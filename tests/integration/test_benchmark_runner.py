@@ -57,17 +57,26 @@ score={"value":1.0,"metric":"rmse","protocol_id":protocol["fingerprint"],"level"
 summary={"score":score,"submission_path":spec["submission_path"],"finalization":{
          "selected":"baseline","refit_status":"succeeded","control_scores":{},
          "selection_protocol":"search_no_control_partition"}}
-if mode=="fallback":
+if mode in ("fallback", "hardkill_ready"):
     summary={"status":"fallback_preserved","submission_path":spec["submission_path"]}
 else:
     (run/"baseline.json").write_text(json.dumps({"score":score}))
     d=run/"validation"
     d.mkdir()
     (d/"result.json").write_text(json.dumps({"ids":["tr3","tr4"],"predictions":[3,4],"classes":[]}))
-(run/"summary.json").write_text(json.dumps(summary))
+if mode!="hardkill_ready":
+    (run/"summary.json").write_text(json.dumps(summary))
 value="NaN" if mode=="invalid" else ("1" if a.backend=="catboost" else "2")
 (root/"answer.csv").write_text("id,y\\n001,"+value+"\\nNA,"+value+"\\n")
 """)
+    with fake.open("a") as stream:
+        stream.write("\nif mode=='exit_nonzero': sys.exit(7)\n")
+        stream.write("if mode=='hardkill_ready':\n")
+        stream.write(
+            "    (run/'ready.json').write_text(json.dumps("
+            "{'path':spec['submission_path'],'status':'statistical_fallback_written'}))\n"
+        )
+        stream.write("    time.sleep(5)\n")
     return task, fake, tmp_path / "results"
 
 
@@ -187,3 +196,108 @@ def test_dependency_versions_and_lockfile_hashes_bind_cached_runs(case, monkeypa
     with pytest.raises(ValueError, match="configuration differs"):
         run(case)
     assert len((case[1].parent / "calls.jsonl").read_text().splitlines()) == 2
+
+
+def test_nonzero_exit_preserves_valid_csv_fraction_without_measured_success(case, monkeypatch):
+    monkeypatch.setenv("BENCHMARK_FAKE_MODE", "exit_nonzero")
+    report = run(case)
+    assert report["valid_submission_fraction"] == 1
+    assert report["execution_success_fraction"] == report["success_fraction"] == 0
+    for item in report["runs"]:
+        assert item["returncode"] == 7
+        assert item["submission"]["status"] == "validated"
+        assert item["valid_csv"] is True
+        assert item["execution_success"] is False
+        assert item["valid_submission_success"] is False
+        assert item["score_status"] == "measured"
+        assert item["measured_success"] is False
+
+
+def test_hardkill_after_ready_accounts_for_preserved_statistical_fallback(case, monkeypatch):
+    monkeypatch.setenv("BENCHMARK_FAKE_MODE", "hardkill_ready")
+    report = benchmark.run_benchmarks(
+        [case[0]],
+        case[2],
+        solution=case[1],
+        seeds=(7,),
+        backends=("catboost",),
+        threads=1,
+        time_budget=0.6,
+        memory_limit_mb=256,
+    )
+    item = report["runs"][0]
+    assert item["returncode"] != 0 and item["termination"] == "time_limit"
+    assert item["submission"]["status"] == "validated"
+    assert item["fallback_status"] is True
+    assert item["fallback_source"] == "statistical_fallback_written"
+    assert item["fallback_backend_attributed"] is False
+    assert item["ready_snapshot"]["sha256"] == item["submission"]["sha256"]
+    assert item["measured_success"] is False
+    assert report["valid_submission_fraction"] == 1
+    assert report["success_fraction"] == 0
+
+
+def test_ready_snapshot_retries_race_then_hashes_once(case, monkeypatch):
+    monkeypatch.setenv("BENCHMARK_FAKE_MODE", "hardkill_ready")
+    original_hash = benchmark._hash
+    ready_path = case[0].parent / "answer.csv"
+    ready_hash_calls = 0
+
+    def racing_hash(path):
+        nonlocal ready_hash_calls
+        if path == ready_path:
+            ready_hash_calls += 1
+            if ready_hash_calls == 1:
+                raise FileNotFoundError("Atomic ready replacement is not visible yet")
+        return original_hash(path)
+
+    monkeypatch.setattr(benchmark, "_hash", racing_hash)
+    report = benchmark.run_benchmarks(
+        [case[0]],
+        case[2],
+        solution=case[1],
+        seeds=(7,),
+        backends=("catboost",),
+        threads=1,
+        time_budget=0.6,
+        memory_limit_mb=256,
+    )
+    # One failed snapshot read, one successful snapshot and one final CSV validation.
+    # The remaining 20ms polls never hash the ready source again.
+    assert ready_hash_calls == 3
+    assert report["runs"][0]["fallback_status"] is True
+
+
+def test_changed_csv_cannot_be_classified_as_preserved_ready_fallback(case):
+    report = run(case)
+    directory = Path(report["runs"][0]["submission"]["path"]).parent
+    source = case[0].parent / "answer.csv"
+    ready = {"path": str(source), "status": "statistical_fallback_written"}
+    (directory / "harness/ready.json").write_text(json.dumps(ready))
+    (directory / "harness/baseline.json").unlink()
+    snapshot = {**ready, "sha256": "0" * 64}
+    artifacts = benchmark._artifacts(directory, snapshot)
+    assert artifacts["submission"]["status"] == "validated"
+    assert artifacts["fallback_status"] is False
+    assert "fallback_source" not in artifacts
+
+
+def test_ready_metadata_race_does_not_invalidate_saved_csv(case, monkeypatch):
+    report = run(case)
+    directory = Path(report["runs"][0]["submission"]["path"]).parent
+    source = case[0].parent / "answer.csv"
+    ready_file = directory / "harness/ready.json"
+    ready = {"path": str(source), "status": "statistical_fallback_written"}
+    ready_file.write_text(json.dumps(ready))
+    (directory / "harness/baseline.json").unlink()
+    original_json = benchmark._json
+
+    def racing_json(path):
+        if path == ready_file:
+            raise FileNotFoundError("Ready metadata was replaced between exists and read")
+        return original_json(path)
+
+    monkeypatch.setattr(benchmark, "_json", racing_json)
+    artifacts = benchmark._artifacts(directory, {**ready, "sha256": benchmark._hash(source)})
+    assert artifacts["submission"]["status"] == "validated"
+    assert artifacts["fallback_status"] is False

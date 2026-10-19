@@ -233,6 +233,7 @@ def _measure(
         key: value for key, value in os.environ.items() if not key.startswith(("OPENAI_", "QWEN_"))
     }
     started, peak, termination = time.monotonic(), 0, "exited"
+    ready_snapshot: dict[str, Any] | None = None
     with (
         (directory / "stdout.log").open("wb") as stdout,
         (directory / "stderr.log").open("wb") as stderr,
@@ -248,6 +249,19 @@ def _measure(
         try:
             while True:
                 peak = max(peak, _rss(process))
+                if ready_snapshot is None:
+                    ready_file = directory / "harness/ready.json"
+                    try:
+                        if ready_file.exists():
+                            ready = _json(ready_file)
+                            ready_path = Path(ready["path"])
+                            ready_snapshot = {
+                                "path": str(ready_path.resolve()),
+                                "status": ready["status"],
+                                "sha256": _hash(ready_path),
+                            }
+                    except (OSError, ValueError, KeyError, TypeError):
+                        pass
                 if process.poll() is not None:
                     break
                 if time.monotonic() - started >= ceiling:
@@ -269,10 +283,14 @@ def _measure(
         "rss_sampling_seconds": poll_seconds,
         "rss_scope": "cli_and_descendants",
         "termination": termination,
+        "ready_snapshot": ready_snapshot,
     }
 
 
-def _artifacts(directory: Path) -> dict[str, Any]:
+def _artifacts(
+    directory: Path,
+    ready_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     harness = directory / "harness"
     result: dict[str, Any] = {
         "score_status": "unavailable",
@@ -335,6 +353,23 @@ def _artifacts(directory: Path) -> dict[str, Any]:
             raise ValueError("Submission changed during benchmark copy")
         temporary.replace(destination)
         result["submission"] = validate_submission(destination, spec)
+        if ready_snapshot is not None and not baseline_file.exists():
+            ready_file = harness / "ready.json"
+            try:
+                ready = _json(ready_file) if ready_file.exists() else {}
+            except (OSError, ValueError):
+                ready = {}
+            if (
+                ready.get("status") in ("statistical_fallback_written", "preserved_existing")
+                and ready.get("status") == ready_snapshot.get("status")
+                and Path(ready.get("path", "")).resolve() == Path(ready_snapshot["path"])
+                and source.resolve() == Path(ready_snapshot["path"])
+                and validated["sha256"] == ready_snapshot.get("sha256")
+            ):
+                result["fallback_status"] = True
+                result["fallback_source"] = ready["status"]
+                result["fallback_evidence"] = "ready_snapshot_checksum_matches_saved_csv"
+                result["fallback_backend_attributed"] = False
     except (OSError, ValueError, KeyError, TypeError) as error:
         result["submission"] = {"status": "invalid", "error": str(error)}
 
@@ -460,13 +495,15 @@ def run_benchmarks(
                     **_measure(command, directory, time_budget, memory_limit_mb, poll_seconds),
                 }
                 try:
-                    record.update(_artifacts(directory))
+                    record.update(_artifacts(directory, record.get("ready_snapshot")))
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     record.update(
                         artifact_error=str(error),
                         submission={"status": "invalid"},
                         score_status="unavailable",
                     )
+                record["execution_success"] = record["returncode"] == 0
+                record["valid_csv"] = record["submission"]["status"] == "validated"
                 record["valid_submission_success"] = (
                     record["returncode"] == 0 and record["submission"]["status"] == "validated"
                 )
@@ -492,8 +529,11 @@ def run_benchmarks(
         "protocol_consistency": "verified_for_available_prepared_artifacts",
         "runs": runs,
         "success_fraction": sum(item["measured_success"] for item in runs) / len(runs),
-        "valid_submission_fraction": sum(item["valid_submission_success"] for item in runs)
+        "valid_submission_fraction": sum(
+            item.get("submission", {}).get("status") == "validated" for item in runs
+        )
         / len(runs),
+        "execution_success_fraction": sum(item["returncode"] == 0 for item in runs) / len(runs),
         "full_agent_comparison": {
             "status": "blocked",
             "reason": (

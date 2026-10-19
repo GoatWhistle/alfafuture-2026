@@ -76,6 +76,7 @@ def cohort(tmp_path: Path, kind: str = "regression", seeds=(7, 42)) -> tuple[Pat
             {
                 "identity": {"task": str(task_path), "seed": seed, "backend": "catboost"},
                 "status": "completed",
+                "returncode": 0,
                 "protocol": {"fingerprint": f"protocol-{seed}"},
                 "score_status": "measured",
                 "score": {
@@ -262,3 +263,21 @@ def test_missing_entire_backend_group_is_visible_and_blocks_holdout(tmp_path: Pa
     assert group["expected_runs"] == 2
     assert group["measured_fraction"] == 0
     assert group["search_score"]["n"] == 0
+
+
+def test_nonzero_exit_valid_csv_is_counted_separately_from_success(tmp_path: Path) -> None:
+    path, report = cohort(tmp_path)
+    for run in report["runs"]:
+        run.update(
+            returncode=7,
+            execution_success=False,
+            valid_submission_success=False,
+            measured_success=False,
+        )
+    dump(path, report)
+    result = summarizer().summarize_benchmarks(path, tmp_path / "summary.json")
+    group = result["groups"][0]
+    assert group["valid_csv_fraction"] == 1
+    assert group["execution_success_fraction"] == 0
+    assert group["measured_fraction"] == 0
+    assert all(run["measured_success"] is False for run in report["runs"])

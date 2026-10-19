@@ -356,7 +356,13 @@ def summarize_benchmarks(report_path: Path, output: Path) -> dict[str, Any]:
                 )
                 / denominator,
                 "valid_csv_fraction": sum(
-                    run.get("status") == "completed" and run.get("valid_submission_success") is True
+                    run.get("status") == "completed"
+                    and run.get("submission", {}).get("status") == "validated"
+                    for run in members
+                )
+                / denominator,
+                "execution_success_fraction": sum(
+                    run.get("status") == "completed" and run.get("returncode") == 0
                     for run in members
                 )
                 / denominator,
@@ -406,6 +412,7 @@ def summarize_benchmarks(report_path: Path, output: Path) -> dict[str, Any]:
             "rss_mib_std",
             "measured_fraction",
             "valid_csv_fraction",
+            "execution_success_fraction",
             "fallback_fraction",
             "posthoc_mean",
             "posthoc_std",
