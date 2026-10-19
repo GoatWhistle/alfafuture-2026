@@ -48,8 +48,13 @@ def _workspace(
         threads=threads,
         timeout_seconds=timeout_seconds,
     )
-    baseline_output = directory.parent / "validation/result.json"
-    request_file = directory.parent / "validation/request.json"
+    validation = (
+        Path(baseline.validation_dir)
+        if baseline.validation_dir
+        else directory.parent / "validation"
+    )
+    baseline_output = validation / "result.json"
+    request_file = validation / "request.json"
     request = json.loads(request_file.read_text()) if request_file.exists() else {}
     workspace.register_baseline(
         baseline.score,
@@ -57,6 +62,10 @@ def _workspace(
         backend=request.get("backend", "catboost"),
         parameters=request.get("parameters", {}),
     )
+    for item in baseline.candidates:
+        if item["backend"] == request.get("backend", baseline.backend):
+            continue
+        workspace.register_starting_point(item)
     return workspace, wall, BudgetedRunner(base, clock, wall, finalizing=True)
 
 
@@ -103,7 +112,8 @@ def research_after_baseline(
     timeout_seconds: float,
     max_steps: int,
     token_limit: int,
-    max_sessions: int = 3,
+    max_sessions: int = 12,
+    search_mode: str = "qwen",
     initial_usage: dict[str, Any] | None = None,
     runtime_budget: WallClockBudget | None = None,
     base_runner: ExperimentRunner | None = None,
@@ -142,6 +152,10 @@ def research_after_baseline(
     model = None
     if (directory / "finalists.json").exists():
         status = "finalization_resumed"
+    elif search_mode == "optuna":
+        from ml_harness.application.use_cases.numeric_search import run_numeric_search
+
+        status = run_numeric_search(workspace, wall, clock)
     elif not usage_known:
         status = "unknown_usage"
     elif not all(os.environ.get(name) for name in names):
@@ -149,8 +163,12 @@ def research_after_baseline(
     else:
         try:
             model = QwenLanguageModel(
-                os.environ[names[0]], os.environ[names[1]], os.environ[names[2]]
+                os.environ[names[0]],
+                os.environ[names[1]],
+                os.environ[names[2]],
             )
+            if hasattr(model, "trace_dir"):
+                model.trace_dir = directory / "api-trace"
         except ModelError:
             status = "configuration_error"
     if model is not None:
@@ -189,6 +207,21 @@ def research_after_baseline(
                     "steps_per_hypothesis": max_steps,
                 },
             )
+            context_value = json.loads(context)
+            context_value["workspace_files"] = [
+                "task.md",
+                "data_dictionary.csv",
+                "candidate_api.md",
+                "candidate.py",
+                "profile.json",
+            ]
+            context_value["recent_tool_failures"] = [
+                failure
+                for event in workspace.store.read_events()
+                if event["kind"] == "session_finished"
+                for failure in event["payload"].get("tool_failures", [])
+            ][-3:]
+            context = json.dumps(context_value, ensure_ascii=False)
             workspace.store.append(
                 {
                     "event_id": "session-start:" + identifier,
@@ -209,7 +242,7 @@ def research_after_baseline(
             write_json(directory / "sessions" / (identifier + ".json"), asdict(session))
             sessions.append(asdict(session))
             status = session.reason
-            if status in ("model_error", "budget_exhausted", "unknown_usage"):
+            if status in ("model_error", "budget_exhausted", "unknown_usage", "protocol_error"):
                 break
     # All LLM calls have ended. A frozen plan on disk prohibits future search after restart as well.
     final = _finish(task, workspace, final_runner, threads, timeout_seconds)

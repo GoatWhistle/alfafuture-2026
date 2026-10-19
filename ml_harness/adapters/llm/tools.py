@@ -1,5 +1,6 @@
 """Validated research tools with workspace confinement and call deduplication."""
 
+import json
 import os
 import tempfile
 from collections.abc import Callable
@@ -10,15 +11,22 @@ from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ml_harness.application.ports.language_model import ToolCall
+from ml_harness.application.use_cases.observations import encoded, experiment_observation
+from ml_harness.domain.models import ContractError
 
 
 class Arguments(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
 
+class InspectData(Arguments):
+    columns: list[str] | None = None
+
+
 class ReadFile(Arguments):
     path: str
-    max_chars: Annotated[int, Field(ge=1, le=12000)] = 8000
+    max_chars: Annotated[int, Field(ge=1, le=12000)] = 4000
+    offset: Annotated[int, Field(ge=0)] = 0
 
 
 class EditFile(Arguments):
@@ -38,7 +46,7 @@ class ReadExperiments(Arguments):
 
 
 _MODELS: dict[str, type[Arguments]] = {
-    "inspect_data": Arguments,
+    "inspect_data": InspectData,
     "read_file": ReadFile,
     "edit_file": EditFile,
     "run_experiment": RunExperiment,
@@ -73,7 +81,29 @@ class ResearchTools:
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": name.replace("_", " "),
+                    "description": {
+                        "inspect_data": (
+                            "Read task schema and compact profile. Optional columns selects "
+                            "feature statistics. Read task.md and candidate_api.md next."
+                        ),
+                        "read_file": (
+                            "Read a workspace-relative file, e.g. {path: task.md}. Use "
+                            "offset=next_offset to continue. candidate.py is the model code."
+                        ),
+                        "edit_file": (
+                            "Replace candidate.py with complete Python source. Must export "
+                            "build_model(kind, parameters, threads, seed). Others are read-only."
+                        ),
+                        "run_experiment": (
+                            "Train edited code: smoke then full validation. Code must differ"
+                            " from parent. Supply experiment_id, hypothesis, expected_effect and "
+                            "optional parent_id."
+                        ),
+                        "read_experiments": (
+                            "Read recent measured results; detailed artifacts "
+                            "can be read with read_file."
+                        ),
+                    }[name],
                     "parameters": model.model_json_schema(),
                 },
             }
@@ -100,6 +130,22 @@ class ResearchTools:
             return deepcopy(response)
         response = self._execute(call)
         self._cache[call.id] = (call.name, call.arguments, deepcopy(response))
+        try:
+            with (self.workspace / "tools.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "id": call.id,
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "response": response,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        except OSError:
+            pass
         return response
 
     def _execute(self, call: ToolCall) -> dict[str, Any]:
@@ -108,18 +154,31 @@ class ResearchTools:
             return _error("unknown_tool", "Unknown research tool")
         try:
             arguments = model.model_validate_json(call.arguments)
-        except ValidationError:
-            return _error("invalid_arguments", "Tool arguments do not match the schema")
+        except ValidationError as exc:
+            details = [
+                {"field": ".".join(map(str, e["loc"])), "expected": e["type"]} for e in exc.errors()
+            ][:5]
+            return _error("invalid_arguments", "Use the declared fields: " + str(details))
         try:
             if isinstance(arguments, ReadFile):
                 path = self._path(arguments.path)
                 if not path.is_file():
-                    return _error("invalid_path", "Read path must be a regular file")
+                    return _error(
+                        "invalid_path",
+                        (
+                            "Read a workspace file: candidate.py, task.md, data_dictionary.csv, "
+                            "candidate_api.md, profile.json"
+                        ),
+                    )
                 with path.open(encoding="utf-8") as stream:
+                    stream.read(arguments.offset)
                     text = stream.read(arguments.max_chars + 1)
                 result: Any = {
                     "text": text[: arguments.max_chars],
                     "truncated": len(text) > arguments.max_chars,
+                    "next_offset": arguments.offset + min(len(text), arguments.max_chars)
+                    if len(text) > arguments.max_chars
+                    else None,
                 }
             elif isinstance(arguments, EditFile):
                 path = self._path(arguments.path)
@@ -145,13 +204,46 @@ class ResearchTools:
                         Path(temporary).unlink(missing_ok=True)
                 result = {"written": True}
             elif isinstance(arguments, RunExperiment):
-                result = self.run_experiment(arguments.model_dump())
+                result = experiment_observation(self.run_experiment(arguments.model_dump()))
             elif isinstance(arguments, ReadExperiments):
-                result = self.read_experiments()[-arguments.limit :]
+                result = [
+                    experiment_observation(r) for r in self.read_experiments()[-arguments.limit :]
+                ]
+                while len(encoded(result)) > 5800 and len(result) > 1:
+                    result.pop(0)
             else:
-                result = self.inspect()
+                profile = self.inspect()
+                if "features" not in profile:
+                    return {"ok": True, "result": profile}
+                if isinstance(arguments, InspectData) and arguments.columns is not None:
+                    selected = set(arguments.columns)
+                    result = {
+                        "features": [
+                            f for f in profile.get("features", []) if f["name"] in selected
+                        ],
+                        "details_path": "profile.json",
+                    }
+                    if len(encoded(result)) > 5800:
+                        result = {"error": "Select fewer columns", "details_path": "profile.json"}
+                else:
+                    result = {
+                        **{k: v for k, v in profile.items() if k != "features"},
+                        "features": [f["name"] for f in profile.get("features", [])],
+                        "details_path": "profile.json",
+                    }
             return {"ok": True, "result": result}
+        except ContractError as exc:
+            return _error(
+                "candidate_unchanged" if "unchanged" in str(exc).lower() else "experiment_error",
+                str(exc)[:500],
+            )
         except (ValueError, OSError):
-            return _error("tool_error", "Tool failed: invalid path, content or operation")
+            return _error(
+                "tool_error",
+                (
+                    "Use workspace-relative paths: task.md, data_dictionary.csv, "
+                    "candidate_api.md, candidate.py; only candidate.py is editable"
+                ),
+            )
         except Exception:
             return _error("tool_error", "Tool execution failed")

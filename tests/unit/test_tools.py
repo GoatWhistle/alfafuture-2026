@@ -79,10 +79,10 @@ def test_schema_rejections(tools: ResearchTools, name: str, args: dict[str, Any]
 def test_read_file_truncation_and_edit_utf8(tools: ResearchTools, tmp_path: Path) -> None:
     assert call(tools, "edit_file", {"path": "candidate.py", "content": "привет"})["ok"]
     response = call(tools, "read_file", {"path": "candidate.py", "max_chars": 3}, "read")
-    assert response == {"ok": True, "result": {"text": "при", "truncated": True}}
+    assert response == {"ok": True, "result": {"text": "при", "truncated": True, "next_offset": 3}}
     response = call(tools, "read_file", {"path": "candidate.py"}, "read_all")
-    assert response["result"] == {"text": "привет", "truncated": False}
-    assert [p.name for p in tmp_path.iterdir()] == ["candidate.py"]
+    assert response["result"] == {"text": "привет", "truncated": False, "next_offset": None}
+    assert {p.name for p in tmp_path.iterdir()} == {"candidate.py", "tools.jsonl"}
 
 
 def test_only_allowlisted_files_can_be_edited(tools: ResearchTools, tmp_path: Path) -> None:

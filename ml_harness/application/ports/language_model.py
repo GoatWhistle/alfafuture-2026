@@ -7,9 +7,10 @@ from typing import Any, Protocol, runtime_checkable
 class ModelError(RuntimeError):
     """A bounded model request failed; previously saved results remain usable."""
 
-    def __init__(self, message: str, *, attempts: int = 1) -> None:
+    def __init__(self, message: str, *, attempts: int = 1, reason: str = "model_error") -> None:
         super().__init__(message)
         self.attempts = attempts
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class ModelReply:
     output_tokens: int = 0
     usage_known: bool = True
     attempts: int = 1
+    finish_reason: str = "stop"
 
 
 class LanguageModel(Protocol):

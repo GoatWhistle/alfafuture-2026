@@ -22,6 +22,8 @@ class TunedCandidate:
         self.kind, self.threads, self.seed = kind, threads, seed
         self.parameters = dict(parameters)
         options = self.parameters.pop("tuning", {})
+        self.storage = options.get("storage")
+        self.study_name = options.get("study_name")
         self.trials = options.get("trials", 5)
         self.time_limit = options.get("time_limit", 60)
         if (
@@ -143,6 +145,17 @@ class TunedCandidate:
         fingerprint.update(pd.util.hash_pandas_object(X, index=True).values.tobytes())
         fingerprint.update(pd.util.hash_pandas_object(y, index=True).values.tobytes())
         study = optuna.create_study(
+            storage=self.storage,
+            study_name=(
+                str(self.study_name)
+                + ":"
+                + self.context.get("level", "full")
+                + ":"
+                + fingerprint.hexdigest()[:16]
+            )
+            if self.storage
+            else None,
+            load_if_exists=bool(self.storage),
             direction="minimize" if metric in ("rmse", "mae", "log_loss") else "maximize",
             sampler=optuna.samplers.TPESampler(seed=self.seed),
         )
@@ -197,6 +210,7 @@ class TunedCandidate:
             self.kind, {**self.parameters, **best.params}, self.threads, self.seed
         )
         self.model.fit(X, y)
+        self.refit_parameters_ = {**self.parameters, **best.params, "tuning": {"enabled": False}}
         self.classes_ = self.model.classes_
         return self
 

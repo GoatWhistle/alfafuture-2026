@@ -75,6 +75,7 @@ def snapshots(tmp_path):
 def test_real_cli_accounts_clarification_and_resumes_without_another_request(tmp_path, monkeypatch):
     from ml_harness.entrypoints import cli
 
+    monkeypatch.chdir(tmp_path)
     path = fixture(tmp_path)
     original = snapshots(tmp_path)
     model = Model([declaration()])

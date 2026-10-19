@@ -227,11 +227,19 @@ def _terminate(process: subprocess.Popen[bytes]) -> None:
 
 
 def _measure(
-    command: list[str], directory: Path, ceiling: float, memory_mb: int, poll_seconds: float
+    command: list[str],
+    directory: Path,
+    ceiling: float,
+    memory_mb: int,
+    poll_seconds: float,
+    *,
+    llm_environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith(("OPENAI_", "QWEN_"))
     }
+    if llm_environment:
+        environment.update(llm_environment)
     started, peak, termination = time.monotonic(), 0, "exited"
     ready_snapshot: dict[str, Any] | None = None
     with (

@@ -85,6 +85,7 @@ def fixture_task(root, variant="regression"):
 
 
 def setup_cli(monkeypatch, tmp_path, variant="regression"):
+    monkeypatch.chdir(tmp_path)
     task = fixture_task(tmp_path, variant)
     run_dir = tmp_path / "run"
     counts = {"baseline": 0, "research": 0}
@@ -136,6 +137,8 @@ def setup_cli(monkeypatch, tmp_path, variant="regression"):
                 str(run_dir),
                 "--research-sessions",
                 "5",
+                "--backend",
+                "catboost",
                 *extra,
             ],
         )

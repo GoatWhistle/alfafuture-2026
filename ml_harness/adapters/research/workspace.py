@@ -27,6 +27,32 @@ from ml_harness.domain.models import (
     ValidationProtocol,
 )
 
+CANDIDATE_API = """# Candidate interface
+Only candidate.py is editable. Read task.md and data_dictionary.csv for task semantics.
+Do not read package source files; the supported interface is documented here.
+
+Export build_model(kind, parameters, threads, seed), returning an unfitted object.
+fit(X, y) receives a pandas DataFrame of features and a Series of training targets.
+predict(X) returns a 1D array. Classification must expose classes_ and, when required,
+predict_proba(X) with columns in classes_ order. All learned transformations fit on X/y
+from fit only; reuse them at prediction. Never read targets or split files yourself.
+
+from ml_harness.adapters.ml.candidates import build_model as base_model
+
+def build_model(kind, parameters, threads, seed):
+    options = {"backend": "catboost", "iterations": 200, "depth": 6}
+    options.update(parameters)  # Required: honor frozen refit overrides.
+    return base_model(kind, options, threads, seed)
+
+CatBoost accepts iterations, depth, learning_rate, l2_leaf_reg, auto_class_weights
+(classification only). LightGBM uses backend="lightgbm", n_estimators, num_leaves,
+learning_rate, min_child_samples. Missing values/categories are handled by the base model.
+Optional numeric search: options["tuning"]={"trials":5,"time_limit":60}.
+Target/feature wrappers must forward classes_, predict_proba, configure_validation,
+and refit_parameters_ / tuning_report_ when wrapping a tuned base model.
+A hypothesis requires an actual code change before run_experiment.
+"""
+
 STARTER = '''"""Starter candidate: change model/feature logic here; never change evaluation."""
 from ml_harness.adapters.ml.candidates import TabularCandidate
 
@@ -121,6 +147,18 @@ class ResearchWorkspace:
                 raise ContractError("Research workspace belongs to another task/protocol")
         else:
             write_json(manifest, asdict(task))
+        for name, source in (
+            ("task.md", Path(task.spec.task_path)),
+            ("data_dictionary.csv", Path(task.spec.dictionary_path)),
+        ):
+            destination = self.path / name
+            if not destination.exists() and source.is_file():
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(0o444)
+        api = self.path / "candidate_api.md"
+        if not api.exists():
+            api.write_text(CANDIDATE_API, encoding="utf-8")
+            api.chmod(0o444)
         self.store = JsonlExperimentStore(self.path / "memory")
         self.reports: list[dict[str, Any]] = []
         self._restore()
@@ -170,10 +208,89 @@ class ResearchWorkspace:
                     (self.baseline_report or {}).get("error_report", {})
                 ),
             }
+        write_json(self.path / "profile.json", self._profile)
         return self._profile
 
     def read_experiments(self) -> list[dict[str, Any]]:
         return deepcopy(([self.baseline_report] if self.baseline_report else []) + self.reports)
+
+    def numeric_completed(self) -> int:
+        return sum(r["id"].startswith("numeric-") for r in self.reports)
+
+    def numeric_batch(self, backend: str, index: int) -> bool:
+        storage = "sqlite:///" + str(self.path / "numeric-studies.sqlite3")
+        options = {
+            "backend": backend,
+            "tuning": {
+                "trials": 5,
+                "time_limit": 60,
+                "storage": storage,
+                "study_name": backend,
+                "batch": index,
+            },
+        }
+        code = (
+            "from ml_harness.adapters.ml.candidates import build_model as base_model\n"
+            "def build_model(kind, parameters, threads, seed):\n"
+            f"    options = {options!r}\n"
+            "    options.update(parameters)\n"
+            "    return base_model(kind, options, threads, seed)\n"
+        )
+        (self.path / "candidate.py").write_text(code)
+        result = self.run_experiment(
+            {
+                "experiment_id": f"numeric-{index:05d}",
+                "parent_id": "baseline",
+                "hypothesis": f"Continue train-only {backend} study, batch {index}",
+                "hypothesis_source": "deterministic_optuna",
+                "expected_effect": "Improve development score",
+            }
+        )
+        return result.get("status") == "succeeded"
+
+    def register_starting_point(self, item: dict[str, Any]) -> None:
+        identifier = "baseline-" + item["backend"]
+        if any(r["id"] == identifier for r in self.reports):
+            return
+        raw = item["score"]
+        output_path = Path(item["validation_dir"]) / "result.json"
+        output = json.loads(output_path.read_text())
+        score = self.evaluator.evaluate(self.task, output)
+        if asdict(score) != raw:
+            raise ContractError("Portfolio score disagrees with independent evaluation")
+        code = (
+            "from ml_harness.adapters.ml.candidates import build_model as base_model\n"
+            "def build_model(kind, parameters, threads, seed):\n"
+            f"    options = {{'backend': {item['backend']!r}}}\n"
+            "    options.update(parameters)\n"
+            "    return base_model(kind, options, threads, seed)\n"
+        ).encode()
+        digest, path = self.store.save_code(code)
+        report = {
+            "id": identifier,
+            "parent_id": "baseline",
+            "hypothesis": "Alternative starting model",
+            "status": "succeeded",
+            "backend": item["backend"],
+            "parameters": {},
+            "code_hash": digest,
+            "code_path": path,
+            "full_score": raw,
+            "level": "full",
+            "protocol_id": self.task.protocol.fingerprint,
+            "measured_by": "harness",
+            "prediction_path": str(output_path),
+            "prediction_hash": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+            "error_report": self.analyzer.analyze(self.task, output),
+        }
+        self.store.append(
+            {
+                "event_id": "experiment:" + identifier + ":finished",
+                "kind": "experiment_finished",
+                "payload": report,
+            }
+        )
+        self.reports.append(report)
 
     def register_baseline(
         self,
@@ -308,17 +425,23 @@ class ResearchWorkspace:
             prediction_hash=hashlib.sha256(file.read_bytes()).hexdigest(),
             error_report=self.analyzer.analyze(self.task, output, parent_output),
             diagnostic_status="measured",
+            backend=output.get("backend", report.get("backend", "custom")),
         )
         if "tuning_report" in output:
             report["tuning_report"] = output["tuning_report"]
-            report["requested_parameters_hash"] = report["parameters_hash"]
-            report["parameters"] = {
-                "factory_arguments": {},
-                "selected_optuna": output["tuning_report"]["best"]["params"],
-            }
-            report["parameters_hash"] = hashlib.sha256(
-                json.dumps(report["parameters"], sort_keys=True, allow_nan=False).encode()
-            ).hexdigest()
+            if not isinstance(output.get("refit_parameters"), dict):
+                raise ContractError(
+                    "Tuned candidate must export refit_parameters_ before finalization"
+                )
+            report["refit_parameters"] = output["refit_parameters"]
+            if output.get("refit_factory") == "tabular":
+                code = (
+                    b"from ml_harness.adapters.ml.candidates import build_model as base_model\n"
+                    b"def build_model(kind, parameters, threads, seed):\n"
+                    b"    return base_model(kind, parameters, threads, seed)\n"
+                )
+                digest, path = self.store.save_code(code)
+                report.update(refit_code_hash=digest, refit_code_path=path)
 
     def _restore(self) -> None:
         experiments: dict[str, dict[str, Any]] = {}
@@ -417,6 +540,7 @@ class ResearchWorkspace:
             "summary": session["summary"],
             "experiment_ids": [report["id"] for report in session["reports"]],
             "reason": session["reason"],
+            "tool_failures": session.get("tool_failures", [])[-3:],
             "usage": {
                 key: session[key]
                 for key in ("input_tokens", "output_tokens", "usage_known", "api_attempts")
@@ -448,6 +572,27 @@ class ResearchWorkspace:
             ):
                 raise ContractError("Experiment ID already belongs to another candidate version")
             return previous
+        parent = (
+            self.baseline_report
+            if parent_id == "baseline"
+            else next((r for r in self.reports if r["id"] == parent_id), None)
+        )
+        if parent is not None and digest == parent["code_hash"]:
+            raise ContractError(
+                "Candidate unchanged: edit candidate.py to implement the hypothesis before training"
+            )
+        duplicate = next(
+            (
+                r
+                for r in self.reports
+                if r["code_hash"] == digest
+                and r.get("parameters", {}) == arguments.get("parameters", {})
+                and r.get("status") == "succeeded"
+            ),
+            None,
+        )
+        if duplicate is not None:
+            return {**duplicate, "reused_from": duplicate["id"]}
         directory = self.path / "experiments" / identifier
         if directory.exists():
             raise ContractError("Experiment directory already exists; inspect it and use a new ID")
@@ -465,8 +610,12 @@ class ResearchWorkspace:
             ),
             "expected_effect": arguments["expected_effect"],
             "code_hash": digest,
-            "parameters": {},
-            "parameters_hash": hashlib.sha256(b"{}").hexdigest(),
+            "parameters": arguments.get("parameters", {}),
+            "parameters_hash": hashlib.sha256(
+                json.dumps(arguments.get("parameters", {}), sort_keys=True).encode()
+            ).hexdigest(),
+            "parent_code_hash": parent.get("code_hash") if parent else None,
+            "parent_score": parent.get("full_score") if parent else None,
             "code_path": version_path,
             "artifacts": [str(directory / "smoke"), str(directory / "full")],
             "error_report": {},

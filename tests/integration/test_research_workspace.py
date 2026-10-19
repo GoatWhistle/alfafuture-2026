@@ -118,7 +118,7 @@ def test_edit_smoke_full_evaluation_and_idempotence(tmp_path):
     assert report["full_score"]["level"] == "full"
     assert report["full_score"]["protocol_id"] == task.protocol.fingerprint
     assert report["smoke_score"]["protocol_id"] != task.protocol.fingerprint
-    assert "full_score" in model.observed[-1]["content"]
+    assert "full_score" in model.observed[-2]["content"]
     report_file = workspace.path / "experiments/regularization/experiment.json"
     before = report_file.stat().st_mtime_ns
     repeated = workspace.run_experiment(

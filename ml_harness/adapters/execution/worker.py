@@ -94,6 +94,7 @@ def run(request: dict[str, Any]) -> None:
                 "time_column": spec.get("time_column"),
                 "group_column": spec.get("group_column"),
                 "metric": spec["metric"],
+                "level": protocol.get("level", "full"),
             }
         )
     fit_started = time.monotonic()
@@ -114,6 +115,9 @@ def run(request: dict[str, Any]) -> None:
     else:
         predictions = np.asarray(model.predict(predict_frame[features])).reshape(-1)
     result = {
+        "backend": getattr(
+            model, "backend", getattr(model, "parameters", {}).get("backend", "custom")
+        ),
         "ids": predict_frame[spec["id_column"]].tolist(),
         "predictions": predictions.tolist(),
         "classes": np.asarray(getattr(model, "classes_", [])).tolist(),
@@ -123,6 +127,12 @@ def run(request: dict[str, Any]) -> None:
     }
     if hasattr(model, "tuning_report_"):
         result["tuning_report"] = model.tuning_report_
+        if hasattr(model, "refit_parameters_"):
+            result["refit_parameters"] = model.refit_parameters_
+            from ml_harness.adapters.ml.tuning import TunedCandidate
+
+            if isinstance(model, TunedCandidate):
+                result["refit_factory"] = "tabular"
     serialized = json.dumps(result, ensure_ascii=False, allow_nan=False)
     output = Path(request["output_dir"])
     output.mkdir(parents=True, exist_ok=True)

@@ -3,8 +3,10 @@
 import json
 import math
 import time
+from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from openai import NOT_GIVEN, APIConnectionError, APIError, APIStatusError, OpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
@@ -23,6 +25,7 @@ class QwenLanguageModel:
         timeout_seconds: float = 60,
         max_attempts: int = 3,
         client: OpenAI | None = None,
+        trace_dir: Path | None = None,
     ) -> None:
         try:
             url = urlsplit(base_url)
@@ -48,6 +51,8 @@ class QwenLanguageModel:
             or max_attempts < 1
         ):
             raise ModelError("Invalid Qwen configuration", attempts=0)
+        self.trace_dir = trace_dir
+        self._secret = api_key
         self.model = model
         self.max_attempts = max_attempts
         self.timeout_seconds = timeout_seconds
@@ -89,14 +94,18 @@ class QwenLanguageModel:
                 prompt_bound = len(prompt.encode("utf-8")) + 1024
                 # Reserve a complete prompt and at least one output token for every retry.
                 # A later successful response cannot reveal tokens spent by failed requests.
-                attempts_allowed = min(attempts_allowed, remaining_tokens // (prompt_bound + 1))
+                attempts_allowed = min(attempts_allowed, remaining_tokens // (prompt_bound + 512))
                 if attempts_allowed <= 0:
-                    raise ModelError("Qwen request budget exhausted", attempts=0)
+                    raise ModelError(
+                        "Qwen request budget exhausted", attempts=0, reason="budget_exhausted"
+                    )
                 max_tokens = min(2048, remaining_tokens // attempts_allowed - prompt_bound)
             except (ValueError, TypeError, UnicodeError):
                 raise ModelError("Cannot serialize Qwen request", attempts=0) from None
             if max_tokens <= 0 or attempts_allowed <= 0 or time.monotonic() >= deadline:
-                raise ModelError("Qwen request budget exhausted", attempts=0)
+                raise ModelError(
+                    "Qwen request budget exhausted", attempts=0, reason="budget_exhausted"
+                )
         for attempt in range(1, attempts_allowed + 1):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -111,6 +120,27 @@ class QwenLanguageModel:
                     if self._limits is not None
                     else NOT_GIVEN,
                 )
+                if self.trace_dir is not None:
+                    self.trace_dir.mkdir(parents=True, exist_ok=True)
+                    trace = {
+                        "request": {"messages": messages, "tools": tools, "max_tokens": max_tokens},
+                        "response": response.model_dump(),
+                        "usage_observation": {
+                            "prompt_upper_bound": len(
+                                json.dumps(
+                                    {"messages": messages, "tools": tools}, ensure_ascii=False
+                                ).encode("utf-8")
+                            )
+                            + 1024,
+                            "billing_verified": False,
+                        },
+                    }
+                    serialized = json.dumps(trace, ensure_ascii=False, default=str).replace(
+                        self._secret, "<REDACTED>"
+                    )
+                    (self.trace_dir / (uuid4().hex + ".json")).write_text(
+                        serialized, encoding="utf-8"
+                    )
                 message = response.choices[0].message
                 calls = tuple(
                     ToolCall(call.id, call.function.name, call.function.arguments)
@@ -128,6 +158,7 @@ class QwenLanguageModel:
                     output_tokens=cast(int, output_count) if valid_output else 0,
                     usage_known=valid_input and valid_output and attempt == 1,
                     attempts=attempt,
+                    finish_reason=response.choices[0].finish_reason or "unknown",
                 )
             except APIError as error:
                 retryable = isinstance(error, APIConnectionError) or (

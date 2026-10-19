@@ -12,10 +12,14 @@ from ml_harness.application.ports.language_model import (
     ModelError,
     ToolExecutor,
 )
+from ml_harness.application.use_cases.observations import compact_observation, encoded
 from ml_harness.domain.models import RunBudget
 
 SYSTEM_PROMPT = """You are an autonomous tabular ML researcher using only the provided Qwen model.
-Use inspect_data and read_file to understand the task and candidate.py. State a specific hypothesis
+Workspace-readable files: task.md, data_dictionary.csv, candidate_api.md, candidate.py.
+Read candidate_api.md and task.md; inspect_data gives a compact profile (columns selects details).
+Do not try to read package source or absolute dataset paths. Use read_file offset for more pages.
+State a specific hypothesis
 and expected measured effect, edit candidate.py, then run_experiment. The harness executes smoke
 and full validation and measures the declared metric independently. Do not claim an improvement
 without measured evidence. Read failures, repair the candidate within the available tool budget,
@@ -38,6 +42,13 @@ class SessionResult:
     usage_known: bool
     reports: tuple[dict[str, Any], ...]
     api_attempts: int
+    tool_failures: tuple[dict[str, Any], ...] = ()
+
+
+def _request_size(messages: list[dict[str, Any]], schemas: list[dict[str, Any]]) -> int:
+    return len(
+        json.dumps({"messages": messages, "tools": schemas}, ensure_ascii=False).encode("utf-8")
+    )
 
 
 def run_session(
@@ -63,6 +74,9 @@ def run_session(
     reports: list[dict[str, Any]] = []
     reason, summary = "step_limit", ""
     awaiting_interpretation = False
+    correction_used = False
+    failures: list[dict[str, Any]] = []
+    observations: list[dict[str, Any]] = []
 
     def reserve() -> float:
         return reserve_seconds() if callable(reserve_seconds) else reserve_seconds
@@ -71,24 +85,68 @@ def run_session(
         if not budget.can_search(clock.now(), reserve()):
             reason = "budget_exhausted"
             break
-        if len(json.dumps(messages, ensure_ascii=False)) > history_char_limit:
-            # Rebuild without orphan tool replies; full history stays on disk.
-            observations = [message for message in messages[2:] if message["role"] == "tool"][-3:]
-            recent = [
-                {"tool_call_id": message["tool_call_id"], "observation": message["content"][:2000]}
-                for message in observations
-            ]
-            messages = messages[:2] + [
+        available_tokens = max(0, budget.token_limit - budget.tokens_used)
+        schemas = [] if awaiting_interpretation else tools.schemas
+        request_limit = (
+            min(history_char_limit, max(0, available_tokens - 1800))
+            if isinstance(model, BudgetAwareLanguageModel)
+            else history_char_limit
+        )
+
+        if (
+            len(json.dumps(messages, ensure_ascii=False)) > history_char_limit
+            or _request_size(messages, schemas) > request_limit
+        ):
+            try:
+                state = json.loads(context)
+                if not isinstance(state, dict):
+                    state = {"task": str(state)[:500]}
+            except (ValueError, TypeError):
+                state = {"task": context[:500]}
+            selected_reports = state.pop("reports", [])
+            state["selected_reports"] = [
                 {
-                    "role": "user",
-                    "content": "History shortened for context budget; recent observations: "
-                    + json.dumps(recent, ensure_ascii=False),
+                    key: report[key]
+                    for key in ("id", "role", "measured", "measured_errors")
+                    if key in report
                 }
+                for report in selected_reports
+                if report.get("role") in ("parent", "best")
+            ][:2]
+            baseline_errors = state.get("baseline_errors")
+            if isinstance(baseline_errors, dict):
+                baseline_errors["target_errors"] = baseline_errors.get("target_errors", [])[:2]
+            task_info = state.get("task")
+            if isinstance(task_info, dict):
+                task_info.pop("features", None)
+                task_info.pop("classes", None)
+            latest = next(
+                (item for item in reversed(observations) if item["tool"] == "run_experiment"), None
+            )
+            recent = {
+                "phase": "interpretation" if awaiting_interpretation else "research",
+                "last_experiment": latest,
+                "recent_tool_failures": failures[-3:],
+                "recent_observations": observations[-2:] if latest is None else [],
+            }
+            phase_instruction = (
+                "Experiment complete; tools unavailable. "
+                "In at most 120 words interpret the measured result. "
+                if awaiting_interpretation
+                else "Continue research using the available tools. "
+            )
+            messages = [
+                messages[0],
+                {"role": "user", "content": encoded(state)},
+                {"role": "user", "content": phase_instruction + encoded(recent)},
             ]
-        while len(json.dumps(messages, ensure_ascii=False)) > history_char_limit:
-            largest = max(range(1, len(messages)), key=lambda i: len(messages[i]["content"]))
-            text = messages[largest]["content"]
-            messages[largest]["content"] = text[: len(text) // 2]
+            # Drop optional reads first; measured latest experiment is retained intact.
+            if _request_size(messages, schemas) > request_limit:
+                recent["recent_observations"] = []
+                messages[-1]["content"] = phase_instruction + encoded(recent)
+        if _request_size(messages, schemas) > request_limit:
+            reason = "budget_exhausted"
+            break
         try:
             if isinstance(model, BudgetAwareLanguageModel):
                 model.set_limits(
@@ -103,7 +161,7 @@ def run_session(
                 budget.attempts_used += max(0, exc.attempts - 1)
             api_attempts += exc.attempts
             usage_known = usage_known and exc.attempts == 0
-            reason = "model_error"
+            reason = exc.reason
             break
         steps += 1
         api_attempts += reply.attempts
@@ -112,6 +170,31 @@ def run_session(
         input_tokens += reply.input_tokens
         output_tokens += reply.output_tokens
         usage_known = usage_known and reply.usage_known
+        if awaiting_interpretation and reply.tool_calls:
+            reason = "protocol_error"
+            break
+        invalid_reply = reply.finish_reason == "length" or (
+            not reply.content.strip() and not reply.tool_calls
+        )
+        if invalid_reply:
+            if not usage_known:
+                reason = "unknown_usage"
+                break
+            if correction_used:
+                reason = "protocol_error"
+                break
+            correction_used = True
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The previous response was empty or truncated. Return one complete short "
+                        "tool call, or a concise final interpretation if the experiment is "
+                        "complete. Do not emit reasoning or XML tool calls."
+                    ),
+                }
+            )
+            continue
         assistant: dict[str, Any] = {"role": "assistant", "content": reply.content or None}
         if reply.tool_calls:
             assistant["tool_calls"] = [
@@ -135,19 +218,35 @@ def run_session(
                 reason = "budget_exhausted"
                 break
             result = tools.execute(call)
+            observation = compact_observation(result)
+            observations.append({"tool": call.name, "observation": observation})
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": json.dumps(result, ensure_ascii=False, allow_nan=False),
+                    "content": encoded(observation),
                 }
             )
             if not result.get("ok"):
                 errors += 1
+                failures.append(
+                    {
+                        "tool": call.name,
+                        "arguments": call.arguments[:250],
+                        "error": result.get("error"),
+                    }
+                )
             elif call.name == "run_experiment":
                 reports.append(result["result"])
                 if result["result"].get("status") != "succeeded":
                     errors += 1
+                    failures.append(
+                        {
+                            "tool": call.name,
+                            "error": result["result"].get("error"),
+                            "experiment_id": result["result"].get("id"),
+                        }
+                    )
                 else:
                     awaiting_interpretation = True
             if errors >= max_tool_errors:
@@ -161,6 +260,18 @@ def run_session(
         assistant["tool_calls"] = [
             item for item in assistant.get("tool_calls", []) if item["id"] in completed_ids
         ]
+        if awaiting_interpretation:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The experiment has finished. This is the final interpretation phase; "
+                        "tools are unavailable. In at most 120 words, compare measured quality "
+                        "with the parent and explain whether the hypothesis was actually tested. "
+                        "Do not propose tool calls."
+                    ),
+                }
+            )
         if not usage_known:
             reason = "unknown_usage"
             break
@@ -176,4 +287,5 @@ def run_session(
         usage_known,
         tuple(reports),
         api_attempts,
+        tuple(failures[-3:]),
     )

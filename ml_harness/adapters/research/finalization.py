@@ -94,6 +94,7 @@ class FinalizationWorkspace:
         outputs: dict[str, dict[str, Any]] = {}
         reports = [self.workspace.baseline_report] if self.workspace.baseline_report else []
         reports += self.workspace.reports
+        seen: set[tuple[str, str]] = set()
         for report in reports:
             if (
                 report.get("status") != "succeeded"
@@ -122,14 +123,25 @@ class FinalizationWorkspace:
                 measured = self.evaluator.evaluate(self.task, output)
                 if measured != _score(report["full_score"]):
                     raise ContractError("Search score disagrees with independent evaluation")
+                parameters = report.get("refit_parameters", report.get("parameters", {}))
+                if "selected_optuna" in (parameters or {}) or (
+                    report.get("tuning_report") and "refit_parameters" not in report
+                ):
+                    raise ContractError(
+                        "Legacy tuned configuration has no executable refit parameters"
+                    )
+                identity = (report.get("refit_code_hash", report["code_hash"]), _digest(parameters))
+                if identity in seen:
+                    continue
+                seen.add(identity)
                 member = CandidateRef(
                     report["id"],
-                    report["code_path"],
-                    report["code_hash"],
+                    report.get("refit_code_path", report["code_path"]),
+                    report.get("refit_code_hash", report["code_hash"]),
                     report.get(
                         "backend", (report.get("parameters") or {}).get("backend", "catboost")
                     ),
-                    report.get("parameters", {}),
+                    parameters,
                 )
                 self._check_code(member)
                 candidates.append(Finalist(member.id, (member,), measured))

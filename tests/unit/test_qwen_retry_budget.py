@@ -95,7 +95,7 @@ def test_retry_worst_case_sum_is_bounded_and_success_usage_is_unknown(qwen_modul
         return httpx.Response(failure, json={"error": {"message": "local test"}})
 
     bound = prompt_bound(MESSAGES, TOOLS)
-    tokens = 3 * (bound + 32)
+    tokens = 3 * (bound + 512)
     candidate = model(qwen_module, handler)
     candidate.set_limits(100, 3, tokens)
     reply = candidate.complete(MESSAGES, TOOLS)
@@ -115,7 +115,7 @@ def test_retry_count_is_reduced_when_not_all_prompts_fit(qwen_module, affordable
         return httpx.Response(429, json={"error": {"message": "local test"}})
 
     bound = prompt_bound(MESSAGES, TOOLS)
-    tokens = affordable * (bound + 1) if affordable else bound
+    tokens = affordable * (bound + 512) if affordable else bound
     candidate = model(qwen_module, handler)
     candidate.set_limits(100, 3, tokens)
     with pytest.raises(ModelError) as error:
@@ -123,7 +123,7 @@ def test_retry_count_is_reduced_when_not_all_prompts_fit(qwen_module, affordable
     assert error.value.attempts == len(requests) == affordable
     assert sum(bound + request["max_tokens"] for request in requests) <= tokens
     if requests:
-        assert all(request["max_tokens"] == 1 for request in requests)
+        assert all(request["max_tokens"] == 512 for request in requests)
 
 
 def test_first_attempt_success_still_has_known_usage(qwen_module):

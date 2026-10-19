@@ -26,7 +26,7 @@ from ml_harness.adapters.storage.submission import (
     ensure_ready_submission,
     load_submission,
 )
-from ml_harness.application.use_cases.baseline import BaselineResult, run_baseline
+from ml_harness.application.use_cases.baseline import BaselineResult, run_baseline, run_portfolio
 from ml_harness.application.use_cases.prepare_task import prepare_task
 from ml_harness.domain.budget import BudgetExpired, WallClockBudget
 from ml_harness.domain.models import (
@@ -93,7 +93,15 @@ def _resume_baseline(work_dir: Path, task: PreparedTask) -> BaselineResult:
         durations = [float(baseline[key]) for key in ("validation_seconds", "refit_seconds")]
         if not all(isfinite(value) and value >= 0 for value in durations):
             raise ContractError("Resume baseline durations must be finite and nonnegative")
-        return BaselineResult(score, str(submission), *durations)
+        return BaselineResult(
+            score,
+            str(submission),
+            durations[0],
+            durations[1],
+            backend=baseline.get("backend", "catboost"),
+            validation_dir=baseline.get("validation_dir"),
+            candidates=tuple(baseline.get("candidates", [])),
+        )
     except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
         raise ContractError(f"Cannot resume saved baseline: {error}") from error
 
@@ -104,7 +112,7 @@ def main(*, started_at: float | None = None) -> int:
     parser = argparse.ArgumentParser(description="Autonomous tabular ML research harness")
     parser.add_argument("task", nargs="?", default=Path("task.md"), type=Path)
     parser.add_argument(
-        "--backend", choices=("catboost", "lightgbm", "autogluon"), default="catboost"
+        "--backend", choices=("portfolio", "catboost", "lightgbm", "autogluon"), default="portfolio"
     )
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=8)
     parser.add_argument("--seed", type=int, default=42)
@@ -113,11 +121,15 @@ def main(*, started_at: float | None = None) -> int:
     parser.add_argument("--time-budget", type=float, default=10800)
     parser.add_argument("--memory-limit-mb", type=int, default=28000)
     parser.add_argument("--baseline-only", action="store_true")
+    parser.add_argument("--search-mode", choices=("qwen", "optuna", "none"))
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--research-sessions", type=int, default=3)
+    parser.add_argument("--research-sessions", type=int, default=12)
     parser.add_argument("--research-steps", type=int, default=12)
     parser.add_argument("--llm-token-limit", type=int, default=32000)
     args = parser.parse_args()
+    if args.baseline_only and args.search_mode not in (None, "none"):
+        parser.error("--baseline-only conflicts with --search-mode")
+    args.search_mode = "none" if args.baseline_only else (args.search_mode or "qwen")
     if args.research_steps < 1 or args.llm_token_limit < 1 or args.research_sessions < 1:
         parser.error("Research steps, sessions and token limit must be positive")
     if (
@@ -242,13 +254,17 @@ def main(*, started_at: float | None = None) -> int:
                     fallback = ensure_ready_submission(task, writer)
                     write_json(work_dir / "ready.json", fallback)
                     ready = True
-                    result = run_baseline(
+                    baseline_runner = run_portfolio if args.backend == "portfolio" else run_baseline
+                    backend_arguments = (
+                        {} if args.backend == "portfolio" else {"backend": args.backend}
+                    )
+                    result = baseline_runner(
                         task,
                         runner,
                         IndependentEvaluator(),
                         writer,
                         work_dir=str(work_dir),
-                        backend=args.backend,
+                        **backend_arguments,
                         threads=args.threads,
                         timeout_seconds=args.worker_timeout,
                     )
@@ -257,7 +273,7 @@ def main(*, started_at: float | None = None) -> int:
                 budget.observe("refit", result.refit_seconds)
                 save_budget()
                 details = asdict(result)
-                if not args.baseline_only:
+                if args.search_mode != "none":
                     details["research"] = research_after_baseline(
                         task,
                         result,
@@ -265,6 +281,7 @@ def main(*, started_at: float | None = None) -> int:
                         threads=args.threads,
                         timeout_seconds=args.worker_timeout,
                         max_steps=args.research_steps,
+                        search_mode=args.search_mode,
                         token_limit=args.llm_token_limit,
                         max_sessions=args.research_sessions,
                         runtime_budget=budget,
