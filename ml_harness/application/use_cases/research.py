@@ -306,7 +306,21 @@ def run_session(
             if not budget.can_search(clock.now(), reserve()):
                 reason = "budget_exhausted"
                 break
-            result = tools.execute(call)
+            result: dict[str, Any]
+            allowed_names = {schema["function"]["name"] for schema in schemas}
+            if call.name not in allowed_names:
+                result = {
+                    "ok": False,
+                    "error": {
+                        "type": "tool_not_allowed",
+                        "message": (
+                            f"Tool {call.name!r} is unavailable in this phase. "
+                            f"Use one of: {', '.join(sorted(allowed_names))}."
+                        ),
+                    },
+                }
+            else:
+                result = tools.execute(call)
             if result.get("ok"):
                 try:
                     arguments = json.loads(call.arguments)

@@ -233,7 +233,7 @@ def test_dynamic_reserve_changes_stop_search_after_tool():
             return ModelReply("", (ToolCall("call", "inspect_data", "{}"),))
 
     class Tools:
-        schemas = []
+        schemas = [{"type": "function", "function": {"name": "inspect_data"}}]
 
         def execute(self, call):
             reserve[0] = 101

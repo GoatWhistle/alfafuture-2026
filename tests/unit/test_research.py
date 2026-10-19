@@ -26,7 +26,10 @@ class FakeClock:
 
 
 class FakeTools:
-    schemas = []
+    schemas = [
+        {"type": "function", "function": {"name": name}}
+        for name in ("read_file", "inspect_data", "read_experiments", "edit_file", "run_experiment")
+    ]
 
     def __init__(self, results):
         self.results = iter(results)
@@ -284,3 +287,43 @@ def test_action_request_discards_navigation_history_but_keeps_research_facts():
     assert "def build_model" in request and "file-2" in request
     assert all(message["role"] != "tool" for message in model.messages[-1])
     assert result.reason == "model_error"
+
+
+def test_out_of_phase_tool_is_rejected_before_execution_and_can_be_corrected():
+    class Tools(FakeTools):
+        schemas = [
+            {"type": "function", "function": {"name": name}}
+            for name in ("read_file", "inspect_data", "edit_file", "run_experiment")
+        ]
+
+    class Model(FakeLanguageModel):
+        def set_limits(self, *limits):
+            pass
+
+    model = Model(
+        [
+            ModelReply("", tuple(ToolCall(str(i), "read_file", "{}") for i in range(3))),
+            # Replay the provider symptom: inspect_data despite edit_file-only schema.
+            ModelReply("", (ToolCall("wrong", "inspect_data", "{}"),), 12, 4),
+            ModelReply("", (ToolCall("edit", "edit_file", '{"content":"changed"}'),)),
+            ModelReply("", (ToolCall("run", "run_experiment", "{}"),)),
+            ModelReply("The measured score is 1."),
+        ]
+    )
+    tools = Tools(
+        [{"ok": True, "result": {"text": "task"}}] * 3
+        + [
+            {"ok": True, "result": {"written": True}},
+            {"ok": True, "result": {"status": "succeeded", "full_score": 1}},
+        ]
+    )
+    result = session(model, tools)
+    assert [call.name for call in tools.calls] == ["read_file"] * 3 + [
+        "edit_file",
+        "run_experiment",
+    ]
+    assert result.reason == "model_finished" and len(result.reports) == 1
+    assert result.tool_errors == 1
+    assert result.input_tokens == 12 and result.output_tokens == 4
+    corrective = json.dumps(model.messages[2])
+    assert "tool_not_allowed" in corrective and "edit_file" in corrective
