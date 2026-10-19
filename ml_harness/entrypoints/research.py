@@ -208,6 +208,18 @@ def research_after_baseline(
                 },
             )
             context_value = json.loads(context)
+            context_value["candidate_code"] = (directory / "candidate.py").read_text()[:4000]
+            context_value["candidate_contract"] = (
+                "build_model(kind, parameters, threads, seed) returns an unfitted model. "
+                "Use from ml_harness.adapters.ml.candidates import build_model as base_model. "
+                "Merge parameters into options; base_model(kind, options, threads, seed) handles "
+                "imputation/categories and fit/predict/predict_proba. CatBoost: backend=catboost, "
+                "iterations, depth, learning_rate, l2_leaf_reg; LightGBM: backend=lightgbm, "
+                "n_estimators, num_leaves, learning_rate. For wrappers, fit transformations only "
+                "on supplied training X/y and expose classes_ for classification. "
+                "Edit the code before run_experiment; unchanged candidates are rejected."
+            )
+            context_value["task_overview"] = (directory / "task.md").read_text()[:1200]
             context_value["workspace_files"] = [
                 "task.md",
                 "data_dictionary.csv",

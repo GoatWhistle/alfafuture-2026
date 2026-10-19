@@ -39,6 +39,10 @@ def test_original_task_and_api_are_readable_but_not_editable(tmp_path):
             ToolCall("edit-" + name, "edit_file", json.dumps({"path": name, "content": "bad"}))
         )["ok"]
     assert (work.path / "task.md").read_bytes() == Path(task.spec.task_path).read_bytes()
+    profile = tools.execute(ToolCall("profile", "inspect_data", "{}"))["result"]
+    assert "train_path" not in profile["task"] and "features" not in profile["task"]
+    assert profile["features"] == list(task.spec.features)
+    assert "target_profile" in profile
 
 
 def test_unchanged_parent_never_starts_training(tmp_path):

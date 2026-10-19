@@ -1,5 +1,6 @@
 """Validated research tools with workspace confinement and call deduplication."""
 
+import hashlib
 import json
 import os
 import tempfile
@@ -73,6 +74,7 @@ class ResearchTools:
         self.read_experiments = read_experiments
         self.editable_paths = frozenset(self._path(path) for path in editable_paths)
         self._cache: dict[str, tuple[str, str, dict[str, Any]]] = {}
+        self._read_pages: set[tuple[str, int, str]] = set()
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
@@ -173,13 +175,22 @@ class ResearchTools:
                 with path.open(encoding="utf-8") as stream:
                     stream.read(arguments.offset)
                     text = stream.read(arguments.max_chars + 1)
+                page_key = (str(path), arguments.offset, hashlib.sha256(text.encode()).hexdigest())
+                repeated = page_key in self._read_pages
+                self._read_pages.add(page_key)
                 result: Any = {
-                    "text": text[: arguments.max_chars],
+                    "text": text[:500] if repeated else text[: arguments.max_chars],
                     "truncated": len(text) > arguments.max_chars,
                     "next_offset": arguments.offset + min(len(text), arguments.max_chars)
                     if len(text) > arguments.max_chars
                     else None,
                 }
+                if repeated:
+                    result["already_read"] = True
+                    result["guidance"] = (
+                        "Unchanged page already read. Use the retained contract and "
+                        "candidate_code; edit candidate.py to test a hypothesis."
+                    )
             elif isinstance(arguments, EditFile):
                 path = self._path(arguments.path)
                 if path not in self.editable_paths:
@@ -222,12 +233,27 @@ class ResearchTools:
                             f for f in profile.get("features", []) if f["name"] in selected
                         ],
                         "details_path": "profile.json",
+                        "target_profile": profile.get("target_profile", {}),
                     }
                     if len(encoded(result)) > 5800:
                         result = {"error": "Select fewer columns", "details_path": "profile.json"}
                 else:
                     result = {
-                        **{k: v for k, v in profile.items() if k != "features"},
+                        **{k: v for k, v in profile.items() if k not in ("features", "task")},
+                        "task": {
+                            k: v
+                            for k, v in profile.get("task", {}).items()
+                            if k
+                            not in (
+                                "features",
+                                "task_path",
+                                "train_path",
+                                "test_path",
+                                "dictionary_path",
+                                "sample_path",
+                                "submission_path",
+                            )
+                        },
                         "features": [f["name"] for f in profile.get("features", [])],
                         "details_path": "profile.json",
                     }

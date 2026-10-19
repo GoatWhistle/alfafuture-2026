@@ -164,3 +164,15 @@ def test_callback_failures_are_sanitized_and_cached(tmp_path: Path) -> None:
     assert "secret" not in str(response)
     assert call(tools, "inspect_data", {}) == response
     assert callback.call_count == 1
+
+
+def test_repeated_unchanged_page_is_short_and_new_candidate_can_be_read(tools, tmp_path):
+    path = tmp_path / "candidate.py"
+    path.write_text("x" * 3000)
+    first = call(tools, "read_file", {"path": "candidate.py"}, "first")
+    second = call(tools, "read_file", {"path": "candidate.py"}, "second")
+    assert len(first["result"]["text"]) == 3000
+    assert second["result"]["already_read"] and len(second["result"]["text"]) == 500
+    path.write_text("changed")
+    third = call(tools, "read_file", {"path": "candidate.py"}, "third")
+    assert third["result"]["text"] == "changed" and "already_read" not in third["result"]

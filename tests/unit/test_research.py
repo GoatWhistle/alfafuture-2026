@@ -161,3 +161,31 @@ def test_repeated_incomplete_reply_is_not_finished():
     )
     result = session(model, FakeTools([]))
     assert result.reason == "protocol_error" and not result.reports
+
+
+def test_compaction_remembers_read_materials_and_current_code():
+    context = json.dumps(
+        {
+            "task_overview": "Annual building energy use",
+            "candidate_contract": "fit(X, y), predict(X)",
+            "candidate_code": (
+                "def build_model(kind, parameters, threads, seed): "
+                "return base_model(kind, parameters, threads, seed)"
+            ),
+        }
+    )
+    model = FakeLanguageModel(
+        [
+            ModelReply("", (ToolCall("task", "read_file", '{"path":"task.md"}'),)),
+            ModelReply("ready"),
+        ]
+    )
+    tools = FakeTools([{"ok": True, "result": {"text": "condition " * 4000, "next_offset": 4000}}])
+    result = run_session(
+        model, tools, context, RunBudget(1000, 32000, 10), FakeClock(), history_char_limit=8000
+    )
+    assert result.reason == "model_finished"
+    compacted = json.dumps(model.messages[-1])
+    assert "candidate_code" in compacted and "build_model" in compacted
+    assert "fit(X, y)" in compacted and "Annual building energy use" in compacted
+    assert "read_files" in compacted and "task.md" in compacted

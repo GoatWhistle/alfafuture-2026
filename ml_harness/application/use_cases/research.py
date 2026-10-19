@@ -17,7 +17,10 @@ from ml_harness.domain.models import RunBudget
 
 SYSTEM_PROMPT = """You are an autonomous tabular ML researcher using only the provided Qwen model.
 Workspace-readable files: task.md, data_dictionary.csv, candidate_api.md, candidate.py.
-Read candidate_api.md and task.md; inspect_data gives a compact profile (columns selects details).
+The context includes task_overview, candidate_contract and current candidate_code.
+Use files only for missing details. inspect_data(columns=...) gives selected statistics.
+Inspect once, implement one concrete hypothesis, then run_experiment.
+Do not reread unchanged pages. Prefer concise code reusing the documented base model.
 Do not try to read package source or absolute dataset paths. Use read_file offset for more pages.
 State a specific hypothesis
 and expected measured effect, edit candidate.py, then run_experiment. The harness executes smoke
@@ -77,6 +80,15 @@ def run_session(
     correction_used = False
     failures: list[dict[str, Any]] = []
     observations: list[dict[str, Any]] = []
+    read_files: dict[str, dict[str, Any]] = {}
+    try:
+        initial_state = json.loads(context)
+        working_code = (
+            initial_state.get("candidate_code", "") if isinstance(initial_state, dict) else ""
+        )
+    except (ValueError, TypeError):
+        working_code = ""
+    navigation_steps = 0
 
     def reserve() -> float:
         return reserve_seconds() if callable(reserve_seconds) else reserve_seconds
@@ -103,6 +115,11 @@ def run_session(
                     state = {"task": str(state)[:500]}
             except (ValueError, TypeError):
                 state = {"task": context[:500]}
+            state["candidate_code"] = working_code[:4000]
+            state["read_files"] = read_files
+            state["next_action"] = (
+                "edit_file then run_experiment" if navigation_steps >= 4 else "research"
+            )
             selected_reports = state.pop("reports", [])
             state["selected_reports"] = [
                 {
@@ -144,6 +161,11 @@ def run_session(
             if _request_size(messages, schemas) > request_limit:
                 recent["recent_observations"] = []
                 messages[-1]["content"] = phase_instruction + encoded(recent)
+            if _request_size(messages, schemas) > request_limit:
+                state["read_files"] = {
+                    path: {"offset": info["offset"]} for path, info in read_files.items()
+                }
+                messages[1]["content"] = encoded(state)
         if _request_size(messages, schemas) > request_limit:
             reason = "budget_exhausted"
             break
@@ -218,6 +240,26 @@ def run_session(
                 reason = "budget_exhausted"
                 break
             result = tools.execute(call)
+            if result.get("ok"):
+                try:
+                    arguments = json.loads(call.arguments)
+                except (ValueError, TypeError):
+                    arguments = {}
+                if call.name == "read_file":
+                    path = arguments.get("path", "")
+                    read_files[path] = {
+                        "offset": arguments.get("offset", 0),
+                        "next_offset": result.get("result", {}).get("next_offset"),
+                        "excerpt": str(result.get("result", {}).get("text", ""))[:500],
+                    }
+                    navigation_steps += 1
+                elif call.name in ("inspect_data", "read_experiments"):
+                    navigation_steps += 1
+                elif call.name == "edit_file":
+                    working_code = arguments.get("content", working_code)
+                    navigation_steps = 0
+                elif call.name == "run_experiment":
+                    navigation_steps = 0
             observation = compact_observation(result)
             observations.append({"tool": call.name, "observation": observation})
             messages.append(
@@ -260,6 +302,17 @@ def run_session(
         assistant["tool_calls"] = [
             item for item in assistant.get("tool_calls", []) if item["id"] in completed_ids
         ]
+        if navigation_steps >= 4 and not awaiting_interpretation:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The task and candidate contract have been inspected. Stop repeating "
+                        "navigation. Implement one hypothesis in candidate.py with edit_file, "
+                        "then run_experiment. Current code is in candidate_code."
+                    ),
+                }
+            )
         if awaiting_interpretation:
             messages.append(
                 {
