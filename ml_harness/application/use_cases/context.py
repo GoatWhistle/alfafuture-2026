@@ -5,6 +5,7 @@ from dataclasses import asdict
 from math import isfinite
 from typing import Any
 
+from ml_harness.application.use_cases.directions import ResearchDirection, diagnostic_focus
 from ml_harness.domain.models import ContractError, Metric, PreparedTask, Score
 
 
@@ -37,6 +38,28 @@ def _measured(report: dict[str, Any], task: PreparedTask) -> Score | None:
         return None
 
 
+def diagnostic_summary(diagnostic: dict[str, Any], limit: int = 3) -> dict[str, Any]:
+    items = []
+    for focus in diagnostic_focus(diagnostic, limit):
+        items.append(
+            {
+                "error": _text(focus["key"], 240),
+                "support": focus["support"],
+                "loss": focus["loss"],
+                "metrics": focus.get(
+                    "metrics", {"f1": focus.get("f1"), "recall": focus.get("recall")}
+                ),
+                "delta": focus.get("delta"),
+            }
+        )
+    return {
+        "measured_by": diagnostic.get("measured_by"),
+        "overall_delta": diagnostic.get("delta"),
+        "target_errors": items,
+        "interpretation": "Observations on validation; no causal claim",
+    }
+
+
 def build_context(
     task: PreparedTask,
     baseline_score: Score,
@@ -45,6 +68,8 @@ def build_context(
     parent_id: str | None = None,
     max_chars: int = 12000,
     budget: dict[str, Any] | None = None,
+    direction: ResearchDirection | None = None,
+    baseline_diagnostics: dict[str, Any] | None = None,
 ) -> str:
     """Prioritize parent, best full result, recent failures and alternative successes."""
     if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 512:
@@ -86,6 +111,21 @@ def build_context(
         else:
             raise ContractError("Task summary cannot fit the context limit")
         context = base()
+    additions: dict[str, Any] = {}
+    if baseline_diagnostics:
+        additions["baseline_errors"] = diagnostic_summary(baseline_diagnostics)
+    if direction is not None:
+        additions["direction"] = {
+            "parent_id": _text(direction.parent_id, 64),
+            "best_id": _text(direction.best_id, 64),
+            "alternatives": [_text(value, 64) for value in direction.alternatives[:5]],
+            "reason": _text(direction.reason, 240),
+            "recent_failures": [_text(value, 64) for value in direction.recent_failures],
+        }
+    for key, value in additions.items():
+        context[key] = value
+        if len(_encode(context)) > max_chars:
+            del context[key]
     if budget:
         safe_budget = {
             _text(key, 40): (_text(value, 80) if isinstance(value, str) else value)
@@ -139,11 +179,13 @@ def build_context(
             "measured": asdict(score) if score is not None else None,
             "error": _text(report.get("error"), 300),
             "interpretation": _text(report.get("llm_commentary"), 400),
+            "measured_errors": diagnostic_summary(report.get("error_report", {})),
         }
         context["reports"].append(summary)
         if len(_encode(context)) > max_chars:
             for key in ("hypothesis", "expected_effect", "error", "interpretation"):
                 summary[key] = _text(summary[key], 80)
+            summary["measured_errors"] = diagnostic_summary(report.get("error_report", {}), 1)
             if len(_encode(context)) > max_chars:
                 context["reports"].pop()
     return _encode(context)

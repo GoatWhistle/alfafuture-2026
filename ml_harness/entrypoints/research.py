@@ -1,5 +1,6 @@
 """Wire the first research session after a valid baseline answer exists."""
 
+import json
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -16,6 +17,7 @@ from ml_harness.application.ports.execution import RunRequest
 from ml_harness.application.ports.language_model import ModelError
 from ml_harness.application.use_cases.baseline import BaselineResult
 from ml_harness.application.use_cases.context import build_context
+from ml_harness.application.use_cases.directions import choose_direction
 from ml_harness.application.use_cases.research import run_session
 from ml_harness.domain.models import (
     ContractError,
@@ -52,6 +54,15 @@ def research_after_baseline(
     workspace = ResearchWorkspace(
         task, directory, runner, evaluator, threads=threads, timeout_seconds=timeout_seconds
     )
+    baseline_output = directory.parent / "validation/result.json"
+    baseline_request = directory.parent / "validation/request.json"
+    request = json.loads(baseline_request.read_text()) if baseline_request.exists() else {}
+    workspace.register_baseline(
+        baseline.score,
+        baseline_output if baseline_output.exists() else None,
+        backend=request.get("backend", "catboost"),
+        parameters=request.get("parameters", {}),
+    )
     budget = RunBudget(clock.now() + 1800, token_limit, max_steps * 3 * max_sessions)
     # Usage survives restart. Unknown usage is kept explicit rather than called zero cost.
     for event in workspace.store.read_events():
@@ -66,22 +77,31 @@ def research_after_baseline(
         tools = ResearchTools(
             directory, workspace.inspect_data, workspace.run_experiment, workspace.read_experiments
         )
-        parent_id = next(
-            (item["id"] for item in reversed(workspace.reports) if item["status"] == "succeeded"),
-            None,
+        identifier = uuid4().hex
+        session_index = sum(
+            event["kind"] == "session_finished" for event in workspace.store.read_events()
         )
+        direction = choose_direction(
+            task,
+            baseline.score,
+            workspace.reports,
+            baseline_report=workspace.baseline_report,
+            session_index=session_index,
+        )
+        workspace.prepare_hypothesis(direction, identifier)
         context = build_context(
             task,
             baseline.score,
-            workspace.read_experiments(),
-            parent_id=parent_id,
+            workspace.reports,
+            parent_id=direction.parent_id,
+            direction=direction,
+            baseline_diagnostics=(workspace.baseline_report or {}).get("error_report"),
             budget={
                 "tokens_remaining": max(0, token_limit - budget.tokens_used),
                 "steps_per_hypothesis": max_steps,
             },
         )
         session = run_session(model, tools, context, budget, clock, max_steps=max_steps)
-        identifier = uuid4().hex
         workspace.register_session(identifier, asdict(session))
         write_json(directory / "sessions" / (identifier + ".json"), asdict(session))
         sessions.append(asdict(session))

@@ -35,3 +35,12 @@ class Evaluator(Protocol):
 
 class SubmissionWriter(Protocol):
     def write(self, task: PreparedTask, output: dict[str, Any]) -> str: ...
+
+
+class ErrorAnalyzer(Protocol):
+    def analyze(
+        self,
+        task: PreparedTask,
+        output: dict[str, Any],
+        parent_output: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...

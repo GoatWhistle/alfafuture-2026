@@ -88,7 +88,9 @@ def _resume_baseline(work_dir: Path, task: PreparedTask) -> BaselineResult:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Autonomous tabular ML research harness")
     parser.add_argument("task", nargs="?", default=Path("task.md"), type=Path)
-    parser.add_argument("--backend", choices=("catboost", "lightgbm"), default="catboost")
+    parser.add_argument(
+        "--backend", choices=("catboost", "lightgbm", "autogluon"), default="catboost"
+    )
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=8)
     parser.add_argument("--worker-timeout", type=float, default=1800)
     parser.add_argument("--run-dir", type=Path)

@@ -80,6 +80,19 @@ class TabularCandidate:
         return self.model.predict_proba(self._transform(X))
 
 
-def build_model(kind: str, parameters: dict[str, Any], threads: int, seed: int) -> TabularCandidate:
-    """Build an unfitted CPU candidate without network or filesystem side effects."""
-    return TabularCandidate(kind, parameters, threads, seed)
+def build_model(kind: str, parameters: dict[str, Any], threads: int, seed: int) -> Any:
+    """Build an unfitted CPU candidate; optional engines are imported only on demand."""
+    tuning = parameters.get("tuning", {})
+    if tuning and tuning.get("enabled", True):
+        from ml_harness.adapters.ml.tuning import TunedCandidate
+
+        return TunedCandidate(kind, parameters, threads, seed)
+    if parameters.get("backend") == "autogluon":
+        from ml_harness.adapters.ml.automl import AutoGluonCandidate
+
+        options = dict(parameters)
+        options.pop("tuning", None)
+        return AutoGluonCandidate(kind, options, threads, seed)
+    options = dict(parameters)
+    options.pop("tuning", None)
+    return TabularCandidate(kind, options, threads, seed)

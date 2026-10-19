@@ -11,14 +11,18 @@ from typing import Any
 import psutil  # type: ignore[import-untyped]
 
 from ml_harness.adapters.data.task import read_csv
+from ml_harness.adapters.ml.diagnostics import IndependentErrorAnalyzer
 from ml_harness.adapters.storage.journal import JsonlExperimentStore
-from ml_harness.application.ports.execution import Evaluator, ExperimentRunner
+from ml_harness.application.ports.execution import ErrorAnalyzer, Evaluator, ExperimentRunner
+from ml_harness.application.use_cases.context import diagnostic_summary
+from ml_harness.application.use_cases.directions import ResearchDirection, validate_parent
 from ml_harness.application.use_cases.experiment import execute_experiment
 from ml_harness.domain.models import (
     ContractError,
     Experiment,
     Hypothesis,
     PreparedTask,
+    Score,
     TaskKind,
     ValidationProtocol,
 )
@@ -46,16 +50,32 @@ def write_json(path: Path, value: Any) -> None:
 def smoke_task(task: PreparedTask) -> PreparedTask:
     """Keep disjoint partitions and every class; smoke is a different protocol/level."""
     _, rows = read_csv(Path(task.spec.train_path))
+
+    def sample(source: tuple[int, ...] | list[int], count: int) -> tuple[int, ...]:
+        if len(source) <= count:
+            return tuple(source)
+        return tuple(source[round(i * (len(source) - 1) / (count - 1))] for i in range(count))
+
     partitions = []
     for source in (task.protocol.train_indices, task.protocol.validation_indices):
         if task.spec.kind == TaskKind.REGRESSION:
-            selected = source[: min(256, len(source))]
+            selected = sample(source, 256)
         else:
             strata: dict[str, list[int]] = defaultdict(list)
             for index in source:
                 strata[rows[index][task.spec.target]].append(index)
-            selected = tuple(sorted(index for values in strata.values() for index in values[:20]))
-        partitions.append(tuple(selected))
+            selected = tuple(
+                sorted(index for values in strata.values() for index in sample(values, 20))
+            )
+        for column in (task.spec.group_column, task.spec.time_column):
+            if column and len({rows[index][column] for index in selected}) < 2:
+                other = next(
+                    (index for index in source if rows[index][column] != rows[selected[0]][column]),
+                    None,
+                )
+                if other is not None:
+                    selected = (*selected, other)
+        partitions.append(tuple(sorted(set(selected))))
     fingerprint = hashlib.sha256(
         json.dumps((task.protocol.fingerprint, partitions, "smoke")).encode()
     ).hexdigest()
@@ -81,9 +101,14 @@ class ResearchWorkspace:
         *,
         threads: int = 8,
         timeout_seconds: float = 600,
+        analyzer: ErrorAnalyzer | None = None,
     ) -> None:
         self.task, self.path = task, path.resolve()
         self.runner, self.evaluator = runner, evaluator
+        self.analyzer = analyzer or IndependentErrorAnalyzer()
+        self.baseline_report: dict[str, Any] | None = None
+        self.active_parent_id: str | None = None
+        self.active_direction: ResearchDirection | None = None
         self.threads, self.timeout_seconds = threads, timeout_seconds
         self.path.mkdir(parents=True, exist_ok=True)
         candidate = self.path / "candidate.py"
@@ -135,11 +160,158 @@ class ResearchWorkspace:
                 "features": features,
                 "target_profile": targets,
                 "protocol": self.task.protocol.fingerprint,
+                "baseline_errors": diagnostic_summary(
+                    (self.baseline_report or {}).get("error_report", {})
+                ),
             }
         return self._profile
 
     def read_experiments(self) -> list[dict[str, Any]]:
-        return deepcopy(self.reports)
+        return deepcopy(([self.baseline_report] if self.baseline_report else []) + self.reports)
+
+    def register_baseline(
+        self,
+        score: Score,
+        output_path: Path | None,
+        *,
+        backend: str = "catboost",
+        parameters: dict[str, Any] | None = None,
+    ) -> None:
+        options = {"backend": backend, **(parameters or {})}
+        code = (
+            "from ml_harness.adapters.ml.candidates import build_model as base_model\n\n"
+            "def build_model(kind, parameters, threads, seed):\n"
+            f"    options = {options!r}\n"
+            "    options.update(parameters)\n"
+            "    return base_model(kind, options, threads, seed)\n"
+        ).encode()
+        digest, code_path = self.store.save_code(code)
+        if self.baseline_report is not None:
+            if self.baseline_report["code_hash"] != digest or self.baseline_report[
+                "full_score"
+            ] != asdict(score):
+                raise ContractError("Saved baseline code/score changed")
+            if output_path is not None and self.baseline_report.get("prediction_hash"):
+                if (
+                    hashlib.sha256(output_path.read_bytes()).hexdigest()
+                    != self.baseline_report["prediction_hash"]
+                ):
+                    raise ContractError("Saved baseline predictions failed integrity check")
+            return
+        report: dict[str, Any] = {
+            "id": "baseline",
+            "parent_id": None,
+            "status": "succeeded",
+            "level": "full",
+            "measured_by": "harness",
+            "full_score": asdict(score),
+            "code_hash": digest,
+            "code_path": code_path,
+            "parameters": options,
+            "protocol_id": self.task.protocol.fingerprint,
+            "data_fingerprint": self.task.protocol.data_fingerprint,
+            "hypothesis": "Fixed initial pipeline",
+            "llm_commentary": None,
+            "error_report": {},
+            "diagnostic_status": "unavailable_baseline_predictions",
+        }
+        if output_path is not None and output_path.exists():
+            output = json.loads(output_path.read_text(encoding="utf-8"))
+            measured = self.evaluator.evaluate(self.task, output)
+            if measured != score:
+                raise ContractError("Baseline summary disagrees with independent reevaluation")
+            report.update(
+                prediction_path=str(output_path.resolve()),
+                prediction_hash=hashlib.sha256(output_path.read_bytes()).hexdigest(),
+                error_report=self.analyzer.analyze(self.task, output),
+                diagnostic_status="measured",
+            )
+        self.store.append(
+            {"event_id": "baseline", "kind": "baseline_registered", "payload": report}
+        )
+        self.baseline_report = report
+        self._profile = None
+
+    def prepare_hypothesis(self, decision: ResearchDirection, identifier: str) -> None:
+        parent = (
+            self.baseline_report
+            if decision.parent_id == "baseline"
+            else next(
+                (report for report in self.reports if report["id"] == decision.parent_id), None
+            )
+        )
+        if parent is None:
+            raise ContractError("Selected parent is unavailable")
+        validate_parent(self.task, parent)
+        code = Path(parent["code_path"]).read_bytes()
+        if hashlib.sha256(code).hexdigest() != parent["code_hash"]:
+            raise ContractError("Selected parent code failed integrity check")
+        temporary = self.path / "candidate.py.tmp"
+        temporary.write_bytes(code)
+        temporary.replace(self.path / "candidate.py")
+        self.active_parent_id = decision.parent_id
+        self.active_direction = decision
+        payload = {"session_id": identifier, **asdict(decision)}
+        self.store.append(
+            {
+                "event_id": "hypothesis:" + identifier,
+                "kind": "hypothesis_started",
+                "payload": payload,
+            }
+        )
+        write_json(self.path / "decisions" / (identifier + ".json"), payload)
+
+    def _parent_output(self, parent_id: str | None) -> dict[str, Any] | None:
+        if parent_id is None:
+            return None
+        parent = (
+            self.baseline_report
+            if parent_id == "baseline"
+            else next((report for report in self.reports if report["id"] == parent_id), None)
+        )
+        if parent is None:
+            if parent_id == "baseline":
+                return None  # Direct offline use may have no initial-pipeline artifact.
+            raise ContractError("Unknown experiment parent")
+        validate_parent(self.task, parent)
+        path = parent.get("prediction_path")
+        if path is None and parent_id != "baseline":
+            path = str(self.path / "experiments" / parent_id / "full/result.json")
+        if path is None:
+            return None
+        file = Path(path)
+        if (
+            parent.get("prediction_hash")
+            and hashlib.sha256(file.read_bytes()).hexdigest() != parent["prediction_hash"]
+        ):
+            raise ContractError("Parent predictions failed integrity check")
+        value = json.loads(file.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ContractError("Parent predictions must be an object")
+        return value
+
+    def _attach_diagnostics(self, report: dict[str, Any]) -> None:
+        if report["status"] != "succeeded":
+            return
+        file = self.path / "experiments" / report["id"] / "full/result.json"
+        output = json.loads(file.read_text(encoding="utf-8"))
+        parent_output = self._parent_output(report.get("parent_id"))
+        report.update(
+            prediction_path=str(file),
+            prediction_hash=hashlib.sha256(file.read_bytes()).hexdigest(),
+            error_report=self.analyzer.analyze(self.task, output, parent_output),
+            diagnostic_status="measured",
+        )
+        if "tuning_report" in output:
+            report["tuning_report"] = output["tuning_report"]
+            report["requested_parameters_hash"] = report["parameters_hash"]
+            report["parameters"] = {
+                "factory_arguments": {},
+                "selected_optuna": output["tuning_report"]["best"]["params"],
+            }
+            report["parameters_hash"] = hashlib.sha256(
+                json.dumps(report["parameters"], sort_keys=True, allow_nan=False).encode()
+            ).hexdigest()
 
     def _restore(self) -> None:
         experiments: dict[str, dict[str, Any]] = {}
@@ -150,6 +322,8 @@ class ResearchWorkspace:
                 experiments[record["id"]] = record
             elif event["kind"] == "session_finished":
                 sessions.append(event["payload"])
+            elif event["kind"] == "baseline_registered":
+                self.baseline_report = event["payload"]
         for report in experiments.values():
             if "code_path" in report:
                 version = Path(report["code_path"])
@@ -201,6 +375,8 @@ class ResearchWorkspace:
                     )
             except (ValueError, OSError):
                 report.update(status="failed", error="Interrupted result failed validation")
+        if report["status"] == "succeeded":
+            self._attach_diagnostics(report)
         self._finish_record(report)
 
     def _finish_record(self, report: dict[str, Any]) -> None:
@@ -245,7 +421,15 @@ class ResearchWorkspace:
         self._apply_session(payload)
 
     def run_experiment(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        arguments = dict(arguments)
         identifier = arguments["experiment_id"]
+        if identifier == "baseline":
+            raise ContractError("The baseline experiment ID is reserved")
+        parent_id = arguments.get("parent_id") or self.active_parent_id
+        if self.active_parent_id is not None and parent_id != self.active_parent_id:
+            raise ContractError("Parent differs from this hypothesis; start a new session")
+        arguments["parent_id"] = parent_id
+        self._parent_output(parent_id)  # Validate lineage before spending training time.
         candidate = self.path / "candidate.py"
         code = candidate.read_bytes()
         digest, version_path = self.store.save_code(code)
@@ -268,6 +452,10 @@ class ResearchWorkspace:
             "id": identifier,
             "parent_id": arguments.get("parent_id"),
             "hypothesis": arguments["hypothesis"],
+            "hypothesis_source": arguments.get("hypothesis_source", "tool_call"),
+            "target_errors": (
+                deepcopy(self.active_direction.target_errors) if self.active_direction else ()
+            ),
             "expected_effect": arguments["expected_effect"],
             "code_hash": digest,
             "parameters": {},
@@ -317,6 +505,10 @@ class ResearchWorkspace:
             )
         except (ContractError, OSError, ValueError) as exc:
             report.update(status="failed", error=str(exc)[:2000], elapsed_seconds=0.0)
+        try:
+            self._attach_diagnostics(report)
+        except (ContractError, OSError, ValueError) as exc:
+            report.update(diagnostic_status="failed", diagnostic_error=str(exc)[:2000])
         self._finish_record(report)
         self.reports.append(report)
         return report

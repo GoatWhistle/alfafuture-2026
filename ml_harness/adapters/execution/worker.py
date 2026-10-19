@@ -54,7 +54,26 @@ def run(request: dict[str, Any]) -> None:
             keep_default_na=False,
             na_values=missing,
         )
-    model.fit(fit_frame[features], fit_frame[spec["target"]])
+    configure = getattr(model, "configure_validation", None)
+    if configure is not None:
+        configure(
+            {
+                "kind": protocol["kind"],
+                "time_column": spec.get("time_column"),
+                "group_column": spec.get("group_column"),
+                "metric": spec["metric"],
+            }
+        )
+    try:
+        model.fit(fit_frame[features], fit_frame[spec["target"]])
+    finally:
+        tuning = getattr(model, "tuning_report_", None)
+        if tuning:
+            output = Path(request["output_dir"])
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "tuning.json").write_text(
+                json.dumps(tuning, allow_nan=False), encoding="utf-8"
+            )
     if spec["prediction_kind"] == "probabilities":
         predictions = np.asarray(model.predict_proba(predict_frame[features]))
     else:
@@ -65,6 +84,8 @@ def run(request: dict[str, Any]) -> None:
         "classes": np.asarray(getattr(model, "classes_", [])).tolist(),
         "worker_seconds": time.monotonic() - started,
     }
+    if hasattr(model, "tuning_report_"):
+        result["tuning_report"] = model.tuning_report_
     serialized = json.dumps(result, ensure_ascii=False, allow_nan=False)
     output = Path(request["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
