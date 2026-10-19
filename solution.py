@@ -1,4 +1,4 @@
-"""Competition entrypoint; the research workflow will be added in the implementation phase."""
+"""Competition entrypoint; composes the validated tabular pipeline."""
 
 from ml_harness.entrypoints.cli import main
 
