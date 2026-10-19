@@ -88,8 +88,10 @@ class QwenLanguageModel:
                     and (error.status_code == 429 or error.status_code >= 500)
                 )
                 if not retryable or attempt == self.max_attempts:
-                    raise ModelError(f"Qwen request failed after {attempt} attempt(s)") from None
+                    raise ModelError(
+                        f"Qwen request failed after {attempt} attempt(s)", attempts=attempt
+                    ) from None
                 time.sleep(min(0.25 * 2 ** (attempt - 1), 2.0))
             except (AttributeError, IndexError, TypeError, ValueError):
-                raise ModelError("Malformed Qwen response") from None
+                raise ModelError("Malformed Qwen response", attempts=attempt) from None
         raise ModelError("Qwen request exhausted attempts")

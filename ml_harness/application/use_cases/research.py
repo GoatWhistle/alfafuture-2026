@@ -15,6 +15,7 @@ and full validation and measures the declared metric independently. Do not claim
 without measured evidence. Read failures, repair the candidate within the available tool budget,
 and interpret observations without claiming causality. Never modify the evaluator, split or
 submission format. Do not download data, weights or packages. Do not request other language models.
+Use a new experiment ID for new code. One successful full experiment ends this hypothesis session.
 Finish with a brief interpretation of the measured result, including failures. A smoke result is
 never a full result. The previously saved baseline remains available if the experiment fails.
 """
@@ -30,6 +31,7 @@ class SessionResult:
     output_tokens: int
     usage_known: bool
     reports: tuple[dict[str, Any], ...]
+    api_attempts: int
 
 
 def run_session(
@@ -42,27 +44,52 @@ def run_session(
     max_steps: int = 12,
     max_tool_errors: int = 3,
     reserve_seconds: float = 30,
+    history_char_limit: int = 48000,
 ) -> SessionResult:
+    if history_char_limit < 4096:
+        raise ValueError("History limit must be at least 4096 characters")
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": context},
+        {"role": "user", "content": context[: history_char_limit // 2]},
     ]
-    errors = input_tokens = output_tokens = steps = 0
+    errors = input_tokens = output_tokens = steps = api_attempts = 0
     usage_known = True
     reports: list[dict[str, Any]] = []
     reason, summary = "step_limit", ""
+    awaiting_interpretation = False
     for _ in range(max_steps):
         if not budget.can_search(clock.now(), reserve_seconds):
             reason = "budget_exhausted"
             break
+        if len(json.dumps(messages, ensure_ascii=False)) > history_char_limit:
+            # Rebuild without orphan tool replies; full history stays on disk.
+            observations = [message for message in messages[2:] if message["role"] == "tool"][-3:]
+            recent = [
+                {"tool_call_id": message["tool_call_id"], "observation": message["content"][:2000]}
+                for message in observations
+            ]
+            messages = messages[:2] + [
+                {
+                    "role": "user",
+                    "content": "History shortened for context budget; recent observations: "
+                    + json.dumps(recent, ensure_ascii=False),
+                }
+            ]
+        while len(json.dumps(messages, ensure_ascii=False)) > history_char_limit:
+            largest = max(range(1, len(messages)), key=lambda i: len(messages[i]["content"]))
+            text = messages[largest]["content"]
+            messages[largest]["content"] = text[: len(text) // 2]
         try:
-            reply = model.complete(messages, tools.schemas)
-        except ModelError:
+            reply = model.complete(messages, [] if awaiting_interpretation else tools.schemas)
+        except ModelError as exc:
             budget.record_attempt(0)
+            budget.attempts_used += max(0, exc.attempts - 1)
+            api_attempts += exc.attempts
             usage_known = False
             reason = "model_error"
             break
         steps += 1
+        api_attempts += reply.attempts
         budget.record_attempt(reply.input_tokens + reply.output_tokens)
         budget.attempts_used += max(0, reply.attempts - 1)
         input_tokens += reply.input_tokens
@@ -82,7 +109,7 @@ def run_session(
                 for call in reply.tool_calls
             ]
         messages.append(assistant)
-        if not reply.tool_calls:
+        if not reply.tool_calls or awaiting_interpretation:
             summary, reason = reply.content[:8000], "model_finished"
             break
         for call in reply.tool_calls:
@@ -103,11 +130,29 @@ def run_session(
                 reports.append(result["result"])
                 if result["result"].get("status") != "succeeded":
                     errors += 1
+                else:
+                    awaiting_interpretation = True
             if errors >= max_tool_errors:
                 reason = "tool_error_limit"
                 break
+            if awaiting_interpretation:
+                break
+        completed_ids = {
+            message["tool_call_id"] for message in messages if message["role"] == "tool"
+        }
+        assistant["tool_calls"] = [
+            item for item in assistant.get("tool_calls", []) if item["id"] in completed_ids
+        ]
         if reason in ("budget_exhausted", "tool_error_limit"):
             break
     return SessionResult(
-        reason, summary, steps, errors, input_tokens, output_tokens, usage_known, tuple(reports)
+        reason,
+        summary,
+        steps,
+        errors,
+        input_tokens,
+        output_tokens,
+        usage_known,
+        tuple(reports),
+        api_attempts,
     )

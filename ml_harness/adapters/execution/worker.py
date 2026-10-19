@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from ml_harness.adapters.ml.candidates import build_model
 
 def run(request: dict[str, Any]) -> None:
     """Materialize the specified split and write finite JSON predictions."""
+    started = time.monotonic()
     spec = request["spec"]
     protocol = request["protocol"]
     if request["mode"] not in ("validation", "refit"):
@@ -61,6 +63,7 @@ def run(request: dict[str, Any]) -> None:
         "ids": predict_frame[spec["id_column"]].tolist(),
         "predictions": predictions.tolist(),
         "classes": np.asarray(getattr(model, "classes_", [])).tolist(),
+        "worker_seconds": time.monotonic() - started,
     }
     serialized = json.dumps(result, ensure_ascii=False, allow_nan=False)
     output = Path(request["output_dir"])

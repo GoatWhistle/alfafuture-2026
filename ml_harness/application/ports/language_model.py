@@ -7,6 +7,10 @@ from typing import Any, Protocol
 class ModelError(RuntimeError):
     """A bounded model request failed; previously saved results remain usable."""
 
+    def __init__(self, message: str, *, attempts: int = 1) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
 
 @dataclass(frozen=True)
 class ToolCall:

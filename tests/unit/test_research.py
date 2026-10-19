@@ -82,3 +82,39 @@ def test_exhausted_budget_never_calls_model():
 def test_no_tools_means_finished_without_fabricated_experiments():
     result = session(FakeLanguageModel([ModelReply("could not improve")]), FakeTools([]))
     assert result.reason == "model_finished" and result.reports == ()
+
+
+def test_tool_history_is_bounded_even_for_escaped_large_strings():
+    model = FakeLanguageModel(
+        [
+            ModelReply("", (ToolCall("read", "read_file", "{}"),)),
+            ModelReply("done"),
+        ]
+    )
+    tools = FakeTools([{"ok": True, "result": {"text": "\x00" * 100000}}])
+    result = run_session(
+        model,
+        tools,
+        "\x00" * 10000,
+        RunBudget(1000, 10000, 10),
+        FakeClock(),
+        history_char_limit=8000,
+    )
+    assert result.reason == "model_finished"
+    assert all(len(json.dumps(messages, ensure_ascii=False)) <= 8000 for messages in model.messages)
+
+
+def test_new_hypothesis_is_not_executed_in_same_session():
+    model = FakeLanguageModel(
+        [
+            ModelReply(
+                "", (ToolCall("run", "run_experiment", "{}"), ToolCall("extra", "edit_file", "{}"))
+            ),
+            ModelReply("", (ToolCall("new", "run_experiment", "{}"),)),
+        ]
+    )
+    tools = FakeTools([{"ok": True, "result": {"status": "succeeded"}}])
+    result = session(model, tools)
+    assert len(tools.calls) == 1 and len(result.reports) == 1
+    # The skipped tool must not leave an orphan call in the next provider request.
+    assert len(model.messages[1][-2]["tool_calls"]) == 1

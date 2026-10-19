@@ -71,6 +71,16 @@ class SubprocessRunner:
                 stderr=stderr,
                 start_new_session=True,
             )
+            (output_dir / "process.json").write_text(
+                json.dumps(
+                    {
+                        "pid": process.pid,
+                        "created_at": psutil.Process(process.pid).create_time(),
+                        "timeout_seconds": timeout_seconds,
+                    }
+                ),
+                encoding="utf-8",
+            )
             try:
                 while process.poll() is None:
                     if time.monotonic() - started >= timeout_seconds:

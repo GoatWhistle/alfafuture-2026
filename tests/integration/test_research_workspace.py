@@ -155,6 +155,7 @@ def test_research_promotes_measured_improvement_after_valid_refit(tmp_path, monk
         timeout_seconds=10,
         max_steps=3,
         token_limit=1000,
+        max_sessions=1,
     )
     assert report["selected"] == "regularization"
     assert report["refit_status"] == "succeeded"
@@ -188,6 +189,88 @@ def test_api_failure_retains_baseline_csv(tmp_path, monkeypatch):
         timeout_seconds=10,
         max_steps=3,
         token_limit=1000,
+        max_sessions=1,
     )
     assert report["status"] == "model_error" and report["selected"] == "baseline"
     assert Path(task.spec.submission_path).read_text() == "previous valid file"
+
+
+def test_new_hypotheses_get_short_sessions_with_prior_evidence(tmp_path, monkeypatch):
+    import ml_harness.entrypoints.research as entrypoint
+    from ml_harness.application.use_cases.baseline import BaselineResult
+    from ml_harness.domain.models import Metric, Score
+
+    task = CsvTaskData().prepare(str(task_fixture(tmp_path)), 42)
+    code = STARTER.replace('"iterations": 200', '"iterations": 3')
+    replies = []
+    for index in range(2):
+        replies.extend(
+            [
+                ModelReply(
+                    "hypothesis",
+                    (
+                        ToolCall(
+                            f"edit-{index}",
+                            "edit_file",
+                            json.dumps({"path": "candidate.py", "content": code}),
+                        ),
+                        ToolCall(
+                            f"run-{index}",
+                            "run_experiment",
+                            json.dumps(
+                                {
+                                    "experiment_id": f"attempt-{index}",
+                                    "hypothesis": f"hypothesis {index}",
+                                    "expected_effect": "lower RMSE",
+                                    "parent_id": None,
+                                }
+                            ),
+                        ),
+                    ),
+                    5,
+                    2,
+                ),
+                ModelReply(f"interpretation {index}", (), 5, 2),
+            ]
+        )
+
+    class MultipleSessions:
+        def __init__(self):
+            self.replies = iter(replies)
+            self.starts = []
+
+        def complete(self, messages, tools):
+            if len(messages) == 2:
+                self.starts.append(json.loads(messages[1]["content"]))
+            return next(self.replies)
+
+    model = MultipleSessions()
+    monkeypatch.setattr(entrypoint, "QwenLanguageModel", lambda *args: model)
+    for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"):
+        monkeypatch.setenv(key, "synthetic")
+    baseline = BaselineResult(
+        Score(1000, Metric.RMSE, task.protocol.fingerprint), task.spec.submission_path, 1, 1
+    )
+    result = entrypoint.research_after_baseline(
+        task,
+        baseline,
+        tmp_path / "research",
+        threads=1,
+        timeout_seconds=10,
+        max_steps=3,
+        token_limit=1000,
+        max_sessions=2,
+    )
+    assert len(model.starts) == 2 and len(result["sessions"]) == 2
+    assert model.starts[0]["reports"] == []
+    previous = model.starts[1]["reports"][0]
+    assert previous["id"] == "attempt-0"
+    assert previous["interpretation"] == "interpretation 0"
+    assert previous["measured"]["protocol_id"] == task.protocol.fingerprint
+    assert result["tokens_used"] == 28
+    restored = ResearchWorkspace(
+        task, tmp_path / "research", SubprocessRunner(), IndependentEvaluator()
+    )
+    assert restored.reports[0]["usage"]["scope"] == "shared_session"
+    assert restored.reports[0]["usage"]["input_tokens"] == 10
+    assert restored.reports[0]["usage"]["api_attempts"] == 2
