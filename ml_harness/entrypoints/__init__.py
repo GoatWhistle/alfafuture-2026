@@ -1,0 +1,1 @@
+"""CLI and composition root."""

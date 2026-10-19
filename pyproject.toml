@@ -1,0 +1,131 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alfa-ml-harness"
+version = "0.1.0"
+description = "A ReAct agent and experiment harness for autonomous tabular ML research"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "catboost==1.2.8",
+    "cloudpickle==3.1.1",
+    "httpx==0.28.1",
+    "joblib==1.4.2",
+    "lightgbm==4.6.0",
+    "numpy==1.26.4",
+    "openai==1.68.2",
+    "optuna==4.2.1",
+    "pandas==2.2.3",
+    "psutil==6.1.1",
+    "pydantic==2.10.6",
+    "python-dotenv==1.0.1",
+    "scikit-learn==1.5.2",
+    "scipy==1.12.0",
+    "tenacity==9.0.0",
+    "threadpoolctl==3.6.0",
+    "xgboost==2.1.4",
+]
+
+[project.optional-dependencies]
+automl = ["autogluon.tabular[lightgbm,catboost,xgboost]==1.3.1"]
+
+[dependency-groups]
+dev = [
+    "import-linter==2.3",
+    "mypy==1.15.0",
+    "pytest==8.3.5",
+    "ruff==0.11.2",
+]
+
+[tool.setuptools.packages.find]
+include = ["ml_harness*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["task/reference"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["ml_harness", "solution.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: filesystem and subprocess integration checks",
+    "live: explicit checks requiring the provided Qwen API",
+]
+
+[tool.importlinter]
+root_package = "ml_harness"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Dependencies point inward"
+type = "layers"
+layers = [
+    "ml_harness.entrypoints",
+    "ml_harness.adapters",
+    "ml_harness.application",
+    "ml_harness.domain",
+]
+
+[[tool.importlinter.contracts]]
+name = "Core is independent of framework and ML libraries"
+type = "forbidden"
+source_modules = ["ml_harness.domain", "ml_harness.application"]
+forbidden_modules = [
+    "openai", "httpx", "pydantic", "pandas", "numpy", "scipy", "sklearn",
+    "catboost", "lightgbm", "xgboost", "optuna", "autogluon", "psutil",
+]
+
+[tool.uv]
+required-version = "==0.9.17"
+environments = ["sys_platform == 'darwin'", "sys_platform == 'linux'"]
+# Organizer pins also constrain transitive dependencies; this does not install unused packages.
+constraint-dependencies = [
+    "numpy==1.26.4",
+    "scipy==1.12.0",
+    "pandas==2.2.3",
+    "polars==1.26.0",
+    "pyarrow==19.0.1",
+    "joblib==1.4.2",
+    "threadpoolctl==3.6.0",
+    "scikit-learn==1.5.2",
+    "catboost==1.2.8",
+    "lightgbm==4.6.0",
+    "xgboost==2.1.4",
+    "imbalanced-learn==0.12.4",
+    "category-encoders==2.6.4",
+    "feature-engine==1.8.3",
+    "statsmodels==0.14.0",
+    "optuna==4.2.1",
+    "torch==2.5.1",
+    "autogluon.tabular[lightgbm,catboost,xgboost]==1.3.1",
+    "lightautoml==0.4.2",
+    "flaml[automl]==2.3.6",
+    "openai==1.68.2",
+    "httpx==0.28.1",
+    "tenacity==9.0.0",
+    "langchain==0.3.27",
+    "langchain-openai==0.3.23",
+    "langgraph==0.6.7",
+    "pydantic==2.10.6",
+    "python-dotenv==1.0.1",
+    "PyYAML==6.0.2",
+    "orjson==3.10.15",
+    "jsonschema==4.23.0",
+    "matplotlib==3.9.4",
+    "seaborn==0.13.2",
+    "tqdm==4.67.1",
+    "psutil==6.1.1",
+    "cloudpickle==3.1.1",
+    "setuptools==80.9.0",
+]
