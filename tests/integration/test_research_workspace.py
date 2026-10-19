@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from test_prepare_task import task_fixture
 
 from ml_harness.adapters.data.task import CsvTaskData
@@ -50,6 +51,38 @@ class ScriptedModel:
     def complete(self, messages, tools):
         self.observed = list(messages)
         return next(self.replies)
+
+
+def test_interrupted_model_session_never_resets_unknown_provider_usage(tmp_path, monkeypatch):
+    import ml_harness.entrypoints.research as entrypoint
+    from ml_harness.application.use_cases.baseline import BaselineResult
+    from ml_harness.domain.models import Metric, Score
+
+    task = CsvTaskData().prepare(str(task_fixture(tmp_path)), 42)
+    baseline = BaselineResult(
+        Score(100, Metric.RMSE, task.protocol.fingerprint), task.spec.submission_path, 1, 1
+    )
+    Path(task.spec.submission_path).write_text("saved baseline bytes")
+
+    class InterruptedModel:
+        def complete(self, messages, tools):
+            raise KeyboardInterrupt("Process interrupted while provider usage is unknown")
+
+    monkeypatch.setattr(entrypoint, "QwenLanguageModel", lambda *args: InterruptedModel())
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"):
+        monkeypatch.setenv(name, "synthetic")
+    arguments = dict(threads=1, timeout_seconds=10, max_steps=3, token_limit=1000)
+    with pytest.raises(KeyboardInterrupt):
+        entrypoint.research_after_baseline(task, baseline, tmp_path / "research", **arguments)
+
+    def forbidden_model(*args):
+        pytest.fail("Resume must stop further calls when prior provider usage is unknown")
+
+    monkeypatch.setattr(entrypoint, "QwenLanguageModel", forbidden_model)
+    report = entrypoint.research_after_baseline(task, baseline, tmp_path / "research", **arguments)
+    assert report["status"] == "unknown_usage"
+    assert report["sessions"] == []
+    assert Path(task.spec.submission_path).read_text() == "saved baseline bytes"
 
 
 def test_edit_smoke_full_evaluation_and_idempotence(tmp_path):
@@ -160,6 +193,25 @@ def test_research_promotes_measured_improvement_after_valid_refit(tmp_path, monk
     assert report["selected"] == "regularization"
     assert report["refit_status"] == "succeeded"
     assert Path(task.spec.submission_path).read_text().startswith("key,response")
+    published = Path(task.spec.submission_path).read_bytes()
+
+    def forbidden_model(*args):
+        raise AssertionError("Frozen control/finalization must never restart model research")
+
+    monkeypatch.setattr(entrypoint, "QwenLanguageModel", forbidden_model)
+    resumed = entrypoint.research_after_baseline(
+        task,
+        baseline,
+        tmp_path / "research",
+        threads=1,
+        timeout_seconds=10,
+        max_steps=3,
+        token_limit=1000,
+        max_sessions=10,
+    )
+    assert resumed["status"] == "finalization_resumed"
+    assert resumed["sessions"] == []
+    assert Path(task.spec.submission_path).read_bytes() == published
 
 
 def test_api_failure_retains_baseline_csv(tmp_path, monkeypatch):

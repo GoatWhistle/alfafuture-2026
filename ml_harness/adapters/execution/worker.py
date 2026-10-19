@@ -18,7 +18,7 @@ def run(request: dict[str, Any]) -> None:
     started = time.monotonic()
     spec = request["spec"]
     protocol = request["protocol"]
-    if request["mode"] not in ("validation", "refit"):
+    if request["mode"] not in ("validation", "control", "fallback", "refit"):
         raise ValueError("Unknown worker mode")
     if request["threads"] < 1:
         raise ValueError("threads must be positive")
@@ -43,11 +43,43 @@ def run(request: dict[str, Any]) -> None:
     # Missing markers apply to features only: IDs and class labels are literal CSV text.
     missing = {column: [""] for column in features}
     train = pd.read_csv(spec["train_path"], dtype=dtypes, keep_default_na=False, na_values=missing)
-    if request["mode"] == "validation":
+    if request["mode"] in ("validation", "control"):
+        fit_indices = protocol["train_indices"]
+        predict_indices = protocol["validation_indices"]
+        all_indices = fit_indices + predict_indices
+        if (
+            not fit_indices
+            or not predict_indices
+            or len(set(all_indices)) != len(all_indices)
+            or any(
+                not isinstance(i, int) or isinstance(i, bool) or i < 0 or i >= len(train)
+                for i in all_indices
+            )
+            or (
+                request["mode"] == "control"
+                and (protocol.get("control_indices") or protocol.get("level") != "full")
+            )
+        ):
+            raise ValueError("Invalid worker validation partitions")
         fit_frame = train.iloc[protocol["train_indices"]]
         predict_frame = train.iloc[protocol["validation_indices"]]
     else:
-        fit_frame = train
+        if request["mode"] == "fallback":
+            development = protocol["train_indices"] + protocol["validation_indices"]
+            controls = set(protocol.get("control_indices", []))
+            if (
+                not development
+                or len(set(development)) != len(development)
+                or controls.intersection(development)
+                or any(
+                    not isinstance(i, int) or isinstance(i, bool) or i < 0 or i >= len(train)
+                    for i in development
+                )
+            ):
+                raise ValueError("Invalid fallback development partition")
+            fit_frame = train.iloc[development]
+        else:
+            fit_frame = train
         predict_frame = pd.read_csv(
             spec["test_path"],
             dtype={spec["id_column"]: str},
@@ -64,6 +96,7 @@ def run(request: dict[str, Any]) -> None:
                 "metric": spec["metric"],
             }
         )
+    fit_started = time.monotonic()
     try:
         model.fit(fit_frame[features], fit_frame[spec["target"]])
     finally:
@@ -74,6 +107,8 @@ def run(request: dict[str, Any]) -> None:
             (output / "tuning.json").write_text(
                 json.dumps(tuning, allow_nan=False), encoding="utf-8"
             )
+    fit_seconds = time.monotonic() - fit_started
+    predict_started = time.monotonic()
     if spec["prediction_kind"] == "probabilities":
         predictions = np.asarray(model.predict_proba(predict_frame[features]))
     else:
@@ -83,6 +118,8 @@ def run(request: dict[str, Any]) -> None:
         "predictions": predictions.tolist(),
         "classes": np.asarray(getattr(model, "classes_", [])).tolist(),
         "worker_seconds": time.monotonic() - started,
+        "fit_seconds": fit_seconds,
+        "predict_seconds": time.monotonic() - predict_started,
     }
     if hasattr(model, "tuning_report_"):
         result["tuning_report"] = model.tuning_report_

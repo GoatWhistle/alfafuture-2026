@@ -54,14 +54,19 @@ def verify(
     timeout_seconds: float = 600,
     hypotheses: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    task = CsvTaskData().prepare(str(task_path), 42)
+    request = json.loads((baseline_dir / "validation/request.json").read_text())
+    frozen = request["protocol"]
+    task = CsvTaskData(reserve_control=bool(frozen.get("control_indices"))).prepare(
+        str(task_path), frozen["seed"]
+    )
+    if task.protocol.fingerprint != frozen["fingerprint"]:
+        raise ContractError("Verification task differs from the saved baseline protocol")
     baseline_file = baseline_dir / "baseline.json"
     if not baseline_file.exists():
         baseline_file = baseline_dir / "summary.json"
     baseline = json.loads(baseline_file.read_text())
     raw = baseline["score"]
     score = Score(raw["value"], Metric(raw["metric"]), raw["protocol_id"], raw["level"])
-    request = json.loads((baseline_dir / "validation/request.json").read_text())
     with RunLease(output_dir / ".run.lock"):
         workspace = ResearchWorkspace(
             task,

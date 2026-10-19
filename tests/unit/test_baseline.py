@@ -11,6 +11,7 @@ from ml_harness.domain.models import ContractError, ExperimentStatus, Metric, Sc
 
 def test_baseline_evaluates_before_refit_and_write():
     task, runner, evaluator, writer = Mock(), Mock(), Mock(), Mock()
+    task.protocol.control_indices = ()
     output, refit_output = {"kind": "validation"}, {"kind": "refit"}
     runner.run.side_effect = [
         ExecutionResult(ExperimentStatus.SUCCEEDED, 2, output),

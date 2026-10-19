@@ -92,6 +92,7 @@ dependencies = [
 [package.optional-dependencies]
 automl = [
     { name = "autogluon-tabular", extra = ["catboost", "lightgbm", "xgboost"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "setuptools", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
 
 [package.dev-dependencies]
@@ -119,6 +120,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = "==1.0.1" },
     { name = "scikit-learn", specifier = "==1.5.2" },
     { name = "scipy", specifier = "==1.12.0" },
+    { name = "setuptools", marker = "extra == 'automl'", specifier = "==80.9.0" },
     { name = "tenacity", specifier = "==9.0.0" },
     { name = "threadpoolctl", specifier = "==3.6.0" },
     { name = "xgboost", specifier = "==2.1.4" },
@@ -1014,6 +1016,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/db/fd/81feac476e1ae495b51b8c3636aee1f50a1c5ca2a3557f5b0043d4e2fb02/scipy-1.12.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:9c39f92041f490422924dfdb782527a4abddf4707616e07b021de33467f917bc", size = 34165749, upload-time = "2024-01-20T21:12:06.38Z" },
     { url = "https://files.pythonhosted.org/packages/11/7d/850bfe9462fff393130519eb54f97d43ad9c280ec4297b4cb98b7c2e96cd/scipy-1.12.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a7ebda398f86e56178c2fa94cad15bf457a218a54a35c2a7b4490b9f9cb2676c", size = 37790844, upload-time = "2024-01-20T21:12:12.826Z" },
     { url = "https://files.pythonhosted.org/packages/7e/7f/504b7b3834d8c9229831c6c58a44943e29a34004eeb34c7ff150add4e001/scipy-1.12.0-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:95e5c750d55cf518c398a8240571b0e0782c2d5a703250872f36eaf737751338", size = 38026369, upload-time = "2024-01-20T21:12:19.69Z" },
+]
+
+[[package]]
+name = "setuptools"
+version = "80.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/18/5d/3bf57dcd21979b887f014ea83c24ae194cfcd12b9e0fda66b957c69d1fca/setuptools-80.9.0.tar.gz", hash = "sha256:f36b47402ecde768dbfafc46e8e4207b4360c654f1f3bb84475f0a28628fb19c", size = 1319958, upload-time = "2025-05-27T00:56:51.443Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a3/dc/17031897dae0efacfea57dfd3a82fdd2a2aeb58e0ff71b77b87e44edc772/setuptools-80.9.0-py3-none-any.whl", hash = "sha256:062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922", size = 1201486, upload-time = "2025-05-27T00:56:49.664Z" },
 ]
 
 [[package]]

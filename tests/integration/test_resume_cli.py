@@ -59,6 +59,10 @@ def fixture_task(root, variant="regression"):
             ("c", "a", "b"),
         )
         columns = ("id", "c", "a", "b")
+    if variant == "binary":
+        train.write_text("id,x,y\n1,1,z\n2,2,a\n3,3,z\n4,4,a\n")
+    elif variant == "multiclass":
+        train.write_text("id,x,y\n1,1,c\n2,2,a\n3,3,b\n4,4,a\n")
     spec = TaskSpec(
         str(root / "task.md"),
         str(train),
@@ -75,7 +79,8 @@ def fixture_task(root, variant="regression"):
         columns,
         classes,
     )
-    protocol = ValidationProtocol("fingerprint", "data", SplitKind.RANDOM, 42, (0, 1), (2, 3))
+    training, validation = ((0, 1, 2), (3,)) if variant == "multiclass" else ((0, 1), (2, 3))
+    protocol = ValidationProtocol("fingerprint", "data", SplitKind.RANDOM, 42, training, validation)
     return PreparedTask(spec, protocol, 4, 2)
 
 
@@ -83,7 +88,7 @@ def setup_cli(monkeypatch, tmp_path, variant="regression"):
     task = fixture_task(tmp_path, variant)
     run_dir = tmp_path / "run"
     counts = {"baseline": 0, "research": 0}
-    monkeypatch.setattr(cli, "prepare_task", lambda *args: task)
+    monkeypatch.setattr(cli, "prepare_task", lambda *args, **kwargs: task)
 
     def baseline(prepared, runner, evaluator, writer, **kwargs):
         counts["baseline"] += 1
@@ -139,6 +144,27 @@ def setup_cli(monkeypatch, tmp_path, variant="regression"):
     return task, run_dir, counts, invoke
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("started_unix", "invalid"),
+        ("time_limit", -1),
+        ("token_limit", 0),
+        ("preparation_tokens", 1.5),
+        ("preparation_attempts", True),
+    ],
+)
+def test_corrupt_saved_budget_is_rejected_without_touching_csv(monkeypatch, tmp_path, field, value):
+    task, run, _, invoke = setup_cli(monkeypatch, tmp_path)
+    assert invoke("--baseline-only") == 0
+    submission = Path(task.spec.submission_path).read_bytes()
+    budget = json.loads((run / "budget.json").read_text())
+    budget[field] = value
+    (run / "budget.json").write_text(json.dumps(budget))
+    assert invoke("--resume", "--baseline-only") == 2
+    assert Path(task.spec.submission_path).read_bytes() == submission
+
+
 @pytest.mark.parametrize("variant", ["regression", "labels", "binary", "multiclass"])
 def test_resume_reuses_baseline_and_validates_current_submission(monkeypatch, tmp_path, variant):
     task, run_dir, counts, invoke = setup_cli(monkeypatch, tmp_path, variant)
@@ -182,7 +208,7 @@ def test_resume_rejects_invalid_saved_state_without_rerun(monkeypatch, tmp_path,
         manifest_path.write_text("broken")
     elif damage == "fingerprint":
         newer = replace(task, protocol=replace(task.protocol, fingerprint="changed"))
-        monkeypatch.setattr(cli, "prepare_task", lambda *args: newer)
+        monkeypatch.setattr(cli, "prepare_task", lambda *args, **kwargs: newer)
     elif damage == "baseline_missing":
         baseline_path.unlink()
     elif damage == "baseline_score":

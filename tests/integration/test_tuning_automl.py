@@ -142,7 +142,16 @@ def test_autogluon_disallows_unapproved_families_and_overrides(options):
         AutoGluonCandidate("binary", options, 1, 42)
 
 
-def test_optional_autogluon_real_cpu_smoke(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "family,options,prefix",
+    [
+        ("GBM", {"num_boost_round": 3, "min_data_in_leaf": 1}, "LightGBM"),
+        ("CAT", {"iterations": 3}, "CatBoost"),
+        ("XGB", {"n_estimators": 3}, "XGBoost"),
+    ],
+    ids=["lightgbm", "catboost", "xgboost"],
+)
+def test_optional_autogluon_real_cpu_smoke(monkeypatch, tmp_path, family, options, prefix):
     monkeypatch.chdir(tmp_path)
     require_autogluon()
     X, y = dataset()
@@ -151,7 +160,7 @@ def test_optional_autogluon_real_cpu_smoke(monkeypatch, tmp_path):
         {
             "backend": "autogluon",
             "time_limit": 30,
-            "hyperparameters": {"GBM": {"num_boost_round": 3, "min_data_in_leaf": 1}},
+            "hyperparameters": {family: options},
         },
         1,
         42,
@@ -165,7 +174,7 @@ def test_optional_autogluon_real_cpu_smoke(monkeypatch, tmp_path):
     assert probability.shape == (3, 2)
     assert np.allclose(probability.sum(axis=1), 1)
     assert set(model.classes_) == set(y)
-    assert all(name.startswith("LightGBM") for name in model.predictor.model_names())
+    assert all(name.startswith(prefix) for name in model.predictor.model_names())
 
 
 @pytest.mark.parametrize("backend", ["catboost", "lightgbm"])

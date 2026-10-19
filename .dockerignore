@@ -1,0 +1,15 @@
+*
+!pyproject.toml
+!uv.lock
+!solution.py
+!ml_harness/
+!ml_harness/**/
+!ml_harness/**/*.py
+!tests/
+!tests/**/
+!tests/**/*.py
+!verification/
+!verification/Dockerfile
+!verification/*.py
+!scripts/
+!scripts/*.py

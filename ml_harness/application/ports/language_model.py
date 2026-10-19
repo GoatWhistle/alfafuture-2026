@@ -1,7 +1,7 @@
 """Provider-independent messages, tool calls and usage."""
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
 class ModelError(RuntimeError):
@@ -33,6 +33,13 @@ class LanguageModel(Protocol):
     def complete(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelReply: ...
+
+
+@runtime_checkable
+class BudgetAwareLanguageModel(Protocol):
+    def set_limits(
+        self, remaining_seconds: float, remaining_attempts: int, remaining_tokens: int
+    ) -> None: ...
 
 
 class ToolExecutor(Protocol):

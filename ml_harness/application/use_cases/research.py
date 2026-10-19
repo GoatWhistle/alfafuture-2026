@@ -1,11 +1,17 @@
 """Bounded ReAct: tool execution is ordinary code, training never polls the LLM."""
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from ml_harness.application.ports.clock import Clock
-from ml_harness.application.ports.language_model import LanguageModel, ModelError, ToolExecutor
+from ml_harness.application.ports.language_model import (
+    BudgetAwareLanguageModel,
+    LanguageModel,
+    ModelError,
+    ToolExecutor,
+)
 from ml_harness.domain.models import RunBudget
 
 SYSTEM_PROMPT = """You are an autonomous tabular ML researcher using only the provided Qwen model.
@@ -43,7 +49,7 @@ def run_session(
     *,
     max_steps: int = 12,
     max_tool_errors: int = 3,
-    reserve_seconds: float = 30,
+    reserve_seconds: float | Callable[[], float] = 30,
     history_char_limit: int = 48000,
 ) -> SessionResult:
     if history_char_limit < 4096:
@@ -57,8 +63,12 @@ def run_session(
     reports: list[dict[str, Any]] = []
     reason, summary = "step_limit", ""
     awaiting_interpretation = False
+
+    def reserve() -> float:
+        return reserve_seconds() if callable(reserve_seconds) else reserve_seconds
+
     for _ in range(max_steps):
-        if not budget.can_search(clock.now(), reserve_seconds):
+        if not budget.can_search(clock.now(), reserve()):
             reason = "budget_exhausted"
             break
         if len(json.dumps(messages, ensure_ascii=False)) > history_char_limit:
@@ -80,12 +90,19 @@ def run_session(
             text = messages[largest]["content"]
             messages[largest]["content"] = text[: len(text) // 2]
         try:
+            if isinstance(model, BudgetAwareLanguageModel):
+                model.set_limits(
+                    max(0, budget.deadline - clock.now() - reserve()),
+                    max(0, budget.attempt_limit - budget.attempts_used),
+                    max(0, budget.token_limit - budget.tokens_used),
+                )
             reply = model.complete(messages, [] if awaiting_interpretation else tools.schemas)
         except ModelError as exc:
-            budget.record_attempt(0)
-            budget.attempts_used += max(0, exc.attempts - 1)
+            if exc.attempts > 0:
+                budget.record_attempt(0)
+                budget.attempts_used += max(0, exc.attempts - 1)
             api_attempts += exc.attempts
-            usage_known = False
+            usage_known = usage_known and exc.attempts == 0
             reason = "model_error"
             break
         steps += 1
@@ -110,10 +127,11 @@ def run_session(
             ]
         messages.append(assistant)
         if not reply.tool_calls or awaiting_interpretation:
-            summary, reason = reply.content[:8000], "model_finished"
+            summary = reply.content[:8000]
+            reason = "model_finished" if usage_known else "unknown_usage"
             break
         for call in reply.tool_calls:
-            if not budget.can_search(clock.now(), reserve_seconds):
+            if not budget.can_search(clock.now(), reserve()):
                 reason = "budget_exhausted"
                 break
             result = tools.execute(call)
@@ -143,6 +161,9 @@ def run_session(
         assistant["tool_calls"] = [
             item for item in assistant.get("tool_calls", []) if item["id"] in completed_ids
         ]
+        if not usage_known:
+            reason = "unknown_usage"
+            break
         if reason in ("budget_exhausted", "tool_error_limit"):
             break
     return SessionResult(

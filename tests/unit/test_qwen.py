@@ -143,8 +143,9 @@ def test_permanent_errors_are_not_retried(status):
 def test_invalid_configuration(overrides):
     config = dict(api_key=SECRET, base_url="https://example.test/v1", model="Qwen/given")
     config.update(overrides)
-    with pytest.raises(ModelError, match="Invalid Qwen configuration"):
+    with pytest.raises(ModelError, match="Invalid Qwen configuration") as error:
         QwenLanguageModel(**config)
+    assert error.value.attempts == 0
 
 
 def test_malformed_reply_is_sanitized():

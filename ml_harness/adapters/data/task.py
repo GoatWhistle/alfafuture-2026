@@ -208,7 +208,105 @@ def _validation(
     )
 
 
+def _reserve_control(
+    spec: TaskSpec,
+    rows: list[dict[str, str]],
+    original: ValidationProtocol,
+) -> tuple[ValidationProtocol, tuple[str, ...]]:
+    """Reserve an independent holdout without changing the declared split family."""
+
+    def unavailable(reason: str) -> tuple[ValidationProtocol, tuple[str, ...]]:
+        return original, ("Control holdout not reserved: " + reason,)
+
+    if len(rows) < 1000:
+        return unavailable("fewer than 1000 training rows")
+    labels = {row[spec.target] for row in rows}
+    classification = spec.kind != TaskKind.REGRESSION
+    if classification and min(Counter(row[spec.target] for row in rows).values()) < 20:
+        return unavailable("each class requires at least 20 rows")
+    rng = random.Random(original.seed)
+    control: list[int] = []
+    if spec.time_column:
+        raw = [row[spec.time_column] for row in rows]
+        try:
+            values: list[Any] = [float(value) for value in raw]
+        except ValueError:
+            values = [datetime.fromisoformat(value.replace("Z", "+00:00")) for value in raw]
+        order = sorted(range(len(rows)), key=lambda index: values[index])
+        boundary = int(len(rows) * 0.9)
+        while boundary > 0 and values[order[boundary - 1]] == values[order[boundary]]:
+            boundary -= 1
+        control = order[boundary:]
+    elif spec.group_column:
+        groups: dict[str, list[int]] = defaultdict(list)
+        for index, row in enumerate(rows):
+            groups[row[spec.group_column]].append(index)
+        if len(groups) < 5:
+            return unavailable("group holdout requires at least five groups")
+        keys = sorted(groups)
+        rng.shuffle(keys)
+        count = max(1, round(len(keys) * 0.1))
+        # Rotation is deterministic and never divides a group.
+        for offset in range(min(len(keys), 100)):
+            chosen = (keys + keys)[offset : offset + count]
+            candidate = [index for key in chosen for index in groups[key]]
+            if not classification or {rows[index][spec.target] for index in candidate} == labels:
+                control = candidate
+                break
+        if not control:
+            return unavailable("no group holdout with all classes")
+    elif classification:
+        strata: dict[str, list[int]] = defaultdict(list)
+        for index, row in enumerate(rows):
+            strata[row[spec.target]].append(index)
+        for _, members in sorted(strata.items()):
+            rng.shuffle(members)
+            control.extend(members[: max(1, round(len(members) * 0.1))])
+    else:
+        indices = list(range(len(rows)))
+        rng.shuffle(indices)
+        control = indices[: max(1, round(len(rows) * 0.1))]
+    reserved = set(control)
+    remaining = [index for index in range(len(rows)) if index not in reserved]
+    if not control or not remaining:
+        return unavailable("nonempty chronological holdout is impossible")
+    if classification and {rows[index][spec.target] for index in control} != labels:
+        return unavailable("control partition would miss classes")
+    try:
+        split = _validation(
+            spec, [rows[index] for index in remaining], original.data_fingerprint, original.seed
+        )
+    except ContractError:
+        return unavailable("remaining train/validation lack required class or split support")
+    train = tuple(sorted(remaining[index] for index in split.train_indices))
+    validation = tuple(sorted(remaining[index] for index in split.validation_indices))
+    heldout = tuple(sorted(control))
+    payload = (
+        original.data_fingerprint,
+        split.kind.value,
+        original.seed,
+        train,
+        validation,
+        "full",
+        heldout,
+    )
+    fingerprint = hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+    protocol = ValidationProtocol(
+        fingerprint,
+        original.data_fingerprint,
+        split.kind,
+        original.seed,
+        train,
+        validation,
+        heldout,
+    )
+    return protocol, ()
+
+
 class CsvTaskData:
+    def __init__(self, reserve_control: bool = True) -> None:
+        self.reserve_control = reserve_control
+
     def prepare(self, task_path: str, seed: int) -> PreparedTask:
         try:
             return self._prepare(Path(task_path).resolve(), seed)
@@ -337,4 +435,9 @@ class CsvTaskData:
                     digest.update(block)
         fingerprint = digest.hexdigest()
         protocol = _validation(spec, train, fingerprint, seed)
-        return PreparedTask(spec, protocol, len(train), len(test))
+        warnings: tuple[str, ...] = ()
+        if self.reserve_control:
+            protocol, warnings = _reserve_control(spec, train, protocol)
+        else:
+            warnings = ("Control holdout disabled for historical offline verification",)
+        return PreparedTask(spec, protocol, len(train), len(test), warnings)

@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+import time
 from dataclasses import asdict
 from math import isfinite
 from pathlib import Path
@@ -10,22 +11,34 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 
+from ml_harness.adapters.data.clarification import ClarifyingTaskData
 from ml_harness.adapters.data.task import CsvTaskData, read_csv
+from ml_harness.adapters.execution.budget import BudgetedRunner, BudgetedSubmissionWriter
+from ml_harness.adapters.execution.clock import SystemClock
+from ml_harness.adapters.execution.deadline import DeadlineGuard
 from ml_harness.adapters.execution.runner import SubprocessRunner
 from ml_harness.adapters.ml.evaluation import validate_predictions
 from ml_harness.adapters.research.workspace import write_json
 from ml_harness.adapters.storage.lease import RunLease
-from ml_harness.adapters.storage.submission import AtomicSubmissionWriter, IndependentEvaluator
+from ml_harness.adapters.storage.submission import (
+    AtomicSubmissionWriter,
+    IndependentEvaluator,
+    ensure_ready_submission,
+    load_submission,
+)
 from ml_harness.application.use_cases.baseline import BaselineResult, run_baseline
 from ml_harness.application.use_cases.prepare_task import prepare_task
+from ml_harness.domain.budget import BudgetExpired, WallClockBudget
 from ml_harness.domain.models import (
     ContractError,
     Metric,
     PredictionKind,
     PreparedTask,
+    RunBudget,
     Score,
     TaskKind,
 )
+from ml_harness.entrypoints.preparation import ConfiguredTaskModel
 from ml_harness.entrypoints.research import research_after_baseline
 
 
@@ -85,15 +98,20 @@ def _resume_baseline(work_dir: Path, task: PreparedTask) -> BaselineResult:
         raise ContractError(f"Cannot resume saved baseline: {error}") from error
 
 
-def main() -> int:
+def main(*, started_at: float | None = None) -> int:
+    clock = SystemClock()
+    started = started_at if started_at is not None else clock.now()
     parser = argparse.ArgumentParser(description="Autonomous tabular ML research harness")
     parser.add_argument("task", nargs="?", default=Path("task.md"), type=Path)
     parser.add_argument(
         "--backend", choices=("catboost", "lightgbm", "autogluon"), default="catboost"
     )
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=8)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--worker-timeout", type=float, default=1800)
     parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--time-budget", type=float, default=10800)
+    parser.add_argument("--memory-limit-mb", type=int, default=28000)
     parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--research-sessions", type=int, default=3)
@@ -102,46 +120,191 @@ def main() -> int:
     args = parser.parse_args()
     if args.research_steps < 1 or args.llm_token_limit < 1 or args.research_sessions < 1:
         parser.error("Research steps, sessions and token limit must be positive")
+    if (
+        not isfinite(args.time_budget)
+        or not 0 < args.time_budget <= 10800
+        or not 1 <= args.memory_limit_mb <= 28000
+    ):
+        parser.error("Time budget must be in (0,10800] and memory in 1..28000 MiB")
     if args.resume and args.run_dir is None:
         parser.error("--resume requires --run-dir")
+    if not 0 <= args.seed < 2**32:
+        parser.error("Seed must be in 0..2**32-1")
+    if not isfinite(args.worker_timeout) or args.worker_timeout <= 0:
+        parser.error("Worker timeout must be finite and positive")
     load_dotenv(Path.cwd() / ".env", override=False)
     work_dir = (args.run_dir or Path("runs") / uuid4().hex).resolve()
+    ready = False
+    task: PreparedTask | None = None
     try:
         with RunLease(work_dir / ".run.lock"):
             if not args.resume and any(path.name != ".run.lock" for path in work_dir.iterdir()):
                 raise ContractError("Run directory already contains artifacts; use --resume")
-            task = prepare_task(str(args.task), CsvTaskData())
-            if args.resume:
-                result = _resume_baseline(work_dir, task)
-            else:
-                write_json(work_dir / "prepared.json", asdict(task))
-                result = run_baseline(
-                    task,
-                    SubprocessRunner(),
-                    IndependentEvaluator(),
-                    AtomicSubmissionWriter(),
-                    work_dir=str(work_dir),
-                    backend=args.backend,
-                    threads=args.threads,
-                    timeout_seconds=args.worker_timeout,
+            budget_path = work_dir / "budget.json"
+            saved = (
+                json.loads(budget_path.read_text()) if args.resume and budget_path.exists() else {}
+            )
+            if not isinstance(saved, dict):
+                raise ContractError("Saved budget must be an object")
+            for key in (
+                "started_unix",
+                "time_limit",
+                "token_limit",
+                "validation_seconds",
+                "refit_seconds",
+                "predict_seconds",
+                "write_seconds",
+                "preparation_tokens",
+                "preparation_attempts",
+            ):
+                if key in saved and (
+                    isinstance(saved[key], bool)
+                    or not isinstance(saved[key], int | float)
+                    or not isfinite(saved[key])
+                    or saved[key] < 0
+                ):
+                    raise ContractError(f"Invalid saved budget field: {key}")
+            if "token_limit" in saved and (
+                not isinstance(saved["token_limit"], int) or saved["token_limit"] < 1
+            ):
+                raise ContractError("Saved token limit must be a positive integer")
+            for key in ("preparation_tokens", "preparation_attempts"):
+                if key in saved and type(saved[key]) is not int:
+                    raise ContractError(f"Saved budget counter must be an integer: {key}")
+            origin = saved.get("started_unix", time.time() - max(0, clock.now() - started))
+            limit = min(args.time_budget, saved.get("time_limit", args.time_budget))
+            args.llm_token_limit = min(
+                args.llm_token_limit, saved.get("token_limit", args.llm_token_limit)
+            )
+            remaining = origin + limit - time.time()
+            if remaining <= 0:
+                raise BudgetExpired("Original run deadline is exhausted")
+            budget = WallClockBudget(clock.now() + remaining)
+            preparation_budget = RunBudget(
+                budget.deadline,
+                args.llm_token_limit,
+                2,
+                int(saved.get("preparation_tokens", 0)),
+                int(saved.get("preparation_attempts", 0)),
+            )
+            data = ClarifyingTaskData(
+                CsvTaskData(),
+                ConfiguredTaskModel(),
+                work_dir / "task-clarification",
+                preparation_budget,
+                clock,
+                reserve_seconds=budget.reserve_seconds,
+            )
+            data.usage_known = saved.get("preparation_usage_known", True) is True
+            preparation_inflight = False
+            for key in ("validation_seconds", "refit_seconds", "predict_seconds", "write_seconds"):
+                if key in saved:
+                    budget.observe(key.removesuffix("_seconds"), saved[key])
+
+            def save_budget() -> None:
+                write_json(
+                    budget_path,
+                    {
+                        "started_unix": origin,
+                        "time_limit": limit,
+                        "token_limit": args.llm_token_limit,
+                        "preparation_tokens": preparation_budget.tokens_used,
+                        "preparation_attempts": preparation_budget.attempts_used,
+                        "preparation_usage_known": data.usage_known and not preparation_inflight,
+                        **{
+                            key: value for key, value in asdict(budget).items() if key != "deadline"
+                        },
+                    },
                 )
-                write_json(work_dir / "baseline.json", asdict(result))
-            details = asdict(result)
-            if not args.baseline_only:
-                details["research"] = research_after_baseline(
-                    task,
-                    result,
-                    work_dir / "research",
-                    threads=args.threads,
-                    timeout_seconds=args.worker_timeout,
-                    max_steps=args.research_steps,
-                    token_limit=args.llm_token_limit,
-                    max_sessions=args.research_sessions,
-                )
-            summary = json.dumps(details, ensure_ascii=False, indent=2)
+
+            save_budget()
+            with DeadlineGuard(remaining):
+                preparation_inflight = True
+                save_budget()
+                try:
+                    task = prepare_task(str(args.task), data, seed=args.seed)
+                except BaseException as error:
+                    # An interrupted request can have provider-side cost without returned usage.
+                    if not isinstance(error, Exception):
+                        data.usage_known = False
+                    raise
+                finally:
+                    preparation_inflight = False
+                    save_budget()
+                underlying = SubprocessRunner(memory_limit_mb=args.memory_limit_mb)
+                runner = BudgetedRunner(underlying, clock, budget, finalizing=True)
+                writer = BudgetedSubmissionWriter(AtomicSubmissionWriter(), clock, budget)
+                if args.resume:
+                    result = _resume_baseline(work_dir, task)
+                    ready = True
+                else:
+                    write_json(work_dir / "prepared.json", asdict(task))
+                    fallback = ensure_ready_submission(task, writer)
+                    write_json(work_dir / "ready.json", fallback)
+                    ready = True
+                    result = run_baseline(
+                        task,
+                        runner,
+                        IndependentEvaluator(),
+                        writer,
+                        work_dir=str(work_dir),
+                        backend=args.backend,
+                        threads=args.threads,
+                        timeout_seconds=args.worker_timeout,
+                    )
+                    write_json(work_dir / "baseline.json", asdict(result))
+                budget.observe("validation", result.validation_seconds)
+                budget.observe("refit", result.refit_seconds)
+                save_budget()
+                details = asdict(result)
+                if not args.baseline_only:
+                    details["research"] = research_after_baseline(
+                        task,
+                        result,
+                        work_dir / "research",
+                        threads=args.threads,
+                        timeout_seconds=args.worker_timeout,
+                        max_steps=args.research_steps,
+                        token_limit=args.llm_token_limit,
+                        max_sessions=args.research_sessions,
+                        runtime_budget=budget,
+                        base_runner=underlying,
+                        initial_usage={
+                            "tokens": preparation_budget.tokens_used,
+                            "attempts": preparation_budget.attempts_used,
+                            "known": data.usage_known,
+                        },
+                    )
+                else:
+                    from ml_harness.entrypoints.research import finalize_baseline
+
+                    details["finalization"] = finalize_baseline(
+                        task,
+                        result,
+                        work_dir / "research",
+                        threads=args.threads,
+                        timeout_seconds=args.worker_timeout,
+                        runtime_budget=budget,
+                        base_runner=underlying,
+                    )
+                save_budget()
+                write_json(work_dir / "summary.json", details)
+                print(json.dumps(details, ensure_ascii=False, indent=2))
+    except (BudgetExpired, ContractError, OSError, ValueError) as exc:
+        if ready and task is not None:
+            try:
+                load_submission(task)
+            except (ContractError, OSError, ValueError):
+                ready = False
+        if ready and task is not None:
+            details = {
+                "status": "fallback_preserved",
+                "submission_path": task.spec.submission_path,
+                "reason": str(exc),
+            }
             write_json(work_dir / "summary.json", details)
-            print(summary)
-    except (ContractError, OSError, ValueError) as exc:
+            print(json.dumps(details, ensure_ascii=False, indent=2))
+            return 0
         print(f"Task failed: {exc}", file=sys.stderr)
-        return 2
+        return 124 if isinstance(exc, BudgetExpired) else 2
     return 0

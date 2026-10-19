@@ -38,7 +38,13 @@ def run_baseline(
         raise ContractError(f"Validation {validation.status}: {validation.detail}")
     score = evaluator.evaluate(task, validation.output)
     refit = runner.run(
-        RunRequest(task, work_dir + "/refit", mode="refit", backend=backend, threads=threads),
+        RunRequest(
+            task,
+            work_dir + "/refit",
+            mode="fallback" if task.protocol.control_indices else "refit",
+            backend=backend,
+            threads=threads,
+        ),
         timeout_seconds,
     )
     if refit.status != ExperimentStatus.SUCCEEDED or refit.output is None:

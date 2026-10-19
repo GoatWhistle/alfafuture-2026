@@ -128,7 +128,11 @@ class ResearchWorkspace:
 
     def inspect_data(self) -> dict[str, Any]:
         if self._profile is None:
-            _, train = read_csv(Path(self.task.spec.train_path))
+            _, all_train = read_csv(Path(self.task.spec.train_path))
+            visible = sorted(
+                self.task.protocol.train_indices + self.task.protocol.validation_indices
+            )
+            train = [all_train[index] for index in visible]
             _, test = read_csv(Path(self.task.spec.test_path))
             spec = self.task.spec
             features = []
@@ -155,7 +159,9 @@ class ResearchWorkspace:
                 targets = dict(Counter(row[spec.target] for row in train))
             self._profile = {
                 "task": asdict(spec),
-                "train_rows": len(train),
+                "train_rows": self.task.train_rows,
+                "development_rows": len(train),
+                "control_rows_withheld": len(self.task.protocol.control_indices),
                 "test_rows": len(test),
                 "features": features,
                 "target_profile": targets,
@@ -200,6 +206,7 @@ class ResearchWorkspace:
             return
         report: dict[str, Any] = {
             "id": "baseline",
+            "backend": backend,
             "parent_id": None,
             "status": "succeeded",
             "level": "full",
