@@ -92,7 +92,9 @@ def verify_run(directory: Path, task_path: Path, seed: int) -> dict[str, Any]:
         "interpreted_successes": len(interpreted),
         "experiments": len(experiments),
         "research_status": research.get("status"),
-        "reported_tokens": research.get("tokens_used", 0),
+        "reported_tokens": research.get("reported_tokens", research.get("tokens_used", 0)),
+        "tokens_charged": research.get("tokens_used", 0),
+        "usage_known": research.get("usage_known", True),
         "sessions": [
             {k: s[k] for k in ("reason", "steps", "tool_errors", "api_attempts")}
             for s in research.get("sessions", [])

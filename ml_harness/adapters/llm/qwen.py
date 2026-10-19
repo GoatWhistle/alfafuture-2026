@@ -106,9 +106,14 @@ class QwenLanguageModel:
             try:
                 prompt = json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False)
                 prompt_bound = len(prompt.encode("utf-8")) + 1024
-                # Reserve a complete prompt and at least one output token for every retry.
+                # Reserve a complete prompt and usable output space for every retry.
                 # A later successful response cannot reveal tokens spent by failed requests.
-                attempts_allowed = min(attempts_allowed, remaining_tokens // (prompt_bound + 512))
+                completion_reserve = (
+                    1536 if any(t["function"]["name"] == "edit_file" for t in tools) else 512
+                )
+                attempts_allowed = min(
+                    attempts_allowed, remaining_tokens // (prompt_bound + completion_reserve)
+                )
                 if attempts_allowed <= 0:
                     raise ModelError(
                         "Qwen request budget exhausted", attempts=0, reason="budget_exhausted"
@@ -182,6 +187,22 @@ class QwenLanguageModel:
                     usage_known=valid_input and valid_output and attempt == 1,
                     attempts=attempt,
                     finish_reason=response.choices[0].finish_reason or "unknown",
+                    unreported_tokens_upper_bound=(
+                        (attempt - 1) * (prompt_bound + max_tokens)
+                        + (
+                            max(
+                                0,
+                                prompt_bound
+                                + max_tokens
+                                - (input_count if valid_input else 0)
+                                - (output_count if valid_output else 0),
+                            )
+                            if not (valid_input and valid_output)
+                            else 0
+                        )
+                        if self._limits is not None
+                        else 0
+                    ),
                 )
             except APIError as error:
                 trace.update(

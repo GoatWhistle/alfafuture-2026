@@ -203,6 +203,9 @@ def test_navigation_transitions_to_edit_then_validation_then_interpretation():
             super().__init__(replies)
             self.allowed = []
 
+        def set_limits(self, *limits):
+            pass
+
         def complete(self, messages, tools):
             self.allowed.append([tool["function"]["name"] for tool in tools])
             return super().complete(messages, tools)
@@ -212,6 +215,7 @@ def test_navigation_transitions_to_edit_then_validation_then_interpretation():
             ModelReply(
                 "", tuple(ToolCall(str(i), "read_file", '{"path":"task.md"}') for i in range(3))
             ),
+            ModelReply("Hypothesis stated, but edit still missing"),
             ModelReply(
                 "", (ToolCall("edit", "edit_file", '{"path":"candidate.py","content":"changed"}'),)
             ),
@@ -228,4 +232,55 @@ def test_navigation_transitions_to_edit_then_validation_then_interpretation():
     )
     result = session(model, tools)
     assert result.reason == "model_finished" and len(result.reports) == 1
-    assert model.allowed[1:] == [["edit_file"], ["run_experiment"], []]
+    assert model.allowed[1:] == [["edit_file"], ["edit_file"], ["run_experiment"], []]
+    assert "prior response was incomplete" in json.dumps(model.messages[2])
+    assert all(message["role"] != "tool" for message in model.messages[3])
+    assert "changed" in json.dumps(model.messages[3])
+    assert "full_score" in json.dumps(model.messages[4])
+
+
+def test_action_request_discards_navigation_history_but_keeps_research_facts():
+    class Tools(FakeTools):
+        schemas = [
+            {"type": "function", "function": {"name": name}}
+            for name in ("read_file", "edit_file", "run_experiment")
+        ]
+
+    class Model(FakeLanguageModel):
+        def set_limits(self, *limits):
+            pass
+
+    context = json.dumps(
+        {
+            "task": {"target": "energy", "metric": "rmse"},
+            "candidate_code": "def build_model(): pass",
+            "candidate_contract": "fit(X,y), predict(X)",
+            "baseline_measured": {"value": 42.2},
+            "direction": {"parent_id": "baseline", "hypothesis": "reduce outlier sensitivity"},
+        }
+    )
+    model = Model(
+        [
+            ModelReply(
+                "",
+                tuple(
+                    ToolCall(str(i), "read_file", json.dumps({"path": f"file-{i}"}))
+                    for i in range(3)
+                ),
+            ),
+            ModelError("stop", attempts=0),
+        ]
+    )
+    result = run_session(
+        model,
+        Tools([{"ok": True, "result": {"text": "navigation " * 700}}] * 3),
+        context,
+        RunBudget(1000, 32000, 10),
+        FakeClock(),
+    )
+    request = json.dumps(model.messages[-1], ensure_ascii=False)
+    assert len(request.encode()) < 12000
+    assert "42.2" in request and "reduce outlier sensitivity" in request
+    assert "def build_model" in request and "file-2" in request
+    assert all(message["role"] != "tool" for message in model.messages[-1])
+    assert result.reason == "model_error"

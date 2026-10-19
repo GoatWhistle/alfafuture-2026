@@ -104,6 +104,9 @@ def test_retry_worst_case_sum_is_bounded_and_success_usage_is_unknown(qwen_modul
     assert reply.attempts == len(failures) + 1
     assert reply.usage_known is False
     assert (reply.input_tokens, reply.output_tokens) == (7, 2)
+    assert reply.unreported_tokens_upper_bound == sum(
+        bound + request["max_tokens"] for request in sent[:-1]
+    )
 
 
 @pytest.mark.parametrize("affordable", [0, 1, 2])
@@ -141,7 +144,7 @@ def test_first_attempt_success_still_has_known_usage(qwen_module):
 
 
 @pytest.mark.parametrize("failure", [429, "timeout"])
-def test_successful_retry_stops_session_before_any_followup_api(qwen_module, failure):
+def test_successful_retry_charges_upper_bound_and_allows_followup_api(qwen_module, failure):
     calls, executed = [], []
 
     def handler(request):
@@ -150,7 +153,7 @@ def test_successful_retry_stops_session_before_any_followup_api(qwen_module, fai
             if failure == "timeout":
                 raise httpx.ReadTimeout("local test", request=request)
             return httpx.Response(failure, json={"error": {"message": "local test"}})
-        return success(tool_call=True)
+        return success(tool_call=len(calls) == 2)
 
     class Clock:
         def now(self):
@@ -173,6 +176,46 @@ def test_successful_retry_stops_session_before_any_followup_api(qwen_module, fai
         max_steps=4,
         reserve_seconds=10,
     )
-    assert result.reason == "unknown_usage" and result.usage_known is False
-    assert result.api_attempts == budget.attempts_used == 2
-    assert len(calls) == 2 and len(executed) == 1
+    assert result.reason == "model_finished" and result.usage_known is False
+    assert result.budget_accounted
+    assert result.api_attempts == budget.attempts_used == 3
+    assert len(calls) == 3 and len(executed) == 1
+    charged = prompt_bound(calls[0]["messages"], calls[0]["tools"]) + calls[0]["max_tokens"] + 18
+    assert result.tokens_charged == budget.tokens_used == charged
+    assert charged <= budget.token_limit
+
+
+def test_edit_request_reserves_enough_output_before_allocating_retries(qwen_module):
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(503, json={"error": {"message": "local test"}})
+
+    tools = [{**TOOLS[0], "function": {**TOOLS[0]["function"], "name": "edit_file"}}]
+    bound = prompt_bound(MESSAGES, tools)
+    candidate = model(qwen_module, handler)
+    candidate.set_limits(100, 3, 2 * (bound + 512))
+    with pytest.raises(ModelError):
+        candidate.complete(MESSAGES, tools)
+    assert len(sent) == 1
+    assert sent[0]["max_tokens"] >= 1536
+
+
+def test_missing_usage_is_accounted_only_with_a_bounded_request(qwen_module):
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        body = success().json()
+        body.pop("usage")
+        return httpx.Response(200, json=body)
+
+    candidate = model(qwen_module, handler)
+    candidate.set_limits(100, 1, 5000)
+    reply = candidate.complete(MESSAGES, TOOLS)
+    assert not reply.usage_known
+    assert reply.unreported_tokens_upper_bound == (
+        prompt_bound(MESSAGES, TOOLS) + sent[0]["max_tokens"]
+    )
+    assert reply.unreported_tokens_upper_bound <= 5000

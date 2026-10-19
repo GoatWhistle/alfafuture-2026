@@ -545,6 +545,13 @@ class ResearchWorkspace:
             "usage": {
                 key: session[key]
                 for key in ("input_tokens", "output_tokens", "usage_known", "api_attempts")
+            }
+            | {
+                "tokens_charged": max(
+                    session.get("tokens_charged", 0),
+                    session["input_tokens"] + session["output_tokens"],
+                ),
+                "budget_accounted": session.get("budget_accounted", session["usage_known"]),
             },
         }
         self.store.append(

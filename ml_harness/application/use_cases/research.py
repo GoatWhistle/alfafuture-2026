@@ -47,6 +47,8 @@ class SessionResult:
     api_attempts: int
     tool_failures: tuple[dict[str, Any], ...] = ()
     error_detail: str | None = None
+    tokens_charged: int = 0
+    budget_accounted: bool = True
 
 
 def _request_size(messages: list[dict[str, Any]], schemas: list[dict[str, Any]]) -> int:
@@ -74,7 +76,8 @@ def run_session(
         {"role": "user", "content": context[: history_char_limit // 2]},
     ]
     errors = input_tokens = output_tokens = steps = api_attempts = 0
-    usage_known = True
+    usage_known = budget_accounted = True
+    initial_tokens_used = budget.tokens_used
     reports: list[dict[str, Any]] = []
     reason, summary = "step_limit", ""
     awaiting_interpretation = False
@@ -116,8 +119,16 @@ def run_session(
             else history_char_limit
         )
 
+        action_request = isinstance(model, BudgetAwareLanguageModel) and (
+            pending_action is not None or awaiting_interpretation
+        )
+        if action_request:
+            # Navigation transcripts can dominate a code-generation request. Retain
+            # the structured research state, not the entire sequence of file pages.
+            request_limit = min(request_limit, 12000)
         if (
-            len(json.dumps(messages, ensure_ascii=False)) > history_char_limit
+            action_request
+            or len(json.dumps(messages, ensure_ascii=False)) > history_char_limit
             or _request_size(messages, schemas) > request_limit
         ):
             try:
@@ -127,9 +138,16 @@ def run_session(
             except (ValueError, TypeError):
                 state = {"task": context[:500]}
             state["candidate_code"] = working_code[:4000]
-            state["read_files"] = read_files
+            state["read_files"] = (
+                {
+                    path: {"offset": info["offset"], "next_offset": info["next_offset"]}
+                    for path, info in read_files.items()
+                }
+                if action_request
+                else read_files
+            )
             state["next_action"] = (
-                "edit_file then run_experiment" if navigation_steps >= 3 else "research"
+                "interpretation" if awaiting_interpretation else pending_action or "research"
             )
             selected_reports = state.pop("reports", [])
             state["selected_reports"] = [
@@ -151,18 +169,47 @@ def run_session(
             latest = next(
                 (item for item in reversed(observations) if item["tool"] == "run_experiment"), None
             )
+            if pending_action == "run_experiment" or awaiting_interpretation:
+                # Executing written code and interpreting a measured report do not
+                # need the task pages or the model-construction contract again.
+                state = {
+                    key: value
+                    for key, value in state.items()
+                    if key
+                    in (
+                        "task",
+                        "baseline_measured",
+                        "direction",
+                        "candidate_code",
+                        "next_action",
+                        "budget",
+                    )
+                }
             recent = {
                 "phase": "interpretation" if awaiting_interpretation else "research",
                 "last_experiment": latest,
                 "recent_tool_failures": failures[-3:],
-                "recent_observations": observations[-2:] if latest is None else [],
+                "recent_observations": (
+                    observations[-2:]
+                    if latest is None and pending_action != "run_experiment"
+                    else []
+                ),
             }
             phase_instruction = (
                 "Experiment complete; tools unavailable. "
                 "In at most 120 words interpret the measured result. "
                 if awaiting_interpretation
-                else "Continue research using the available tools. "
+                else (
+                    f"Use {pending_action} now. Prefer concise code reusing base_model. "
+                    if pending_action
+                    else "Continue research using the available tools. "
+                )
             )
+            if correction_used:
+                phase_instruction += (
+                    "The prior response was incomplete. Return one complete tool call, "
+                    "or a concise interpretation if tools are unavailable. "
+                )
             messages = [
                 messages[0],
                 {"role": "user", "content": encoded(state)},
@@ -194,16 +241,22 @@ def run_session(
                 budget.attempts_used += max(0, exc.attempts - 1)
             api_attempts += exc.attempts
             usage_known = usage_known and exc.attempts == 0
+            budget_accounted = budget_accounted and exc.attempts == 0
             reason = exc.reason
             error_detail = str(exc)[:500]
             break
         steps += 1
         api_attempts += reply.attempts
-        budget.record_attempt(reply.input_tokens + reply.output_tokens)
+        budget.record_attempt(
+            reply.input_tokens + reply.output_tokens + reply.unreported_tokens_upper_bound
+        )
         budget.attempts_used += max(0, reply.attempts - 1)
         input_tokens += reply.input_tokens
         output_tokens += reply.output_tokens
         usage_known = usage_known and reply.usage_known
+        budget_accounted = budget_accounted and (
+            reply.usage_known or reply.unreported_tokens_upper_bound > 0
+        )
         if awaiting_interpretation and reply.tool_calls:
             reason = "protocol_error"
             break
@@ -213,7 +266,7 @@ def run_session(
             or (not reply.content.strip() and not reply.tool_calls)
         )
         if invalid_reply:
-            if not usage_known:
+            if not budget_accounted:
                 reason = "unknown_usage"
                 break
             if correction_used:
@@ -247,7 +300,7 @@ def run_session(
         messages.append(assistant)
         if not reply.tool_calls or awaiting_interpretation:
             summary = reply.content[:8000]
-            reason = "model_finished" if usage_known else "unknown_usage"
+            reason = "model_finished" if budget_accounted else "unknown_usage"
             break
         for call in reply.tool_calls:
             if not budget.can_search(clock.now(), reserve()):
@@ -343,7 +396,7 @@ def run_session(
                     ),
                 }
             )
-        if not usage_known:
+        if not budget_accounted:
             reason = "unknown_usage"
             break
         if reason in ("budget_exhausted", "tool_error_limit"):
@@ -360,4 +413,6 @@ def run_session(
         api_attempts,
         tuple(failures[-3:]),
         error_detail,
+        budget.tokens_used - initial_tokens_used,
+        budget_accounted,
     )

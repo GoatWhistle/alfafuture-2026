@@ -132,6 +132,8 @@ def research_after_baseline(
     )
     completed = 0
     usage_known = initial_usage.get("known", True) is True
+    budget_accounted = usage_known
+    reported_tokens = initial_usage.get("tokens", 0)
     started_sessions: set[str] = set()
     finished_sessions: set[str] = set()
     for event in workspace.store.read_events():
@@ -140,12 +142,19 @@ def research_after_baseline(
         if event["kind"] == "session_finished":
             finished_sessions.add(event["payload"]["id"])
             usage = event["payload"]["usage"]
-            budget.tokens_used += usage["input_tokens"] + usage["output_tokens"]
+            budget.tokens_used += usage.get(
+                "tokens_charged", usage["input_tokens"] + usage["output_tokens"]
+            )
+            reported_tokens += usage["input_tokens"] + usage["output_tokens"]
             budget.attempts_used += usage.get("api_attempts", 0)
             usage_known = usage_known and usage["usage_known"]
+            budget_accounted = budget_accounted and usage.get(
+                "budget_accounted", usage["usage_known"]
+            )
             completed += 1
     # A killed request may have consumed tokens without returning usage. Never reset that cost.
     usage_known = usage_known and not (started_sessions - finished_sessions)
+    budget_accounted = budget_accounted and not (started_sessions - finished_sessions)
     sessions = []
     status = "budget_exhausted"
     names = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL")
@@ -156,7 +165,7 @@ def research_after_baseline(
         from ml_harness.application.use_cases.numeric_search import run_numeric_search
 
         status = run_numeric_search(workspace, wall, clock)
-    elif not usage_known:
+    elif not budget_accounted:
         status = "unknown_usage"
     elif not all(os.environ.get(name) for name in names):
         status = "not_configured"
@@ -254,8 +263,10 @@ def research_after_baseline(
             write_json(directory / "sessions" / (identifier + ".json"), asdict(session))
             sessions.append(asdict(session))
             status = session.reason
+            reported_tokens += session.input_tokens + session.output_tokens
             usage_known = usage_known and session.usage_known
-            if not usage_known or status in (
+            budget_accounted = budget_accounted and session.budget_accounted
+            if not budget_accounted or status in (
                 "model_error",
                 "budget_exhausted",
                 "unknown_usage",
@@ -269,6 +280,9 @@ def research_after_baseline(
         "sessions": sessions,
         "reports": workspace.read_experiments(),
         "tokens_used": budget.tokens_used,
+        "reported_tokens": reported_tokens,
+        "usage_known": usage_known,
+        "budget_accounted": budget_accounted,
         "finalization": final,
         "selected": final.get("selected", "baseline"),
         "refit_status": final.get("refit_status", "not_needed"),

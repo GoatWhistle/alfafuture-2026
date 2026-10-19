@@ -29,6 +29,7 @@ class ModelReply:
     usage_known: bool = True
     attempts: int = 1
     finish_reason: str = "stop"
+    unreported_tokens_upper_bound: int = 0
 
 
 class LanguageModel(Protocol):

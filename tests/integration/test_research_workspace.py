@@ -329,3 +329,54 @@ def test_new_hypotheses_get_short_sessions_with_prior_evidence(tmp_path, monkeyp
     assert restored.reports[0]["usage"]["scope"] == "shared_session"
     assert restored.reports[0]["usage"]["input_tokens"] == 10
     assert restored.reports[0]["usage"]["api_attempts"] == 2
+
+
+def test_resume_preserves_conservative_charge_after_successful_retry(tmp_path, monkeypatch):
+    import ml_harness.entrypoints.research as entrypoint
+    from ml_harness.application.use_cases.baseline import BaselineResult
+    from ml_harness.domain.models import Metric, Score
+
+    task = CsvTaskData().prepare(str(task_fixture(tmp_path)), 42)
+    baseline = BaselineResult(
+        Score(100, Metric.RMSE, task.protocol.fingerprint), task.spec.submission_path, 1, 1
+    )
+    Path(task.spec.submission_path).write_text("saved baseline bytes")
+    directory = tmp_path / "research"
+    workspace = ResearchWorkspace(
+        task, directory, SubprocessRunner(), IndependentEvaluator(), threads=1, timeout_seconds=10
+    )
+    workspace.register_session(
+        "recovered",
+        {
+            "summary": "recovered request",
+            "reports": [],
+            "reason": "model_finished",
+            "input_tokens": 9,
+            "output_tokens": 1,
+            "usage_known": False,
+            "api_attempts": 2,
+            "tokens_charged": 1400,
+            "budget_accounted": True,
+        },
+    )
+
+    class ForbiddenModel:
+        def complete(self, messages, tools):
+            pytest.fail("The reserved retry cost must not reset to ten reported tokens")
+
+    monkeypatch.setattr(entrypoint, "QwenLanguageModel", lambda *args: ForbiddenModel())
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"):
+        monkeypatch.setenv(name, "synthetic")
+    report = entrypoint.research_after_baseline(
+        task,
+        baseline,
+        directory,
+        threads=1,
+        timeout_seconds=10,
+        max_steps=3,
+        token_limit=1000,
+        max_sessions=2,
+    )
+    assert report["tokens_used"] == 1400
+    assert report["budget_accounted"] and not report["usage_known"]
+    assert report["status"] == "budget_exhausted"
