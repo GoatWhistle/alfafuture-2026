@@ -46,6 +46,7 @@ class SessionResult:
     reports: tuple[dict[str, Any], ...]
     api_attempts: int
     tool_failures: tuple[dict[str, Any], ...] = ()
+    error_detail: str | None = None
 
 
 def _request_size(messages: list[dict[str, Any]], schemas: list[dict[str, Any]]) -> int:
@@ -89,6 +90,8 @@ def run_session(
     except (ValueError, TypeError):
         working_code = ""
     navigation_steps = 0
+    pending_action: str | None = None
+    error_detail: str | None = None
 
     def reserve() -> float:
         return reserve_seconds() if callable(reserve_seconds) else reserve_seconds
@@ -99,6 +102,14 @@ def run_session(
             break
         available_tokens = max(0, budget.token_limit - budget.tokens_used)
         schemas = [] if awaiting_interpretation else tools.schemas
+        if not awaiting_interpretation:
+            if navigation_steps >= 3 and pending_action is None:
+                pending_action = "edit_file"
+            if pending_action:
+                required = [
+                    schema for schema in schemas if schema["function"]["name"] == pending_action
+                ]
+                schemas = required or schemas
         request_limit = (
             min(history_char_limit, max(0, available_tokens - 1800))
             if isinstance(model, BudgetAwareLanguageModel)
@@ -118,7 +129,7 @@ def run_session(
             state["candidate_code"] = working_code[:4000]
             state["read_files"] = read_files
             state["next_action"] = (
-                "edit_file then run_experiment" if navigation_steps >= 4 else "research"
+                "edit_file then run_experiment" if navigation_steps >= 3 else "research"
             )
             selected_reports = state.pop("reports", [])
             state["selected_reports"] = [
@@ -176,7 +187,7 @@ def run_session(
                     max(0, budget.attempt_limit - budget.attempts_used),
                     max(0, budget.token_limit - budget.tokens_used),
                 )
-            reply = model.complete(messages, [] if awaiting_interpretation else tools.schemas)
+            reply = model.complete(messages, schemas)
         except ModelError as exc:
             if exc.attempts > 0:
                 budget.record_attempt(0)
@@ -184,6 +195,7 @@ def run_session(
             api_attempts += exc.attempts
             usage_known = usage_known and exc.attempts == 0
             reason = exc.reason
+            error_detail = str(exc)[:500]
             break
         steps += 1
         api_attempts += reply.attempts
@@ -195,8 +207,10 @@ def run_session(
         if awaiting_interpretation and reply.tool_calls:
             reason = "protocol_error"
             break
-        invalid_reply = reply.finish_reason == "length" or (
-            not reply.content.strip() and not reply.tool_calls
+        invalid_reply = (
+            (pending_action is not None and not reply.tool_calls)
+            or reply.finish_reason == "length"
+            or (not reply.content.strip() and not reply.tool_calls)
         )
         if invalid_reply:
             if not usage_known:
@@ -256,9 +270,11 @@ def run_session(
                 elif call.name in ("inspect_data", "read_experiments"):
                     navigation_steps += 1
                 elif call.name == "edit_file":
+                    pending_action = "run_experiment"
                     working_code = arguments.get("content", working_code)
                     navigation_steps = 0
                 elif call.name == "run_experiment":
+                    pending_action = None
                     navigation_steps = 0
             observation = compact_observation(result)
             observations.append({"tool": call.name, "observation": observation})
@@ -271,6 +287,8 @@ def run_session(
             )
             if not result.get("ok"):
                 errors += 1
+                if result.get("error", {}).get("type") == "candidate_unchanged":
+                    pending_action = "edit_file"
                 failures.append(
                     {
                         "tool": call.name,
@@ -302,7 +320,7 @@ def run_session(
         assistant["tool_calls"] = [
             item for item in assistant.get("tool_calls", []) if item["id"] in completed_ids
         ]
-        if navigation_steps >= 4 and not awaiting_interpretation:
+        if navigation_steps >= 3 and not awaiting_interpretation:
             messages.append(
                 {
                     "role": "user",
@@ -341,4 +359,5 @@ def run_session(
         tuple(reports),
         api_attempts,
         tuple(failures[-3:]),
+        error_detail,
     )

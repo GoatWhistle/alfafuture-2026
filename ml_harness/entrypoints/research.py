@@ -254,7 +254,13 @@ def research_after_baseline(
             write_json(directory / "sessions" / (identifier + ".json"), asdict(session))
             sessions.append(asdict(session))
             status = session.reason
-            if status in ("model_error", "budget_exhausted", "unknown_usage", "protocol_error"):
+            usage_known = usage_known and session.usage_known
+            if not usage_known or status in (
+                "model_error",
+                "budget_exhausted",
+                "unknown_usage",
+                "protocol_error",
+            ):
                 break
     # All LLM calls have ended. A frozen plan on disk prohibits future search after restart as well.
     final = _finish(task, workspace, final_runner, threads, timeout_seconds)

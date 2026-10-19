@@ -70,7 +70,9 @@ def verify_run(directory: Path, task_path: Path, seed: int) -> dict[str, Any]:
     changed = [
         r
         for r in experiments
-        if r.get("status") == "succeeded" and r.get("code_hash") != r.get("parent_code_hash")
+        if r.get("status") == "succeeded"
+        and not r.get("reused_from")
+        and r.get("code_hash") != r.get("parent_code_hash")
     ]
     interpreted = [
         s

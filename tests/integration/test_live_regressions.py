@@ -135,3 +135,28 @@ def test_default_portfolio_cli_and_resume_keep_measured_artifacts(tmp_path, monk
     monkeypatch.setattr(sys, "argv", arguments + ["--resume"])
     assert cli.main() == 0
     assert {str(p): p.stat().st_mtime_ns for p in directory.rglob("request.json")} == before
+
+
+def test_reused_result_keeps_new_lineage_without_training(tmp_path):
+    task, work, runner, evaluator = workspace(tmp_path)
+    arguments = {"hypothesis": "capacity", "expected_effect": "lower RMSE"}
+    first_code = candidate_code({"backend": "catboost", "iterations": 3})
+    (work.path / "candidate.py").write_text(first_code)
+    first = work.run_experiment({**arguments, "experiment_id": "first"})
+    (work.path / "candidate.py").write_text(
+        candidate_code({"backend": "catboost", "iterations": 4})
+    )
+    second = work.run_experiment({**arguments, "experiment_id": "second"})
+    (work.path / "candidate.py").write_text(first_code)
+
+    class ForbiddenRunner:
+        def run(self, *args):
+            pytest.fail("Completed candidates must not be trained twice")
+
+    work.runner = ForbiddenRunner()
+    reused = work.run_experiment({**arguments, "experiment_id": "reuse", "parent_id": "second"})
+    assert reused["reused_from"] == "first" and reused["id"] == "reuse"
+    assert reused["parent_id"] == "second" and reused["parent_score"] == second["full_score"]
+    assert reused["full_score"] == first["full_score"] and reused["elapsed_seconds"] == 0
+    restored = ResearchWorkspace(task, work.path, runner, evaluator)
+    assert restored.reports[-1]["parent_id"] == "second"

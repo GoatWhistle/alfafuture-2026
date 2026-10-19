@@ -189,3 +189,43 @@ def test_compaction_remembers_read_materials_and_current_code():
     assert "candidate_code" in compacted and "build_model" in compacted
     assert "fit(X, y)" in compacted and "Annual building energy use" in compacted
     assert "read_files" in compacted and "task.md" in compacted
+
+
+def test_navigation_transitions_to_edit_then_validation_then_interpretation():
+    class Tools(FakeTools):
+        schemas = [
+            {"type": "function", "function": {"name": name}}
+            for name in ("read_file", "inspect_data", "edit_file", "run_experiment")
+        ]
+
+    class Model(FakeLanguageModel):
+        def __init__(self, replies):
+            super().__init__(replies)
+            self.allowed = []
+
+        def complete(self, messages, tools):
+            self.allowed.append([tool["function"]["name"] for tool in tools])
+            return super().complete(messages, tools)
+
+    model = Model(
+        [
+            ModelReply(
+                "", tuple(ToolCall(str(i), "read_file", '{"path":"task.md"}') for i in range(3))
+            ),
+            ModelReply(
+                "", (ToolCall("edit", "edit_file", '{"path":"candidate.py","content":"changed"}'),)
+            ),
+            ModelReply("", (ToolCall("run", "run_experiment", "{}"),)),
+            ModelReply("Measured result received"),
+        ]
+    )
+    tools = Tools(
+        [{"ok": True, "result": {"text": "task"}}] * 3
+        + [
+            {"ok": True, "result": {"written": True}},
+            {"ok": True, "result": {"status": "succeeded", "full_score": 1}},
+        ]
+    )
+    result = session(model, tools)
+    assert result.reason == "model_finished" and len(result.reports) == 1
+    assert model.allowed[1:] == [["edit_file"], ["run_experiment"], []]

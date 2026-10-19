@@ -22,7 +22,7 @@ class QwenLanguageModel:
         api_key: str,
         base_url: str,
         model: str,
-        timeout_seconds: float = 60,
+        timeout_seconds: float = 120,
         max_attempts: int = 3,
         client: OpenAI | None = None,
         trace_dir: Path | None = None,
@@ -63,6 +63,20 @@ class QwenLanguageModel:
             else OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds, max_retries=0)
         )
 
+    def _write_trace(self, identifier: str, value: dict[str, Any]) -> None:
+        if self.trace_dir is None:
+            return
+        try:
+            self.trace_dir.mkdir(parents=True, exist_ok=True)
+            data = json.dumps(value, ensure_ascii=False, default=str).replace(
+                self._secret, "<REDACTED>"
+            )
+            temporary = self.trace_dir / (identifier + ".tmp")
+            temporary.write_text(data, encoding="utf-8")
+            temporary.replace(self.trace_dir / (identifier + ".json"))
+        except OSError:
+            pass
+
     def set_limits(
         self, remaining_seconds: float, remaining_attempts: int, remaining_tokens: int
     ) -> None:
@@ -99,7 +113,7 @@ class QwenLanguageModel:
                     raise ModelError(
                         "Qwen request budget exhausted", attempts=0, reason="budget_exhausted"
                     )
-                max_tokens = min(2048, remaining_tokens // attempts_allowed - prompt_bound)
+                max_tokens = min(4096, remaining_tokens // attempts_allowed - prompt_bound)
             except (ValueError, TypeError, UnicodeError):
                 raise ModelError("Cannot serialize Qwen request", attempts=0) from None
             if max_tokens <= 0 or attempts_allowed <= 0 or time.monotonic() >= deadline:
@@ -110,37 +124,46 @@ class QwenLanguageModel:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ModelError("Qwen request deadline reached", attempts=attempt - 1)
+            trace_id = uuid4().hex
+            request_started = time.monotonic()
+            trace = {
+                "status": "started",
+                "started_unix": time.time(),
+                "attempt": attempt,
+                "request": {"messages": messages, "tools": tools, "max_tokens": max_tokens},
+                "usage_observation": {
+                    "prompt_upper_bound": len(
+                        json.dumps(
+                            {"messages": messages, "tools": tools}, ensure_ascii=False
+                        ).encode("utf-8")
+                    )
+                    + 1024,
+                    "billing_verified": False,
+                },
+            }
+            self._write_trace(trace_id, trace)
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=cast(list[ChatCompletionMessageParam], messages),
                     tools=cast(list[ChatCompletionToolParam], tools) if tools else NOT_GIVEN,
+                    tool_choice=cast(
+                        Any,
+                        {"type": "function", "function": {"name": tools[0]["function"]["name"]}},
+                    )
+                    if len(tools) == 1
+                    else NOT_GIVEN,
                     max_tokens=max_tokens,
                     timeout=min(self.timeout_seconds, remaining)
                     if self._limits is not None
                     else NOT_GIVEN,
                 )
-                if self.trace_dir is not None:
-                    self.trace_dir.mkdir(parents=True, exist_ok=True)
-                    trace = {
-                        "request": {"messages": messages, "tools": tools, "max_tokens": max_tokens},
-                        "response": response.model_dump(),
-                        "usage_observation": {
-                            "prompt_upper_bound": len(
-                                json.dumps(
-                                    {"messages": messages, "tools": tools}, ensure_ascii=False
-                                ).encode("utf-8")
-                            )
-                            + 1024,
-                            "billing_verified": False,
-                        },
-                    }
-                    serialized = json.dumps(trace, ensure_ascii=False, default=str).replace(
-                        self._secret, "<REDACTED>"
-                    )
-                    (self.trace_dir / (uuid4().hex + ".json")).write_text(
-                        serialized, encoding="utf-8"
-                    )
+                trace.update(
+                    status="completed",
+                    response=response.model_dump(),
+                    elapsed_seconds=time.monotonic() - request_started,
+                )
+                self._write_trace(trace_id, trace)
                 message = response.choices[0].message
                 calls = tuple(
                     ToolCall(call.id, call.function.name, call.function.arguments)
@@ -161,19 +184,34 @@ class QwenLanguageModel:
                     finish_reason=response.choices[0].finish_reason or "unknown",
                 )
             except APIError as error:
+                trace.update(
+                    status="api_error",
+                    error_type=type(error).__name__,
+                    cause_type=type(error.__cause__).__name__,
+                    http_status=getattr(error, "status_code", None),
+                    provider_error=json.dumps(getattr(error, "body", None), default=str)[:2000],
+                    elapsed_seconds=time.monotonic() - request_started,
+                )
+                self._write_trace(trace_id, trace)
                 retryable = isinstance(error, APIConnectionError) or (
                     isinstance(error, APIStatusError)
                     and (error.status_code == 429 or error.status_code >= 500)
                 )
                 if not retryable or attempt == attempts_allowed:
                     raise ModelError(
-                        f"Qwen request failed after {attempt} attempt(s)", attempts=attempt
+                        f"Qwen {type(error).__name__} after {attempt} attempt(s)",
+                        attempts=attempt,
+                        reason="api_error",
                     ) from None
                 delay = min(0.25 * 2 ** (attempt - 1), 2.0)
                 remaining = deadline - time.monotonic()
                 if remaining <= delay:
                     raise ModelError("Qwen request deadline reached", attempts=attempt) from None
                 time.sleep(delay)
-            except (AttributeError, IndexError, TypeError, ValueError):
-                raise ModelError("Malformed Qwen response", attempts=attempt) from None
+            except (AttributeError, IndexError, TypeError, ValueError) as error:
+                trace.update(status="protocol_error", error_type=type(error).__name__)
+                self._write_trace(trace_id, trace)
+                raise ModelError(
+                    "Malformed Qwen response", attempts=attempt, reason="protocol_error"
+                ) from None
         raise ModelError("Qwen request exhausted attempts", attempts=0)

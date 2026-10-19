@@ -228,7 +228,7 @@ def test_api_failure_retains_baseline_csv(tmp_path, monkeypatch):
 
     class UnavailableModel:
         def complete(self, messages, tools):
-            raise ModelError("unavailable")
+            raise ModelError("unavailable", reason="api_error")
 
     monkeypatch.setattr(entrypoint, "QwenLanguageModel", lambda *args: UnavailableModel())
     for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"):
@@ -243,7 +243,9 @@ def test_api_failure_retains_baseline_csv(tmp_path, monkeypatch):
         token_limit=1000,
         max_sessions=1,
     )
-    assert report["status"] == "model_error" and report["selected"] == "baseline"
+    assert report["status"] == "api_error" and report["selected"] == "baseline"
+    assert len(report["sessions"]) == 1
+    assert report["sessions"][0]["error_detail"] == "unavailable"
     assert Path(task.spec.submission_path).read_text() == "previous valid file"
 
 
@@ -256,6 +258,7 @@ def test_new_hypotheses_get_short_sessions_with_prior_evidence(tmp_path, monkeyp
     code = STARTER.replace('"iterations": 200', '"iterations": 3')
     replies = []
     for index in range(2):
+        attempt_code = code.replace('"iterations": 3', f'"iterations": {3 + index}')
         replies.extend(
             [
                 ModelReply(
@@ -264,7 +267,7 @@ def test_new_hypotheses_get_short_sessions_with_prior_evidence(tmp_path, monkeyp
                         ToolCall(
                             f"edit-{index}",
                             "edit_file",
-                            json.dumps({"path": "candidate.py", "content": code}),
+                            json.dumps({"path": "candidate.py", "content": attempt_code}),
                         ),
                         ToolCall(
                             f"run-{index}",

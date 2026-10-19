@@ -68,6 +68,7 @@ def test_tool_calls_usage_exact_request_and_timeout(usage):
             "model": "Qwen/exact-given",
             "messages": [{"role": "user", "content": "inspect"}],
             "tools": TOOLS,
+            "tool_choice": {"type": "function", "function": {"name": "inspect_data"}},
         }
         assert request.extensions["timeout"]["read"] == 7
         return httpx.Response(200, json=completion(usage))
@@ -151,3 +152,32 @@ def test_invalid_configuration(overrides):
 def test_malformed_reply_is_sanitized():
     with pytest.raises(ModelError, match="Malformed Qwen response"):
         adapter(lambda request: httpx.Response(200, json={"choices": []})).complete([], [])
+
+
+def test_failed_requests_are_traced_without_credentials(tmp_path):
+    import json
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(429, json={"error": {"message": "busy"}})
+    )
+    client = OpenAI(
+        api_key="audit-secret",
+        base_url="https://unused.test/v1",
+        http_client=httpx.Client(transport=transport),
+    )
+    model = QwenLanguageModel(
+        "audit-secret",
+        "https://unused.test/v1",
+        "qwen-test",
+        max_attempts=1,
+        client=client,
+        trace_dir=tmp_path,
+    )
+    with pytest.raises(ModelError) as error:
+        model.complete([{"role": "user", "content": "test"}], [])
+    assert error.value.reason == "api_error"
+    files = list(tmp_path.glob("*.json"))
+    assert len(files) == 1 and "audit-secret" not in files[0].read_text()
+    recorded = json.loads(files[0].read_text())
+    assert recorded["status"] == "api_error" and recorded["http_status"] == 429
+    assert recorded["request"]["messages"][0]["content"] == "test"

@@ -541,6 +541,7 @@ class ResearchWorkspace:
             "experiment_ids": [report["id"] for report in session["reports"]],
             "reason": session["reason"],
             "tool_failures": session.get("tool_failures", [])[-3:],
+            "error_detail": session.get("error_detail"),
             "usage": {
                 key: session[key]
                 for key in ("input_tokens", "output_tokens", "usage_known", "api_attempts")
@@ -592,7 +593,29 @@ class ResearchWorkspace:
             None,
         )
         if duplicate is not None:
-            return {**duplicate, "reused_from": duplicate["id"]}
+            output = self._parent_output(duplicate["id"])
+            if output is None:
+                raise ContractError("Completed duplicate has no verified prediction artifact")
+            reused = {
+                **deepcopy(duplicate),
+                "id": identifier,
+                "parent_id": parent_id,
+                "hypothesis": arguments["hypothesis"],
+                "expected_effect": arguments["expected_effect"],
+                "parent_score": parent.get("full_score") if parent else None,
+                "parent_code_hash": parent.get("code_hash") if parent else None,
+                "reused_from": duplicate["id"],
+                "hypothesis_source": arguments.get("hypothesis_source", "tool_call"),
+                "elapsed_seconds": 0.0,
+                "llm_commentary": None,
+                "usage": None,
+                "error_report": self.analyzer.analyze(
+                    self.task, output, self._parent_output(parent_id)
+                ),
+            }
+            self._finish_record(reused)
+            self.reports.append(reused)
+            return reused
         directory = self.path / "experiments" / identifier
         if directory.exists():
             raise ContractError("Experiment directory already exists; inspect it and use a new ID")
