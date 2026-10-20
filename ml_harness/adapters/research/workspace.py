@@ -3,6 +3,7 @@
 import hashlib
 import json
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -559,7 +560,11 @@ class ResearchWorkspace:
         )
         self._apply_session(payload)
 
-    def run_experiment(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def run_experiment(
+        self,
+        arguments: dict[str, Any],
+        admit_full: Callable[[float], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         arguments = dict(arguments)
         identifier = arguments["experiment_id"]
         if identifier == "baseline":
@@ -632,6 +637,7 @@ class ResearchWorkspace:
         frozen.write_bytes(code)
         frozen.chmod(0o444)
         report: dict[str, Any] = {
+            **arguments.get("recipe_provenance", {}),
             "id": identifier,
             "parent_id": arguments.get("parent_id"),
             "hypothesis": arguments["hypothesis"],
@@ -689,6 +695,7 @@ class ResearchWorkspace:
                     output_dir=str(directory),
                     threads=self.threads,
                     timeout_seconds=self.timeout_seconds,
+                    admit_full=admit_full,
                 )
             )
         except (ContractError, OSError, ValueError) as exc:
@@ -697,6 +704,8 @@ class ResearchWorkspace:
             self._attach_diagnostics(report)
         except (ContractError, OSError, ValueError) as exc:
             report.update(diagnostic_status="failed", diagnostic_error=str(exc)[:2000])
+        if report.get("full_score") and report.get("parent_score"):
+            report["parent_delta"] = report["full_score"]["value"] - report["parent_score"]["value"]
         self._finish_record(report)
         self.reports.append(report)
         return report

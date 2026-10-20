@@ -10,8 +10,8 @@ from uuid import uuid4
 from ml_harness.adapters.execution.budget import BudgetedRunner, BudgetedSubmissionWriter
 from ml_harness.adapters.execution.clock import SystemClock
 from ml_harness.adapters.execution.runner import SubprocessRunner
+from ml_harness.adapters.llm.proposals import ProposalTools
 from ml_harness.adapters.llm.qwen import QwenLanguageModel
-from ml_harness.adapters.llm.tools import ResearchTools
 from ml_harness.adapters.research.finalization import FinalizationWorkspace
 from ml_harness.adapters.research.workspace import ResearchWorkspace, write_json
 from ml_harness.adapters.storage.submission import AtomicSubmissionWriter, IndependentEvaluator
@@ -20,7 +20,7 @@ from ml_harness.application.ports.language_model import ModelError
 from ml_harness.application.use_cases.baseline import BaselineResult
 from ml_harness.application.use_cases.context import build_context
 from ml_harness.application.use_cases.directions import choose_direction
-from ml_harness.application.use_cases.research import run_session
+from ml_harness.application.use_cases.proposal_session import run_proposal_session
 from ml_harness.domain.budget import WallClockBudget
 from ml_harness.domain.models import PreparedTask, RunBudget
 
@@ -112,15 +112,29 @@ def research_after_baseline(
     timeout_seconds: float,
     max_steps: int,
     token_limit: int,
-    max_sessions: int = 12,
+    max_sessions: int = 3,
     search_mode: str = "qwen",
     initial_usage: dict[str, Any] | None = None,
     runtime_budget: WallClockBudget | None = None,
     base_runner: ExperimentRunner | None = None,
 ) -> dict[str, Any]:
+    version_file = directory / "pipeline-version.json"
+    if version_file.exists():
+        if json.loads(version_file.read_text()) != {"version": 2}:
+            raise ValueError("Incompatible research pipeline; use a new run directory")
+    else:
+        journal = directory / "memory/events.jsonl"
+        if journal.exists() and any(
+            json.loads(line).get("kind") in ("session_started", "session_finished")
+            for line in journal.read_text().splitlines()
+            if line.strip()
+        ):
+            raise ValueError("Legacy research sessions cannot resume under pipeline 2")
     workspace, wall, final_runner = _workspace(
         task, baseline, directory, threads, timeout_seconds, runtime_budget, base_runner
     )
+    write_json(version_file, {"version": 2})
+    max_sessions = min(3, max_sessions)
     clock = SystemClock()
     initial_usage = initial_usage or {}
     budget = RunBudget(
@@ -184,13 +198,8 @@ def research_after_baseline(
         for _ in range(max(0, max_sessions - completed)):
             if not budget.can_search(clock.now(), wall.reserve_seconds()):
                 break
-            tools = ResearchTools(
-                directory,
-                workspace.inspect_data,
-                workspace.run_experiment,
-                workspace.read_experiments,
-            )
             identifier = uuid4().hex
+            tools = ProposalTools(workspace, wall, clock, identifier, baseline.validation_seconds)
             session_index = sum(
                 event["kind"] == "session_finished" for event in workspace.store.read_events()
             )
@@ -222,33 +231,40 @@ def research_after_baseline(
                 },
             )
             context_value = json.loads(context)
-            context_value["candidate_code"] = (directory / "candidate.py").read_text()[:4000]
-            context_value["candidate_runtime_contract"] = {
-                "kind_selects": "task_type",
-                "backend_option": "backend",
-                "default_backend": "catboost",
-            }
-            context_value["candidate_contract"] = (
-                "build_model(kind, parameters, threads, seed) returns an unfitted model. "
-                "kind is the task type (regression/binary/multiclass), not the learner. "
-                "base_model defaults to CatBoost if options['backend'] is omitted; "
-                "LightGBM requires options['backend']='lightgbm' explicitly. "
-                "Use from ml_harness.adapters.ml.candidates import build_model as base_model. "
-                "Merge parameters into options; base_model(kind, options, threads, seed) handles "
-                "imputation/categories and fit/predict/predict_proba. CatBoost: backend=catboost, "
-                "iterations, depth, learning_rate, l2_leaf_reg; LightGBM: backend=lightgbm, "
-                "n_estimators, num_leaves, learning_rate. For wrappers, fit transformations only "
-                "on supplied training X/y and expose classes_ for classification. "
-                "Edit the code before run_experiment; unchanged candidates are rejected."
+            parent = next(r for r in workspace.read_experiments() if r["id"] == direction.parent_id)
+            context_value["parent_recipe"] = parent.get(
+                "resolved_spec",
+                {
+                    "backend": parent.get("backend"),
+                    "parameters": parent.get("parameters", {}),
+                },
             )
+            context_value["parent_id"] = direction.parent_id
+            context_value["task_kind"] = task.spec.kind.value
+            # Preserve feature names: semantic proposals must address actual columns.
+            context_value["features"] = list(task.spec.features)
             context_value["task_overview"] = (directory / "task.md").read_text()[:1200]
-            context_value["workspace_files"] = [
-                "task.md",
-                "data_dictionary.csv",
-                "candidate_api.md",
-                "candidate.py",
-                "profile.json",
+            context_value["last_measurements"] = [
+                {
+                    k: r[k]
+                    for k in (
+                        "id",
+                        "status",
+                        "backend",
+                        "full_score",
+                        "parent_delta",
+                        "admission",
+                        "resolved_spec",
+                        "error",
+                        "error_report",
+                    )
+                    if k in r
+                }
+                for r in workspace.read_experiments()[-2:]
             ]
+            # Diagnostics are summarized in build_context; avoid duplicating large row reports.
+            for measurement in context_value["last_measurements"]:
+                measurement.pop("error_report", None)
             context_value["recent_tool_failures"] = [
                 failure
                 for event in workspace.store.read_events()
@@ -263,7 +279,7 @@ def research_after_baseline(
                     "payload": {"id": identifier},
                 }
             )
-            session = run_session(
+            session = run_proposal_session(
                 model,
                 tools,
                 context,
@@ -289,6 +305,7 @@ def research_after_baseline(
     # All LLM calls have ended. A frozen plan on disk prohibits future search after restart as well.
     final = _finish(task, workspace, final_runner, threads, timeout_seconds)
     report = {
+        "pipeline_version": 2,
         "status": status,
         "sessions": sessions,
         "reports": workspace.read_experiments(),

@@ -14,8 +14,11 @@ from typing import Any
 from dotenv import load_dotenv
 
 from ml_harness.adapters.data.task import CsvTaskData, read_csv
+from ml_harness.adapters.llm.proposals import ProposalArguments
+from ml_harness.adapters.llm.proposals import digest as proposal_digest
 from ml_harness.adapters.ml.ensemble import combine_predictions
 from ml_harness.adapters.storage.submission import load_submission
+from verification.pipeline_gate import VERSION, validate_gate_shape, verify_recipe
 from verification.run_benchmarks import (
     ROOT,
     _hash,
@@ -35,6 +38,7 @@ def source_hashes() -> dict[str, str]:
         Path(__file__),
         ROOT / "verification/run_benchmarks.py",
         ROOT / "verification/verify_archive.py",
+        ROOT / "verification/pipeline_gate.py",
     ]
     files += sorted((ROOT / "ml_harness").rglob("*.py"))
     return {str(p.relative_to(ROOT)): _hash(p) for p in files}
@@ -74,13 +78,28 @@ def verify_run(directory: Path, task_path: Path, seed: int) -> dict[str, Any]:
         and not r.get("reused_from")
         and r.get("code_hash") != r.get("parent_code_hash")
     ]
-    interpreted = [
-        s
-        for s in research.get("sessions", [])
-        if s["reason"] == "model_finished"
-        and s["summary"].strip()
-        and any(r["status"] == "succeeded" for r in s["reports"])
-    ]
+    trace_files = sorted((directory / "harness/research/api-trace").glob("*.json"))
+    trace_hashes = {p.name: _hash(p) for p in trace_files}
+    provider_proposals = set()
+    for path in trace_files:
+        trace = read_json(path)
+        for choice in trace.get("response", {}).get("choices", []):
+            for call in choice.get("message", {}).get("tool_calls") or []:
+                function = call.get("function", {})
+                if function.get("name") == "propose_experiment":
+                    try:
+                        raw = ProposalArguments.model_validate_json(
+                            function["arguments"]
+                        ).model_dump()
+                        provider_proposals.add(proposal_digest(raw))
+                    except ValueError:
+                        pass
+    proposal_successes = live_proposal_successes = 0
+    for report in changed:
+        if report.get("hypothesis_source") == "qwen_proposal":
+            verify_recipe(report, task, research.get("reports", []))
+            proposal_successes += 1
+            live_proposal_successes += report["proposal_hash"] in provider_proposals
     score = final.get("control_scores", {}).get(final["selected"])
     return {
         "protocol": task.protocol.fingerprint,
@@ -89,7 +108,9 @@ def verify_run(directory: Path, task_path: Path, seed: int) -> dict[str, Any]:
         "csv_sha256": _hash(Path(task.spec.submission_path)),
         "refit_verified": True,
         "changed_successes": len(changed),
-        "interpreted_successes": len(interpreted),
+        "proposal_successes": proposal_successes,
+        "live_proposal_successes": live_proposal_successes,
+        "api_trace_hashes": trace_hashes,
         "experiments": len(experiments),
         "research_status": research.get("status"),
         "reported_tokens": research.get("reported_tokens", research.get("tokens_used", 0)),
@@ -192,6 +213,54 @@ def complete_holdout(runs: list[dict[str, Any]], sources: list[Path], expected: 
             }
 
 
+def public_tasks() -> dict[str, Any]:
+    paths = [ROOT / "data" / name / "task.md" for name in ("regression", "classification")]
+    return {str(p.resolve()): _task_inputs(p) for p in paths}
+
+
+def validate_saved_gate(
+    path: Path, code: dict[str, str], model: str | None, endpoint_fingerprint: str
+) -> None:
+    gate = read_json(path)
+    if gate.get("gate_version") != VERSION:
+        raise ValueError("Legacy gate cannot authorize comparisons")
+    configuration_path = Path(gate["configuration"])
+    if _hash(configuration_path) != gate["configuration_hash"]:
+        raise ValueError("Gate configuration hash mismatch")
+    config = read_json(configuration_path)
+    validate_gate_shape(config, gate["runs"], public_tasks())
+    if (
+        config["code"] != code
+        or gate["code"] != code
+        or config["model"] != model
+        or config["endpoint_fingerprint"] != endpoint_fingerprint
+        or config["runtime"] != _runtime_versions()
+    ):
+        raise ValueError("Gate runtime/provider differs from current runtime")
+    for record in gate["runs"]:
+        command = record["command"]
+        directory = Path(command[command.index("--run-dir") + 1]).parent
+        source = Path(record["task"])
+        isolated_task = directory / "inputs" / source.name
+        # Recheck isolated input bytes, not merely the original source.
+        original = config["tasks"][[x["path"] for x in config["tasks"]].index(str(source))][
+            "inputs"
+        ]
+        current = _task_inputs(isolated_task)
+        if sorted(v for k, v in original.items() if k != str(source)) != sorted(
+            v for k, v in current.items() if k != str(isolated_task)
+        ):
+            raise ValueError("Gate input hash mismatch")
+        verified = verify_run(directory, isolated_task, 42)
+        if (
+            record["returncode"] != 0
+            or verified["live_proposal_successes"] < 1
+            or verified["api_trace_hashes"] != record["api_trace_hashes"]
+            or verified["csv_sha256"] != record["csv_sha256"]
+        ):
+            raise ValueError("Gate artifact verification failed")
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -212,18 +281,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not args.gate:
         if args.gate_report is None:
             raise ValueError("A passed live-gate report is required before comparisons")
-        gate = read_json(args.gate_report)
-        if (
-            not gate.get("gate_passed")
-            or gate.get("code") != code
-            or gate.get("model") != os.environ.get("OPENAI_MODEL")
-            or gate.get("endpoint_fingerprint") != endpoint_fingerprint
-        ):
-            raise ValueError("Live-gate must pass against exactly the current source code")
+        validate_saved_gate(
+            args.gate_report, code, os.environ.get("OPENAI_MODEL"), endpoint_fingerprint
+        )
     names = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL")
     if "qwen" in args.modes and not all(os.environ.get(k) for k in names):
         raise ValueError("Supplied Qwen credentials are not configured")
     config = {
+        "gate_version": VERSION,
         "tasks": [{"path": str(p), "inputs": _task_inputs(p)} for p in sources],
         "seeds": args.seeds,
         "modes": args.modes,
@@ -239,6 +304,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "gate": args.gate,
         "endpoint_fingerprint": endpoint_fingerprint,
     }
+    if args.gate:
+        validate_gate_shape(
+            config, [{"task": str(p), "seed": 42, "mode": "qwen"} for p in sources], public_tasks()
+        )
     configuration = output / "configuration.json"
     if configuration.exists() and read_json(configuration) != config:
         raise ValueError("Configuration changed; choose a new output directory")
@@ -318,15 +387,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     flush=True,
                 )
     report = {
+        "gate_version": VERSION,
+        "configuration_hash": _hash(configuration),
+        "configuration": str(configuration),
         "model": config["model"],
         "endpoint_fingerprint": endpoint_fingerprint,
         "code": code,
         "runs": runs,
         "gate_passed": all(
-            r["returncode"] == 0 and r["changed_successes"] > 0 and r["interpreted_successes"] > 0
+            r["returncode"] == 0 and r["live_proposal_successes"] > 0 and r["refit_verified"]
             for r in runs
         ),
     }
+    if args.gate:
+        validate_gate_shape(config, runs, public_tasks())
     if not args.gate:
         report.pop("gate_passed")
         complete_holdout(runs, sources, len(sources) * len(args.seeds) * len(args.modes))
@@ -345,7 +419,7 @@ def main() -> int:
     parser.add_argument(
         "--modes", nargs="+", choices=("qwen", "optuna"), default=["qwen", "optuna"]
     )
-    parser.add_argument("--sessions", type=int, default=12)
+    parser.add_argument("--sessions", type=int, default=3)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--time-budget", type=float, default=1800)
     args = parser.parse_args()

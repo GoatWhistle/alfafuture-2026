@@ -191,6 +191,12 @@ def run_session(
                     state = {"task": str(state)[:500]}
             except (ValueError, TypeError):
                 state = {"task": context[:500]}
+            state["budget"] = {
+                **state.get("budget", {}),
+                "seconds_remaining": max(0, budget.deadline - clock.now() - reserve()),
+                "reserved_seconds": reserve(),
+                "tokens_remaining": max(0, budget.token_limit - budget.tokens_used),
+            }
             state["candidate_code"] = working_code[:4000]
             state["candidate_code_truncated"] = len(working_code) > 4000
             state["read_files"] = (

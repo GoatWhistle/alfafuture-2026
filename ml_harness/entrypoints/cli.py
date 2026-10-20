@@ -123,7 +123,7 @@ def main(*, started_at: float | None = None) -> int:
     parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--search-mode", choices=("qwen", "optuna", "none"))
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--research-sessions", type=int, default=12)
+    parser.add_argument("--research-sessions", type=int, default=3)
     parser.add_argument("--research-steps", type=int, default=12)
     parser.add_argument("--llm-token-limit", type=int, default=32000)
     args = parser.parse_args()

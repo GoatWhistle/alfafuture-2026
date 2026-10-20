@@ -56,6 +56,40 @@ class ScriptedModel:
         return next(self.replies)
 
 
+class ScriptedProposalModel:
+    def __init__(self):
+        self.starts = []
+        self.observed = []
+
+    def complete(self, messages, tools):
+        self.observed = list(messages)
+        state = json.loads(messages[1]["content"])
+        self.starts.append(state)
+        index = len(self.starts)
+        return ModelReply(
+            "",
+            (
+                ToolCall(
+                    str(index),
+                    "propose_experiment",
+                    json.dumps(
+                        {
+                            "parent_id": state["parent_id"],
+                            "task_kind": state["task_kind"],
+                            "backend": "catboost",
+                            "target_error": "exploratory: simpler model",
+                            "rationale": "Reduce overfit with shallow trees",
+                            "expected_effect": "lower RMSE",
+                            "parameters": {"iterations": 10 + index, "depth": 3},
+                        }
+                    ),
+                ),
+            ),
+            5,
+            2,
+        )
+
+
 def test_interrupted_model_session_never_resets_unknown_provider_usage(tmp_path, monkeypatch):
     import ml_harness.entrypoints.research as entrypoint
     from ml_harness.application.use_cases.baseline import BaselineResult
@@ -175,8 +209,7 @@ def test_research_promotes_measured_improvement_after_valid_refit(tmp_path, monk
         Score(1000, Metric.RMSE, task.protocol.fingerprint), task.spec.submission_path, 2.5, 4.0
     )
     Path(task.spec.submission_path).write_text("baseline placeholder")
-    code = STARTER.replace('"iterations": 200', '"iterations": 3')
-    model = ScriptedModel(code)
+    model = ScriptedProposalModel()
     monkeypatch.setattr(entrypoint, "QwenLanguageModel", lambda *args: model)
     for name, value in (
         ("OPENAI_API_KEY", "synthetic"),
@@ -195,15 +228,8 @@ def test_research_promotes_measured_improvement_after_valid_refit(tmp_path, monk
         max_sessions=1,
     )
     initial_context = json.loads(model.observed[1]["content"])
-    from ml_harness.adapters.ml.candidates import build_model as base_model
-
-    contract = initial_context["candidate_runtime_contract"]
-    assert contract == {
-        "kind_selects": "task_type",
-        "backend_option": "backend",
-        "default_backend": "catboost",
-    }
-    assert contract["default_backend"] == base_model("regression", {}, 1, 42).backend
+    assert initial_context["parent_recipe"]["backend"] == "catboost"
+    assert initial_context["task_kind"] == "regression"
     context_budget = initial_context["budget"]
     assert {
         key: context_budget[key]
@@ -221,11 +247,9 @@ def test_research_promotes_measured_improvement_after_valid_refit(tmp_path, monk
         "baseline_validation_seconds": 2.5,
         "baseline_refit_seconds": 4.0,
     }
-    observed_reports = [
-        json.loads(m["content"]).get("result", {}) for m in model.observed if m["role"] == "tool"
-    ]
-    assert any(r.get("parent_backend") == "catboost" for r in observed_reports)
-    assert report["selected"] == "regularization"
+    assert report["reports"][-1]["parent_backend"] == "catboost"
+    assert report["selected"] != "baseline"
+    assert report["sessions"][0]["reason"] == "experiment_completed"
     assert report["refit_status"] == "succeeded"
     assert Path(task.spec.submission_path).read_text().startswith("key,response")
     published = Path(task.spec.submission_path).read_bytes()
@@ -290,52 +314,7 @@ def test_new_hypotheses_get_short_sessions_with_prior_evidence(tmp_path, monkeyp
     from ml_harness.domain.models import Metric, Score
 
     task = CsvTaskData().prepare(str(task_fixture(tmp_path)), 42)
-    code = STARTER.replace('"iterations": 200', '"iterations": 3')
-    replies = []
-    for index in range(2):
-        attempt_code = code.replace('"iterations": 3', f'"iterations": {3 + index}')
-        replies.extend(
-            [
-                ModelReply(
-                    "hypothesis",
-                    (
-                        ToolCall(
-                            f"edit-{index}",
-                            "edit_file",
-                            json.dumps({"path": "candidate.py", "content": attempt_code}),
-                        ),
-                        ToolCall(
-                            f"run-{index}",
-                            "run_experiment",
-                            json.dumps(
-                                {
-                                    "experiment_id": f"attempt-{index}",
-                                    "hypothesis": f"hypothesis {index}",
-                                    "expected_effect": "lower RMSE",
-                                    "parent_id": None,
-                                }
-                            ),
-                        ),
-                    ),
-                    5,
-                    2,
-                ),
-                ModelReply(f"interpretation {index}", (), 5, 2),
-                ModelReply(f"interpretation {index}"),
-            ]
-        )
-
-    class MultipleSessions:
-        def __init__(self):
-            self.replies = iter(replies)
-            self.starts = []
-
-        def complete(self, messages, tools):
-            if len(messages) == 2:
-                self.starts.append(json.loads(messages[1]["content"]))
-            return next(self.replies)
-
-    model = MultipleSessions()
+    model = ScriptedProposalModel()
     monkeypatch.setattr(entrypoint, "QwenLanguageModel", lambda *args: model)
     for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"):
         monkeypatch.setenv(key, "synthetic")
@@ -355,16 +334,18 @@ def test_new_hypotheses_get_short_sessions_with_prior_evidence(tmp_path, monkeyp
     assert len(model.starts) == 2 and len(result["sessions"]) == 2
     assert model.starts[0]["reports"] == []
     previous = model.starts[1]["reports"][0]
-    assert previous["id"] == "attempt-0"
-    assert previous["interpretation"] == "interpretation 0"
+    assert previous["id"] == result["reports"][1]["id"]
+    assert not previous["interpretation"]
+    assert model.starts[1]["last_measurements"][-1]["full_score"]
+    assert model.starts[1]["budget"]["tokens_remaining"] == 993
     assert previous["measured"]["protocol_id"] == task.protocol.fingerprint
-    assert result["tokens_used"] == 28
+    assert result["tokens_used"] == 14
     restored = ResearchWorkspace(
         task, tmp_path / "research", SubprocessRunner(), IndependentEvaluator()
     )
     assert restored.reports[0]["usage"]["scope"] == "shared_session"
-    assert restored.reports[0]["usage"]["input_tokens"] == 10
-    assert restored.reports[0]["usage"]["api_attempts"] == 3
+    assert restored.reports[0]["usage"]["input_tokens"] == 5
+    assert restored.reports[0]["usage"]["api_attempts"] == 1
 
 
 def test_resume_preserves_conservative_charge_after_successful_retry(tmp_path, monkeypatch):
@@ -395,6 +376,8 @@ def test_resume_preserves_conservative_charge_after_successful_retry(tmp_path, m
             "budget_accounted": True,
         },
     )
+
+    (directory / "pipeline-version.json").write_text(json.dumps({"version": 2}))
 
     class ForbiddenModel:
         def complete(self, messages, tools):
