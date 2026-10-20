@@ -98,6 +98,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {
                 "title": title.strip(),
                 "created_at": iso_now(),
+                # Модель фиксируется при создании: позже конфигурация сервера может смениться
+                "model": qwen_status()["model"] if mode == "qwen" else "Без LLM",
                 "options": {
                     "time_sec": time_sec,
                     "tokens": tokens,

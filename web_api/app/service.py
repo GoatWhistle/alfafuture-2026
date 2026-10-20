@@ -86,7 +86,8 @@ class Service:
                 chosen = facts["selected"]
                 parts.append(
                     f"В итоговый CSV вошёл {chosen['id']} "
-                    f"({facts['metric']} {chosen['score']:.4f} на полной validation)."
+                    f"({facts['metric']} {reader.format_score(chosen['score'], facts['metric'])} "
+                    "на полной validation)."
                 )
             note = " ".join(parts) or None
         return {
@@ -102,7 +103,7 @@ class Service:
             "elapsedSec": round(elapsed),
             "startedAt": meta.get("started_at") or meta["created_at"],
             "demo": False,
-            "model": qwen_status()["model"],
+            "model": meta.get("model") or "модель не записана",
             "mode": options["mode"],
             "budget": {
                 "timeSec": options["time_sec"],

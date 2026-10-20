@@ -150,3 +150,13 @@ def test_no_secrets_or_paths_in_responses(client, settings, monkeypatch):
     assert "sk-secret-value" not in text
     assert str(settings.runs_root) not in text
     assert os.environ["OPENAI_API_KEY"] not in client.get("/api/runs").text
+
+
+def test_model_is_fixed_at_creation(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "model-a")
+    run_id = create(client)
+    monkeypatch.setenv("OPENAI_MODEL", "model-b")
+    assert client.get(f"/api/runs/{run_id}").json()["model"] == "model-a"
+    assert client.get(f"/api/runs/{create(client, mode='optuna')}").json()["model"] == "Без LLM"

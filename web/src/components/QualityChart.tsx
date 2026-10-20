@@ -3,6 +3,7 @@ import type { Run } from "../data/types";
 import { fmtScore } from "../format";
 
 interface Point {
+  /** Короткая подпись оси: идентификаторы экспериментов бывают длинными хешами */
   x: string;
   score: number;
   id: string;
@@ -12,7 +13,7 @@ interface Point {
 export function QualityChart({ run, onSelect }: { run: Run; onSelect: (id: string) => void }) {
   const points: Point[] = run.experiments
     .filter((e) => e.level === "full" && e.status === "ok" && e.score !== null)
-    .map((e) => ({ x: e.id, score: e.score as number, id: e.id }));
+    .map((e, i) => ({ x: `№${i + 1}`, score: e.score as number, id: e.id }));
   const smoke = run.experiments.filter((e) => e.level === "smoke").length;
   const values = [...points.map((p) => p.score), ...(run.baseline !== null ? [run.baseline] : [])];
   const span = values.length ? Math.max(...values) - Math.min(...values) : 0;
@@ -44,7 +45,7 @@ export function QualityChart({ run, onSelect }: { run: Run; onSelect: (id: strin
             />
             <Tooltip
               formatter={(v: number) => [fmtScore(v, run.metric), run.metric]}
-              labelFormatter={(l) => `Эксперимент ${l}`}
+              labelFormatter={(_, payload) => `Эксперимент ${(payload?.[0]?.payload as Point | undefined)?.id ?? ""}`}
               contentStyle={{ borderRadius: 10, border: "1px solid var(--line)", fontFamily: "inherit" }}
             />
             {run.baseline !== null && (
@@ -86,7 +87,7 @@ export function QualityChart({ run, onSelect }: { run: Run; onSelect: (id: strin
       <ul className="sr-only">
         {points.map((p) => (
           <li key={p.id}>
-            Эксперимент {p.id}: {fmtScore(p.score, run.metric)}
+            {p.x}, эксперимент {p.id}: {fmtScore(p.score, run.metric)}
           </li>
         ))}
       </ul>

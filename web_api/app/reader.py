@@ -56,7 +56,7 @@ def _score(report: dict[str, Any], key: str = "full_score") -> float | None:
     return float(value)
 
 
-def _fmt(value: float, metric: str) -> str:
+def format_score(value: float, metric: str) -> str:
     return f"{value:.2f}" if re.search(r"rmse|mae|mse", metric, re.IGNORECASE) else f"{value:.4f}"
 
 
@@ -160,10 +160,10 @@ def experiments(
         if admission.get("allowed") is False:
             status = "rejected"
         if status == "ok" and score is not None:
-            measured = f"{metric} {_fmt(score, metric)}"
+            measured = f"{metric} {format_score(score, metric)}"
             if delta is not None:
                 sign = "+" if delta >= 0 else "−"
-                measured += f": {sign}{_fmt(abs(delta), metric)} к родителю"
+                measured += f": {sign}{format_score(abs(delta), metric)} к родителю"
         elif status == "running":
             measured = "Выполняется…"
         elif status == "rejected" and "estimated_full_seconds" in admission:

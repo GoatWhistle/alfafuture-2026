@@ -1,6 +1,7 @@
 """Fake OpenAI-compatible endpoint for web e2e: every request gets one propose_experiment call.
 
-Usage: python fake_llm.py PORT LOGFILE. Env SLEEP adds a per-request delay in seconds.
+Usage: python fake_llm.py PORT LOGFILE. Env SLEEP adds a per-request delay in seconds,
+TASK_KIND sets the proposed task kind (binary, multiclass, regression).
 The parent is taken from the last parent/best id mentioned in the request context.
 """
 
@@ -32,7 +33,7 @@ class Handler(BaseHTTPRequestHandler):
         found = _PARENT.findall(json.dumps(body["messages"], ensure_ascii=False))
         arguments = {
             "parent_id": found[-1] if found else "baseline",
-            "task_kind": "binary",
+            "task_kind": os.environ.get("TASK_KIND", "binary"),
             "backend": "catboost",
             "target_error": "Fake: ошибки на редких категориях f2",
             "rationale": "Fake: уменьшить глубину и число итераций",
