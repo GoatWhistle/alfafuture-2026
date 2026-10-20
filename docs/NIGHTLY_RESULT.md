@@ -2,7 +2,7 @@
 
 Промежуточный отчёт: работа продолжается одним агентом в fix/qwen-live-cycle.
 Короткий измеренный цикл принят, включая новый review интерпретации.
-Три публичных gate не приняты; gate-v4 выполняется. Сравнение — 0/18,
+Четыре публичных gate не приняты; следующий — gate-v5. Сравнение — 0/18,
 польза Qwen относительно Optuna ещё не измерена.
 
 ## 503 и контракт tools
@@ -151,7 +151,11 @@ candidate_runtime_contract, forced edit_file и enable_thinking=False; это н
 wall-clock, но не повышает прогноз стоимости успешных финалистов; fallback
 учитывается как refit, а не validation. Три быстрые регрессии воспроизвели
 дефекты до исправления. make check и macOS offline: 628 passed / 1 live
-deselected (84.97 s). Linux/ZIP перепроверяются перед свежим gate-v5.
+deselected (84.97 s); Linux без сети: 628 passed / 1 live deselected (90.97 s).
+ZIP: 56 файлов, SHA-256 6f512560ea4f5208b04e4450c5e2c03c002668ac2c9f9c27b0812580c4895429.
+Распакованный ZIP побайтово совпадает с исходниками; Linux без сети, 4 CPU/6 GiB:
+regression/diabetes дали валидные CSV и успешный refit. Следующий — gate-v5
+на frozen runtime 13b8c80.
 
 ## Сравнение и следующий шаг
 

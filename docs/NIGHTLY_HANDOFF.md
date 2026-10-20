@@ -150,3 +150,8 @@ classification full timed_out и budget_exhausted (935.2 s), changed=0.
 классификация fallback как validation вместо refit. make check и macOS offline:
 628 passed / 1 live deselected (84.97 s). Следующий gate-v5 — после Linux/ZIP
 проверок, без переноса старых gate. Сравнение остаётся 0/18.
+
+13b8c80 отправлен. Linux offline: 628 passed / 1 live deselected (90.97 s);
+ZIP SHA-256 6f512560ea4f5208b04e4450c5e2c03c002668ac2c9f9c27b0812580c4895429,
+56 файлов, побайтовое совпадение, regression/diabetes CSV/refit в Linux без сети
+проверены. Следующая серия gate-v5 на frozen 13b8c80; локатор ACTIVE.json.
