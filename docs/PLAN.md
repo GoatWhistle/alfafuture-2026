@@ -423,3 +423,9 @@ Gate-v5 активен на 13b8c80 (ACTIVE.json, session 62189): regression
 допускает сравнение. Classification продолжает работу; не перезапускать
 живой процесс. После terminal status сохранить все факты и повторить gate
 на обеих задачах тем же runtime, если endpoint позволяет. Control не читался.
+
+Gate-v5 terminal: classification api_error, changed=0, interpreted=0,
+624.4 s; обе задачи CSV/refit verified (22 449 / 41 166 строк). Приёмка
+серии false, control scores не просматривались. Повтор — gate-v6 на том же
+frozen 13b8c80; новых runtime-изменений после проверки ZIP нет.
+Сравнение 0/18 и запрещено до приёмки обеих задач свежего gate.
