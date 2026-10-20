@@ -277,6 +277,45 @@ def run_session(
                     else "Continue research using the available tools. "
                 )
             )
+            if interpretation_draft is not None:
+                # A review needs evidence, not search instructions or artifact
+                # locations. Keep all measured values and the executed source.
+                messages[0] = {
+                    "role": "system",
+                    "content": INTERPRETATION_AUDIT_INSTRUCTION
+                    + " Use candidate_runtime_contract for imported base_model. "
+                    + "Explicitly state when the executed code did not test the hypothesis.",
+                }
+                phase_instruction = ""
+                state.pop("budget", None)
+                state.pop("direction", None)
+                recent.pop("phase", None)
+                recent.pop("recent_observations", None)
+                if latest is not None:
+                    observation = latest["observation"]
+                    report = observation.get("result")
+                    if isinstance(report, dict):
+                        recent["last_experiment"] = {
+                            **latest,
+                            "observation": {
+                                **observation,
+                                "result": {
+                                    key: value
+                                    for key, value in report.items()
+                                    if key
+                                    not in (
+                                        "artifacts",
+                                        "code_hash",
+                                        "parent_code_hash",
+                                        "protocol_id",
+                                        "diagnostic_status",
+                                        "hypothesis_source",
+                                    )
+                                },
+                            },
+                        }
+                        if report.get("parent_score") is not None:
+                            state.pop("baseline_measured", None)
             if correction_used:
                 phase_instruction += (
                     "The prior response was incomplete. Return one complete tool call, "
@@ -291,7 +330,7 @@ def run_session(
             if _request_size(messages, schemas) > request_limit:
                 recent["recent_observations"] = []
                 messages[-1]["content"] = phase_instruction + encoded(recent)
-            if _request_size(messages, schemas) > request_limit:
+            if _request_size(messages, schemas) > request_limit and not awaiting_interpretation:
                 state["read_files"] = {
                     path: {"offset": info["offset"]} for path, info in read_files.items()
                 }

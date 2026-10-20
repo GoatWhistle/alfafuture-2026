@@ -2,7 +2,7 @@
 
 Промежуточный отчёт: работа продолжается одним агентом в fix/qwen-live-cycle.
 Короткий измеренный цикл принят, включая новый review интерпретации.
-Пять публичных gate не приняты; следующий повтор — gate-v6 на том же runtime. Сравнение — 0/18,
+Шесть публичных gate не приняты; review-context исправляется перед gate-v7. Сравнение — 0/18,
 польза Qwen относительно Optuna ещё не измерена.
 
 ## 503 и контракт tools
@@ -119,6 +119,8 @@ archive-скрипта остановился до harness из-за PYTHONPATH;
 | gate-v4 / classification | Не принята: catboost-balanced-w700d8 timed_out на full, changed=0, budget_exhausted; 935.2 s. |
 | gate-v5 / regression | Не принята: changed full RMSE 41.1507446438 против 42.1966696526, но interpreted=0; после одного 503 и успешного retry не хватило token budget на интерпретацию. 199.0 s, CSV/refit 22 449 строк проверены. |
 | gate-v5 / classification | Не принята: api_error после двух edit-попыток (~61 s каждая), changed=0, interpreted=0; 624.4 s. CSV/refit 41 166 строк проверены. |
+| gate-v6 / regression | Не принята: forced edit HTTP 503 после навигации, changed=0; 104.4 s. Два read_file с file_path отклонены структурированно. CSV/refit проверены. |
+| gate-v6 / classification | Не принята: первый full timed_out; исправленный кандидат прошёл full (macro-F1 0.5241378916 против 0.5652431446), но review не уместился в token budget. 1043.8 s; CSV/refit 41 166 строк проверены. |
 
 У gate-v2 автоматический changed=0 для classification оказался ложным отказом:
 ID baseline-catboost-sqrtbalanced был исключён по префиксу. Исправленный verifier
@@ -159,25 +161,42 @@ ZIP: 56 файлов, SHA-256 6f512560ea4f5208b04e4450c5e2c03c002668ac2c9f9c27b0
 regression/diabetes дали валидные CSV и успешный refit. Следующий — gate-v5
 на frozen runtime 13b8c80.
 
+После terminal status gate-v6 воспроизведён отдельный дефект review-context:
+при оставшихся 7 728 tokens исходный код/метрики с повторными инструкциями и
+служебными полями не проходили консервативный request limit. Offline replay
+исходного контекста, без API/ML, завершался после draft с budget_exhausted;
+синтетическая регрессия подтвердила тот же отказ при неподвижных часах.
+Исправление убирает из тесного review-контекста повторную инструкцию,
+поисковый budget/direction, пути и хеши артефактов. Код, factory semantics,
+гипотеза, full/parent/smoke-метрики, вся показанная диагностика и draft сохранены.
+Offline replay теперь доходит до mocked review (5 918 bytes); это не новая
+Qwen-интерпретация и не замена исходного gate report. 19 связанных тестов прошли.
+Сводка оригинальных API attempts/session accounting: runs/nightly/live-accounting.json;
+диагностические раунды в неё не входят, точный биллинг не подтверждён.
+
 ## Сравнение и следующий шаг
 
 Матрица — 0/18, не начата. Измеренного эффекта Qwen против Optuna нет.
 Диабетический holdout verifier открывает только после полного cohort.
 
-1. Повторить обе публичные задачи в свежей серии gate-v6 на том же runtime
-   13b8c80: gate-v5 завершён, обе задачи не приняты. CSV/refit обеих задач
-   проверены, но regression без интерпретации, classification без changed full.
-   После завершения gate-v6 проверить код, full-метрики, scope и review.
+1. Завершить проверки исправления review-context, пересобрать ZIP и проверить
+   Linux без сети; затем свежий gate-v7 на обеих публичных задачах. Старые
+   gate не переносятся. Проверить фактический код, full-метрики, scope, review
+   и соответствие CSV/refit. Матрицу запускать только после приёмки обоих.
 2. Только после этого выполнить:
 
 ```sh
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
 uv run --locked --all-extras python -m verification.run_agent_comparison \
   data/regression/task.md data/classification/task.md runs/stage7/tasks/diabetes/task.md \
-  --gate-report runs/nightly/gate-v6/report.json --output runs/nightly/comparison-v1
+  --gate-report runs/nightly/gate-v7/report.json --output runs/nightly/comparison-v1
 ```
 
 3. Сохранить все 18 попыток и парные эффекты по трём seed, обновить этот отчёт
    фактами; отрицательный эффект допустим. После просмотра final control/holdout
    новые изменения не подбирать. Gate и сравнение остаются незавершёнными до
    фактической проверки; готовность агента по этой записи не объявляется.
+
+Проверка review-context: make check успешен; полный macOS offline —
+629 passed / 1 live deselected (85.27 s). Linux/ZIP проверяются отдельно
+перед новым gate; эти offline результаты не означают live-приёмку.

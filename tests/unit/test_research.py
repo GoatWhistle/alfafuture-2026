@@ -424,7 +424,8 @@ def test_review_compaction_retains_draft_code_and_latest_measurement():
     state = json.loads(model.messages[2][1]["content"])
     assert state["candidate_code"] == code and not state["candidate_code_truncated"]
     review = model.messages[2][-1]["content"]
-    assert "Audit the previous draft" in review and "draft_interpretation" in review
+    assert "Audit the previous draft" in model.messages[2][0]["content"]
+    assert "draft_interpretation" in review
     assert '"draft_truncated":true' in review
     assert "12.5" in review and "13.0" in review
     assert len(json.dumps(model.messages[2], ensure_ascii=False).encode()) < 6000
@@ -464,3 +465,90 @@ def test_factory_runtime_contract_survives_run_interpretation_and_review_compact
     for messages in model.messages[1:]:
         assert json.loads(messages[1]["content"])["candidate_runtime_contract"] == contract
         assert "candidate_runtime_contract" in messages[0]["content"]
+
+
+def test_review_fits_remaining_budget_without_losing_code_or_measured_diagnostics():
+    class Model(FakeLanguageModel):
+        def set_limits(self, seconds, attempts, tokens):
+            self.remaining_tokens = tokens
+
+        def complete(self, messages, tools):
+            request = json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False)
+            assert len(request.encode()) + 1024 + 512 <= self.remaining_tokens
+            return super().complete(messages, tools)
+
+    code = "# model configuration and its rationale\n" * 24 + "def build_model(): return model\n"
+    protocol = "p" * 64
+    score = {"value": 0.52, "metric": "macro_f1", "protocol_id": protocol, "level": "full"}
+    diagnostics = {
+        "measured_by": "harness",
+        "overall_delta": {"value": -0.04, "improved": False},
+        "focus_scope": {"selected": 3, "classes_total": 10, "exhaustive": False},
+        "class_metric_changes": {"f1": {"increased": 2, "decreased": 8}},
+        "target_errors": [
+            {
+                "class": name,
+                "support": 100,
+                "metrics": {"precision": 0.2, "recall": 0.3, "f1": 0.24},
+                "delta": {"precision": -0.1, "recall": 0.1, "f1": -0.02},
+            }
+            for name in ["class-a", "class-b", "class-c"]
+        ],
+    }
+    report = {
+        "id": "changed",
+        "parent_id": "baseline",
+        "status": "succeeded",
+        "full_score": score,
+        "parent_score": score | {"value": 0.56},
+        "smoke_score": score | {"value": 0.51, "level": "smoke"},
+        "protocol_id": protocol,
+        "code_hash": "c" * 64,
+        "parent_code_hash": "b" * 64,
+        "parent_backend": "catboost",
+        "hypothesis": "Balanced weights should improve rare-class recall. " * 8,
+        "expected_effect": "Increase macro F1 by improving rare-class predictions. " * 3,
+        "measured_errors": diagnostics,
+        "artifacts": ["/local/private/run/" + "artifact/" * 16 + str(i) for i in range(3)],
+    }
+    draft = "Measured F1 fell to 0.52 versus 0.56; selected errors are partial. " * 7
+    model = Model(
+        [
+            ModelReply("", (ToolCall("run", "run_experiment", "{}"),)),
+            ModelReply(draft, input_tokens=2296, output_tokens=1141),
+            ModelReply("Reviewed measurement, without a causal claim.", input_tokens=1000),
+        ]
+    )
+    context = {
+        "task": {"target": "label", "metric": "macro_f1", "class_count": 10},
+        "candidate_code": code,
+        "candidate_runtime_contract": {"default_backend": "catboost"},
+        "baseline_measured": {"value": 0.56, "metric": "macro_f1", "protocol_id": protocol},
+        "direction": {"parent_id": "baseline", "reason": "test rare-class recall " * 6},
+        "budget": {"description": "measured baseline timing and worker limits " * 7},
+    }
+    result = run_session(
+        model,
+        FakeTools([{"ok": True, "result": report}]),
+        json.dumps(context),
+        RunBudget(1000, 32000, 10, tokens_used=20835),
+        FakeClock(),
+    )
+    assert result.reason == "model_finished" and len(model.messages) == 3
+    review = json.dumps(model.messages[-1], ensure_ascii=False)
+    assert code in [
+        json.loads(m["content"]).get("candidate_code")
+        for m in model.messages[-1]
+        if m["content"].startswith("{")
+    ]
+    assert "default_backend" in review and "catboost" in review
+    assert "0.52" in review and "0.56" in review and "draft_interpretation" in review
+    assert "classes_total" in review and "class_metric_changes" in review
+    assert all(name in review for name in ["class-a", "class-b", "class-c"])
+    assert "false" in review and "single-split" in review
+    measured = json.loads(model.messages[-1][-1]["content"])["last_experiment"]["observation"][
+        "result"
+    ]
+    assert measured["measured_errors"] == diagnostics
+    for key in ("full_score", "parent_score", "smoke_score", "hypothesis", "expected_effect"):
+        assert measured[key] == report[key]

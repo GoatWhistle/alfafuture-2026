@@ -429,3 +429,16 @@ Gate-v5 terminal: classification api_error, changed=0, interpreted=0,
 серии false, control scores не просматривались. Повтор — gate-v6 на том же
 frozen 13b8c80; новых runtime-изменений после проверки ZIP нет.
 Сравнение 0/18 и запрещено до приёмки обеих задач свежего gate.
+
+Gate-v6 terminal: regression api_error/503, changed=0 (104.4 s);
+classification repaired full macro-F1 0.5241378916 против 0.5652431446,
+но interpreted=0 из-за review-context budget (1043.8 s). Обе CSV/refit verified.
+После terminal status найдено и offline воспроизведено переполнение review:
+убираются дубли инструкций, поисковые подсказки и пути/хеши, сохраняются код
+и все измеренные значения. 19 связанных тестов прошли; исходный replay без
+API/ML теперь доходит до mocked review. Далее полные проверки/Linux/ZIP и
+свежий gate-v7; старый отчёт не заменять. Сравнение 0/18.
+
+Проверка review-context: make check успешен; полный macOS offline —
+629 passed / 1 live deselected (85.27 s). Linux/ZIP проверяются отдельно
+перед новым gate; эти offline результаты не означают live-приёмку.
