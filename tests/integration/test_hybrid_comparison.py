@@ -2,8 +2,11 @@
 
 import csv
 import importlib
+import os
+import sys
 from pathlib import Path
 
+import pytest
 from test_prepare_task import task_fixture
 
 from ml_harness.adapters.data.task import CsvTaskData
@@ -45,3 +48,37 @@ def test_bundled_classification_benchmark_copies_preserve_label_contract(tmp_pat
         copied = module.benchmark_copy(path, tmp_path / "copies" / name)
         prepared = CsvTaskData().prepare(str(copied), 42)
         assert prepared.spec.kind in ("binary", "multiclass", "regression")
+
+
+@pytest.mark.parametrize("configured_model", [None, "platform-model"])
+def test_comparison_cli_loads_root_env_without_overriding_platform(
+    tmp_path, monkeypatch, configured_model
+):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2]))
+    module = importlib.import_module("verification.run_hybrid_comparison")
+    (tmp_path / ".env").write_text("OPENAI_MODEL=fixture-model\nOPENAI_API_KEY=fixture-key\n")
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    if configured_model:
+        monkeypatch.setenv("OPENAI_MODEL", configured_model)
+    captured = []
+
+    def capture(args):
+        captured.append((os.environ["OPENAI_MODEL"], os.environ["OPENAI_API_KEY"], args.modes))
+
+    monkeypatch.setattr(module, "run", capture)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "comparison",
+            str(tmp_path / "task.md"),
+            "--output",
+            str(tmp_path / "out"),
+            "--modes",
+            "qwen",
+        ],
+    )
+    module.main()
+    assert captured == [(configured_model or "fixture-model", "fixture-key", ["qwen"])]

@@ -13,6 +13,8 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
 from ml_harness.adapters.data.task import CsvTaskData
 from verification.run_agent_comparison import source_hashes, validate_saved_gate
 from verification.run_benchmarks import (
@@ -394,6 +396,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> None:
+    load_dotenv(ROOT / ".env", override=False)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tasks", nargs="+", type=Path)
     parser.add_argument("--output", required=True, type=Path)
