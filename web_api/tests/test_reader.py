@@ -116,3 +116,28 @@ def test_failed_qwen_session_is_shown_as_attempt(tmp_path: Path):
     assert row["kind"] == "llm_request" and row["status"] == "failed"
     assert row["error"] == "Qwen APIConnectionError after 3 attempt(s)"
     assert row["score"] is None
+
+
+def test_running_usage_counts_finished_sessions_and_marks_pending():
+    events = [
+        {"kind": "session_started", "payload": {"id": "one"}},
+        {
+            "kind": "session_finished",
+            "payload": {
+                "id": "one",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "tokens_charged": 200,
+                    "usage_known": False,
+                },
+            },
+        },
+        {"kind": "session_started", "payload": {"id": "two"}},
+    ]
+    assert reader.token_usage(events, {"preparation_tokens": 10}, {}) == (210, True)
+    assert reader.token_usage(events[:1], {}, {}) == (0, True)
+    assert reader.token_usage(events[:2], {}, {"tokens_used": 200, "usage_known": False}) == (
+        200,
+        True,
+    )

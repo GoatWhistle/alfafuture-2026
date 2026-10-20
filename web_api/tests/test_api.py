@@ -141,6 +141,36 @@ def test_description_prefix_is_rewritten_to_run_files(client, settings):
     assert "`train.csv`" in task and "multiclass/" not in task
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        r'{"train_path":"\u002fprivate\u002fsecret.txt"}',
+        r'{"submission_path":"\u002e\u002e\u002foutside.csv"}',
+        '{"submission_path":"train.csv"}',
+        '{"test_path":"other.csv"}',
+    ],
+)
+def test_structured_paths_cannot_escape_or_overwrite_inputs(client, metadata):
+    from .conftest import files
+
+    response = client.post(
+        "/api/runs",
+        data={"title": "Test", "description": "```task-json\n" + metadata + "\n```"},
+        files=files(),
+    )
+    assert response.status_code == 422
+
+
+def test_task_metadata_preserves_semantics_and_owns_paths(client, settings):
+    description = '```task-json\n{"target":"y","metric":"rmse"}\n```\nOutput: `train.csv`'
+    run_id = create(client, description=description)
+    task = (settings.runs_root / run_id / "inputs/task.md").read_text()
+    metadata = json.loads(task.split("```task-json\n")[1].split("```")[0])
+    assert metadata["target"] == "y" and metadata["metric"] == "rmse"
+    assert metadata["train_path"] == "train.csv"
+    assert metadata["submission_path"] == "submission.csv"
+
+
 def test_no_secrets_or_paths_in_responses(client, settings, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value")
     run_id = create(client)

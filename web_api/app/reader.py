@@ -282,6 +282,31 @@ def stage_of(harness: Path) -> str:
     return "prepare"
 
 
+def token_usage(
+    events: list[dict[str, Any]], budget: dict[str, Any], research: dict[str, Any]
+) -> tuple[int, bool]:
+    """Show persisted charges while running; an unfinished request has unknown usage."""
+    tokens = int(budget.get("preparation_tokens", 0))
+    uncertain = budget.get("preparation_usage_known") is False
+    started, finished = set(), set()
+    for event in events:
+        payload = event["payload"]
+        if event.get("kind") == "session_started":
+            started.add(payload.get("id"))
+        elif event.get("kind") == "session_finished":
+            finished.add(payload.get("id"))
+            usage = payload.get("usage") or {}
+            reported = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            tokens += max(reported, usage.get("tokens_charged", reported))
+            uncertain = uncertain or usage.get("usage_known") is not True
+    uncertain = uncertain or bool(started - finished)
+    # The final summary already includes preparation and sessions; do not add it again.
+    if isinstance(research.get("tokens_used"), int):
+        tokens = research["tokens_used"]
+        uncertain = uncertain or research.get("usage_known") is False
+    return tokens, uncertain
+
+
 def run_facts(run_dir: Path) -> dict[str, Any]:
     """Facts derived from artifacts only: no process state, no side effects."""
     harness = run_dir / "harness"
@@ -308,12 +333,7 @@ def run_facts(run_dir: Path) -> dict[str, Any]:
     if selected is not None:
         # В итоговый CSV входит выбранный финалист; показываем его измеренную метрику
         best = selected["score"]
-    tokens = research.get("tokens_used")
-    if not isinstance(tokens, int):
-        tokens = int(budget.get("preparation_tokens", 0)) if isinstance(budget, dict) else 0
-    uncertain = research.get("usage_known") is False or (
-        isinstance(budget, dict) and budget.get("preparation_usage_known") is False
-    )
+    tokens, uncertain = token_usage(events, budget, research)
     submission = spec.get("submission_path")
     return {
         "metric": metric,
