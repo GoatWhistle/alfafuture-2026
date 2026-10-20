@@ -1,7 +1,7 @@
 # Ночная стабилизация Qwen: фактический результат
 
 Промежуточный отчёт, работа продолжается в `fix/qwen-live-cycle` одним агентом.
-Короткий измеренный цикл принят. Публичный gate выполняется; сравнение с Optuna
+Короткий измеренный цикл принят. Первый публичный gate не принят, второй выполняется; сравнение с Optuna
 ещё не разрешено. Польза агента пока не измерена.
 
 ## 503 и некорректные tool calls
@@ -53,6 +53,8 @@ tokens и полностью cached prompt при нескольких аргу�
 | d46c7c6 | Инструменты вне схемы текущего запроса отклоняются до executor; ошибка возвращается модели, фаза и расход сохраняются. |
 | a40d167 | Bounded generation ограничена 1536 tokens; action-фазы получают system prompt без стартовой навигации. Запуск и интерпретация обязаны сверять гипотезу с исполняемым candidate_code. |
 | 8319ce9 | Thinking отключён для forced tool choice; параметры выбора и режима сохраняются в API-трассе. |
+| 272fab3 | Ограниченная строка исключения stderr и failure_phase доступны модели; failed-кандидат возвращает её в edit_file для исправления. |
+| 980cb43 | В контекст Qwen передаются измеренные baseline validation/refit seconds, worker/smoke timeout и число потоков. |
 
 Регрессии сначала воспроизвели нарушения на реальных границах SDK/session,
 затем прошли после исправлений. Scripted-тесты не считаются live-приёмкой.
@@ -75,17 +77,17 @@ semantic-review.json. Последний smoke подтверждает инже
 
 ## Проверки и ZIP
 
-- Последний runtime 8319ce9: make check успешен; 75 связанных unit-тестов,
-  отдельно 29 SDK-тестов с проверкой фактического тела и трассы.
-- Полный macOS offline-прогон: 618 passed, 1 live deselected, 80.24 s;
-  runs/nightly/offline-tests-v4.log.
-- Полный Linux offline-прогон a40d167: 618 passed, 1 live deselected, 83.74 s,
-  network=none, 2 CPU / 6 GiB; runs/nightly/linux-offline-v2/pytest.log.
+- Последний runtime 980cb43: make check успешен; SDK-тесты проверяют тело/трассу,
+  integration-регрессия — настоящий worker failure и исправление в той же сессии.
+- Полный macOS offline-прогон: 619 passed, 1 live deselected, 82.42 s;
+  runs/nightly/offline-tests-v6.log.
+- Полный Linux offline-прогон 980cb43: 619 passed, 1 live deselected, 84.88 s,
+  network=none, 2 CPU / 6 GiB; runs/nightly/linux-offline-v4/pytest.log.
 - ZIP последнего runtime: 56 файлов, побайтовое совпадение с исходниками;
-  SHA-256 b76d8ad7b9bc0a1f93a5b455e99b80bfd0af392ed9aa75feaf5aa5ce7d71155d.
-- Распакованный entrypoint 8319ce9 проверен в Linux вне checkout, без сети,
+  SHA-256 286f31b3ebb10e21ebac900710619b90b0ea52a4dcb279e71e20ed59bf7024fb.
+- Распакованный entrypoint 980cb43 проверен в Linux вне checkout, без сети,
   Python 3.12.12, 4 CPU / 6 GiB: regression 22 449 строк, diabetes 88,
-  оба exit=0, валидный CSV, успешный refit. runs/nightly/linux-archive-v3/report.json.
+  оба exit=0, валидный CSV, успешный refit. runs/nightly/linux-archive-v4/report.json.
   Это режим search-mode=none, не Qwen gate. Посторонние контейнеры не останавливались.
 
 Предыдущие проверки и артефакты сохранены; первый технический запуск вспомогательного
@@ -94,15 +96,34 @@ archive-скрипта остановился до harness из-за PYTHONPATH,
 
 ## Публичный gate и сравнение
 
-Новая серия runs/nightly/gate-v1 запущена на зафиксированном runtime 8319ce9:
+Серия runs/nightly/gate-v1 завершена на зафиксированном runtime 8319ce9:
 regression и classification, seed 42, Qwen, до трёх сессий. Runtime и verification
 во время серии не меняются. Требуется ручная проверка содержания отчёта и
 интерпретации, одного gate_passed недостаточно.
 
 | Публичная задача | Приёмка |
 |---|---|
-| regression | Выполняется |
-| classification | Ожидает последовательного запуска |
+| regression | Не принята: changed=0, interpreted=0, budget_exhausted; CSV/refit проверены (22 449 строк), wall=101.6 s. |
+| classification | Не принята: changed=0, interpreted=0, budget_exhausted; CSV/refit проверены (41 166 строк), wall=552.7 s. |
+
+Оба процесса exit=0; report.json gate_passed=false и acceptance-review.json
+сохранены. Control scores при диагностике не просматривались. Причины:
+LightGBM early_stopping_rounds без eval set и CatBoost class_weights="Balanced".
+Модель получала лишь generic worker exit, а stderr был недоступен через tools.
+Исправлена общая граница (272fab3): ограниченная последняя строка stderr в error,
+сохранение failure_phase и переход к edit_file после неуспешного эксперимента.
+Регрессия с настоящим LightGBM/worker сначала упала, затем исправила кандидата
+в той же ReAct-сессии и завершила full за 2.49 s. Полный macOS offline-прогон 272fab3 — 619 passed (81.85 s); Linux — 619 passed
+(86.41 s), оба с 1 live deselected. В 980cb43 дополнительно переданы measured
+baseline timings и worker/smoke limits: реальный baseline classification
+занял 93.6/120.1 s, а Qwen предложила 3000 итераций. Проверка выявила отсутствие
+этих полей на границе entrypoint → model, затем прошла. make check и полный
+macOS offline 980cb43 — 619 passed / 1 live deselected (82.42 s).
+Последние Linux/ZIP проверки успешны (см. выше).
+На frozen runtime 980cb43 выполняется новый gate-v2 на обеих задачах.
+Regression выполняется; classification ожидает последовательного запуска.
+Исходники runtime/verification не меняются; после окончания необходимо
+проверить содержание report, код кандидатов и интерпретации.
 
 Сравнение — 0/18, ещё не запущено. Измеренного эффекта Qwen против Optuna нет.
 Полная матрица разрешена только после приёмки обеих публичных задач на этих исходниках;
@@ -111,16 +132,16 @@ diabetes holdout открывается verifier только после пол�
 
 ## Открытые пункты и следующий шаг
 
-1. Дождаться текущего gate через runner.log/manifest/session и проверить оба
-   публичных запуска: самостоятельное изменение кода, успешный full, корректная
-   интерпретация и CSV выбранного refit. Текущий процесс не перезапускать по таймауту наблюдения.
+1. Дождаться текущего gate-v2 через runner.log/manifest/session и проверить
+   обе задачи: изменение кода, full, корректная интерпретация, refit CSV.
+   Живой процесс не перезапускать из-за таймаута наблюдения.
 2. После приёмки выполнить 18 запусков с параметрами PLAN через:
 
 ```sh
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
 uv run --locked --all-extras python -m verification.run_agent_comparison \
   data/regression/task.md data/classification/task.md runs/stage7/tasks/diabetes/task.md \
-  --gate-report runs/nightly/gate-v1/report.json --output runs/nightly/comparison-v1
+  --gate-report runs/nightly/gate-v2/report.json --output runs/nightly/comparison-v1
 ```
 
 3. Записать фактические парные эффекты и оставшиеся отказы; отрицательный результат

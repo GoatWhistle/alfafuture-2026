@@ -341,3 +341,24 @@ enable_thinking=False дал 3/3 валидных edit_file; default восст�
 ZIP последнего runtime повторно проверяется в Linux; затем новый публичный gate.
 Фактический отчёт — [NIGHTLY_RESULT.md](NIGHTLY_RESULT.md); трассы, расходы и
 все непринятые попытки остаются локально в `runs/nightly/`.
+
+Публичный `runs/nightly/gate-v1` на 8319ce9 не принят на обеих задачах:
+changed=0 / interpreted=0; оба exit=0, CSV соответствуют финальному refit.
+Regression — 101.6 s, 22 449 строк; classification — 552.7 s, 41 166 строк.
+Причины исполнения: LightGBM early_stopping_rounds без eval set и CatBoost
+class_weights="Balanced". Worker exception не был доступен модели; последовали
+попытки чтения недоступного stderr. Control scores для исправлений не просматривались.
+
+`272fab3` возвращает ограниченную последнюю строку stderr и failure_phase,
+после failed/timed_out кандидата выбирает edit_file. Реальная worker-регрессия
+с LightGBM сначала воспроизвела дефект, затем исправила код в той же сессии
+и получила full-метрику. `980cb43` передаёт Qwen измеренные времена baseline
+validation/refit, worker/smoke timeout и потоки: baseline classification
+занял 93.6/120.1 s, тогда как Qwen предложила 3000 итераций. Последний
+make check и macOS offline — 619 passed / 1 live deselected (82.42 s).
+Linux на 980cb43 — 619 passed / 1 live deselected (84.88 s), без сети,
+2 CPU / 6 GiB. ZIP — 56 файлов, SHA-256
+286f31b3ebb10e21ebac900710619b90b0ea52a4dcb279e71e20ed59bf7024fb;
+побайтово сопоставлен с исходниками, распакованный entrypoint в Linux без сети
+прошёл regression/diabetes с валидными CSV и refit. Новый gate-v2 начат
+на обеих публичных задачах с прежними лимитами. Старый gate не переносится.
