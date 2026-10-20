@@ -35,10 +35,12 @@ class AutoGluonCandidate:
     def __init__(self, kind: str, parameters: dict[str, Any], threads: int, seed: int):
         options = dict(parameters)
         options.pop("backend", None)
-        self.time_limit = options.pop("time_limit", 60)
+        self.comparison = options.pop("comparison", False)
+        self.time_limit = options.pop("time_limit", 600 if self.comparison else 60)
         self.hyperparameters = copy.deepcopy(options.pop("hyperparameters", {"CAT": {}}))
         if (
             options
+            or type(self.comparison) is not bool
             or not isinstance(self.time_limit, int | float)
             or not math.isfinite(self.time_limit)
             or not 0 < self.time_limit <= 600
@@ -192,7 +194,7 @@ class AutoGluonCandidate:
             num_stack_levels=0,
             auto_stack=False,
             dynamic_stacking=False,
-            fit_weighted_ensemble=False,
+            fit_weighted_ensemble=self.comparison,
             ag_args_fit={"num_cpus": self.threads, "num_gpus": 0},
             calibrate=False,
             calibrate_decision_threshold=False,

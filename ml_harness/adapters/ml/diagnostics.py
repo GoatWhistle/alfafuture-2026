@@ -19,7 +19,6 @@ from ml_harness.domain.models import (
     ValidationProtocol,
 )
 
-MAX_FEATURES = 20
 MAX_CATEGORIES = 8
 
 
@@ -161,7 +160,7 @@ def analyze_errors(
             "interpretation": None,
             "limits": {
                 "min_support": min_support,
-                "max_features": MAX_FEATURES,
+                "max_features": len(spec.features),
                 "max_categories_per_feature": MAX_CATEGORIES,
                 "numeric_bins": 4,
                 "segment_fit_partition": "train",
@@ -247,42 +246,47 @@ def analyze_errors(
                     key: value - output["parent_regression"][key]
                     for key, value in output["regression"].items()
                 }
-            features = [f for f in spec.features if f not in (spec.target, spec.id_column)]
-            selected = features[:MAX_FEATURES]
-            missing = [f for f in selected if any(f not in row for row in train + validation)]
-            definitions = [
-                definition
-                for feature in selected
-                if feature not in missing
-                for definition in _definitions(feature, train)
-            ]
-            output["segment_definitions"] = definitions
-            output["segment_fingerprint"] = _hash(definitions)
-            output["limits"].update(
-                features_omitted=max(0, len(features) - MAX_FEATURES), missing_features=missing
+        if spec.kind != TaskKind.REGRESSION:
+            errors = [float(a != b) for a, b in zip(targets, labels(predictions), strict=True)]
+            parent_errors = (
+                [float(a != b) for a, b in zip(targets, labels(parent_predictions), strict=True)]
+                if parent_predictions is not None
+                else None
             )
-            segments = []
-            suppressed = 0
-            for definition in definitions:
-                train_support = sum(_matches(row, definition) for row in train)
-                positions = [i for i, row in enumerate(validation) if _matches(row, definition)]
-                if train_support < min_support or len(positions) < min_support:
-                    suppressed += 1
-                    continue
-                losses = _losses([errors[i] for i in positions])
-                segment = {
-                    "definition": definition,
-                    "train_support": train_support,
-                    "support": len(positions),
-                    "metrics": losses,
-                }
-                if parent_errors is not None:
-                    previous = _losses([parent_errors[i] for i in positions])
-                    segment["parent_metrics"] = previous
-                    segment["delta"] = {key: value - previous[key] for key, value in losses.items()}
-                segments.append(segment)
-            output["segments"] = segments
-            output["limits"]["segments_suppressed"] = suppressed
+        features = [f for f in spec.features if f not in (spec.target, spec.id_column)]
+        selected = features
+        missing = [f for f in selected if any(f not in row for row in train + validation)]
+        definitions = [
+            definition
+            for feature in selected
+            if feature not in missing
+            for definition in _definitions(feature, train)
+        ]
+        output["segment_definitions"] = definitions
+        output["segment_fingerprint"] = _hash(definitions)
+        output["limits"].update(features_omitted=0, missing_features=missing)
+        segments = []
+        suppressed = 0
+        for definition in definitions:
+            train_support = sum(_matches(row, definition) for row in train)
+            positions = [i for i, row in enumerate(validation) if _matches(row, definition)]
+            if train_support < min_support or len(positions) < min_support:
+                suppressed += 1
+                continue
+            losses = _losses([errors[i] for i in positions])
+            segment = {
+                "definition": definition,
+                "train_support": train_support,
+                "support": len(positions),
+                "metrics": losses,
+            }
+            if parent_errors is not None:
+                previous = _losses([parent_errors[i] for i in positions])
+                segment["parent_metrics"] = previous
+                segment["delta"] = {key: value - previous[key] for key, value in losses.items()}
+            segments.append(segment)
+        output["segments"] = segments
+        output["limits"]["segments_suppressed"] = suppressed
         json.dumps(output, allow_nan=False)
         return output
     except (IndexError, KeyError, TypeError, ValueError, OverflowError) as error:

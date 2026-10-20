@@ -220,8 +220,8 @@ def test_feature_and_category_limits_are_explicit(
         for feature in spec.features:
             row[feature] = "a"
     result = analyze_errors(spec, protocol, rows, worker([1] * 4), min_support=1)
-    assert result["limits"]["features_omitted"] == 10
-    assert len({d["feature"] for d in result["segment_definitions"]}) == 20
+    assert result["limits"]["features_omitted"] == 0
+    assert len({d["feature"] for d in result["segment_definitions"]}) == 30
     assert result["limits"]["max_categories_per_feature"] == 8
 
 
@@ -352,3 +352,12 @@ def test_paired_classification_changes_count_correctness_transitions(
     )
     assert result["paired_changes"] == {"corrected": 1, "worsened": 1, "unchanged": 2}
     assert result["confusion_matrix_delta"] == [[1, -1], [1, -1]]
+
+
+def test_diagnostics_cover_late_feature(spec, protocol, rows):
+    names = tuple(f"feature_{i}" for i in range(30))
+    wide = replace(spec, features=names)
+    wide_rows = [{**row, **{name: row["cat"] for name in names}} for row in rows]
+    result = analyze_errors(wide, protocol, wide_rows, worker([1, 1, 8, 8]), min_support=1)
+    assert any(item["definition"]["feature"] == "feature_29" for item in result["segments"])
+    assert result["limits"]["features_omitted"] == 0

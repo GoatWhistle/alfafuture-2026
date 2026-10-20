@@ -118,6 +118,19 @@ export function RunDetail() {
         </div>
       )}
 
+      {run.canonicalVersion === 3 && (
+        <section className="card" aria-label="Итог файла и исследования">
+          <h2 className="h-sm">Результат и поиск</h2>
+          <dl className="kv">
+            <div><dt>CSV</dt><dd>{run.resultStatus === "refitted" ? "Переобучен и проверен" : run.resultStatus === "preserved" ? "Сохранён проверенный результат" : "Недоступен"}</dd></div>
+            <div><dt>Поиск</dt><dd>{run.researchStatus ?? "—"}</dd></div>
+            <div><dt>Причина остановки</dt><dd>{run.stopReason ?? "—"}</dd></div>
+            <div><dt>Источник выбранного решения</dt><dd>{run.selectedOrigin ?? "—"}</dd></div>
+          </dl>
+          {!!run.searchDecisions?.length && <details><summary>Решения планировщика</summary><ul>{run.searchDecisions.map((decision, index) => <li key={index}>{String(decision.reason ?? decision.action ?? JSON.stringify(decision))}</li>)}</ul></details>}
+          {!!run.rejections?.length && <details><summary>Отказы ({run.rejections.length})</summary><ul>{run.rejections.map((rejection) => <li key={rejection.id}>{rejection.id}: {rejection.error || String(rejection.admission?.reason ?? "отклонено")}</li>)}</ul></details>}
+        </section>
+      )}
       <StageBar stage={run.stage} status={run.status} />
 
       <section className="summary" aria-label="Сводка">
@@ -152,6 +165,8 @@ export function RunDetail() {
                   <div className="feed-top">
                     <strong>{e.kind === "llm_request" ? "Запрос к Qwen" : `Эксперимент ${e.id}`}</strong>
                     <ExpBadge status={e.status} />
+                    {e.origin && <span className="tag">{e.origin === "qwen_proposal" ? "Qwen" : e.origin.includes("optuna") ? "Численный поиск" : e.origin}</span>}
+                    {e.parentId && <span className="muted small">Ветка: {e.parentId}</span>}
                     <span className="tag">{e.kind === "llm_request" ? "запрос Qwen" : e.level}</span>
                     <span className="feed-score">
                       {e.score !== null && <>{fmtScore(e.score, run.metric)} </>}

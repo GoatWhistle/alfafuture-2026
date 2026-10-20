@@ -110,6 +110,8 @@ def build_context(
                 "target": _text(spec.target, text_limit),
                 "kind": spec.kind.value,
                 "metric": spec.metric.value,
+                "prediction_kind": spec.prediction_kind.value,
+                "submission_columns": [_text(name, text_limit) for name in spec.submission_columns],
                 "features": [_text(name, text_limit) for name in spec.features[:feature_limit]],
                 "features_omitted": max(0, len(spec.features) - feature_limit),
                 "classes": [
@@ -216,3 +218,68 @@ def build_context(
             if len(_encode(context)) > max_chars:
                 context["reports"].pop()
     return _encode(context)
+
+
+def bound_context(state: dict[str, Any], max_chars: int = 24000) -> str:
+    """Bound the final message while preserving the execution contract and chosen evidence."""
+    state = dict(state)
+    profile = state.get("dataset_profile", {})
+    columns = profile.get("columns", {})
+    evidence = state.get("selected_evidence", [])
+    relevant = {item.get("definition", {}).get("feature") for item in evidence}
+    if columns:
+        overview = {
+            "feature_count": len(columns),
+            "fit_partition": profile.get("fit_partition"),
+            "target": profile.get("target"),
+            "schema": profile.get("schema"),
+            "constant_features": [name for name, value in columns.items() if value.get("constant")],
+            "duplicate_features": profile.get("duplicate_features", []),
+            "details": {
+                name: value
+                for index, (name, value) in enumerate(columns.items())
+                if name in relevant or index < 12
+            },
+            "additional_details_tool": "column_details: request up to 8 named features",
+        }
+        state["dataset_profile"] = overview
+    mandatory = {"task", "budget", "parent_recipe", "parent_id", "task_kind", "selected_evidence"}
+    # Remove optional bulky history before reducing dataset detail.
+    for key in (
+        "recent_tool_failures",
+        "previous_attempts",
+        "last_measurements",
+        "reports",
+        "features",
+        "task_overview",
+        "baseline_errors",
+        "direction",
+        "baseline_measured",
+    ):
+        if len(_encode(state)) <= max_chars:
+            break
+        state.pop(key, None)
+    if len(_encode(state)) > max_chars and "dataset_profile" in state:
+        profile = dict(state["dataset_profile"])
+        for key in ("constant_features", "duplicate_features", "target", "schema"):
+            profile.pop(key, None)
+            state["dataset_profile"] = profile
+            if len(_encode(state)) <= max_chars:
+                break
+    if len(_encode(state)) > max_chars and "dataset_profile" in state:
+        current_profile = dict(state["dataset_profile"])
+        current_profile["details"] = {
+            name: value
+            for name, value in current_profile.get("details", {}).items()
+            if name in relevant
+        }
+        state["dataset_profile"] = current_profile
+    if len(_encode(state)) > max_chars:
+        for key in list(state):
+            if key not in mandatory and key != "dataset_profile":
+                state.pop(key)
+                if len(_encode(state)) <= max_chars:
+                    break
+    if len(_encode(state)) > max_chars:
+        raise ContractError("Required research context cannot fit the final message limit")
+    return _encode(state)

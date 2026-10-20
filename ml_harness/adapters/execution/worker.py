@@ -114,6 +114,12 @@ def run(request: dict[str, Any]) -> None:
         predictions = np.asarray(model.predict_proba(predict_frame[features]))
     else:
         predictions = np.asarray(model.predict(predict_frame[features])).reshape(-1)
+    if spec["kind"] != "regression":
+        probabilities = (
+            predictions.tolist()
+            if spec["prediction_kind"] == "probabilities"
+            else np.asarray(model.predict_proba(predict_frame[features])).tolist()
+        )
     result = {
         "backend": getattr(
             model, "backend", getattr(model, "parameters", {}).get("backend", "custom")
@@ -125,6 +131,8 @@ def run(request: dict[str, Any]) -> None:
         "fit_seconds": fit_seconds,
         "predict_seconds": time.monotonic() - predict_started,
     }
+    if spec["kind"] != "regression":
+        result["probabilities"] = probabilities
     if hasattr(model, "tuning_report_"):
         result["tuning_report"] = model.tuning_report_
         if hasattr(model, "refit_parameters_"):

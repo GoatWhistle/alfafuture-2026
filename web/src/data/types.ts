@@ -10,6 +10,8 @@ export type Params = Record<string, string | number | boolean>;
 export interface Experiment {
   id: string;
   parentId: string | null;
+  origin?: string;
+  branch?: string;
   level: Level;
   status: ExperimentStatus;
   /** Какая ошибка замечена */
@@ -63,6 +65,14 @@ export interface RunSummary {
 
 export interface Run extends RunSummary {
   model: string;
+  resultStatus?: string | null;
+  researchStatus?: string | null;
+  stopReason?: string | null;
+  selectedOrigin?: string | null;
+  selectedRecipe?: Record<string, unknown> | null;
+  rejections?: { id: string; error?: string; admission?: Record<string, unknown> }[];
+  searchDecisions?: Record<string, unknown>[];
+  canonicalVersion?: number | null;
   mode: SearchMode;
   budget: Budget;
   used: Usage;

@@ -95,6 +95,7 @@ def build_model(kind, parameters, threads, seed):
     output = json.loads((tmp_path / "result.json").read_text())
     assert output["ids"] == (["2", "5"] if mode == "validation" else ["101", "100"])
     assert output["classes"] == [9, 7]
+    assert output["probabilities"] == [[0.25, 0.75]] * 2
     expected = [4, 2] if mode == "validation" else [50, 60]
     assert output["predictions"] == ([[0.25, 0.75]] * 2 if probabilities else expected)
 

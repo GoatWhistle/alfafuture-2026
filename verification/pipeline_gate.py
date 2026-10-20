@@ -1,4 +1,4 @@
-"""Version 2 acceptance rechecks immutable recipes, measurements and the public cohort."""
+"""Version 3 acceptance rechecks immutable recipes, measurements and the public cohort."""
 
 from dataclasses import asdict
 from pathlib import Path
@@ -8,7 +8,7 @@ from ml_harness.adapters.llm.proposals import digest, materialize
 from ml_harness.adapters.storage.submission import IndependentEvaluator
 from ml_harness.domain.proposals import Proposal, frozen_recipe, require_resolved, resolve
 
-VERSION = 2
+VERSION = 3
 
 
 def verify_recipe(report: dict[str, Any], task: Any, reports: list[dict[str, Any]]) -> None:
@@ -19,15 +19,20 @@ def verify_recipe(report: dict[str, Any], task: Any, reports: list[dict[str, Any
         report.get("pipeline_version") != VERSION
         or report.get("hypothesis_source") != "qwen_proposal"
     ):
-        raise ValueError("Not a version 2 Qwen proposal")
+        raise ValueError("Not a version 3 Qwen proposal")
     raw = report["requested_proposal"]
     if digest(raw) != report["proposal_hash"]:
         raise ValueError("Proposal hash mismatch")
+    parent = next((r for r in reports if r["id"] == report["parent_id"]), None)
+    if parent is None or parent["code_hash"] != report["parent_code_hash"]:
+        raise ValueError("Parent provenance mismatch")
+    parent_recipe = parent.get("executed_recipe") or parent.get("resolved_spec")
     recipe = require_resolved(
         resolve(
             Proposal(**{**raw, "transforms": tuple(raw["transforms"])}),
             task.spec.kind.value,
             task.spec.features,
+            parent_recipe=parent_recipe,
         )
     )
     spec = asdict(recipe)
@@ -129,7 +134,7 @@ def validate_gate_shape(
     if any(r["seed"] != 42 or r["mode"] != "qwen" for r in runs):
         raise ValueError("Invalid gate run configuration")
     if (
-        config.get("sessions") != 3
+        config.get("sessions") != 12
         or config.get("threads") != 4
         or config.get("time_budget") != 1800
         or config.get("worker_timeout") != 300

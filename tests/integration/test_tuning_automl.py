@@ -73,8 +73,8 @@ def test_internal_partitions_fit_only_passed_training_rows(monkeypatch, strategy
     fitted = []
     original = TabularCandidate.fit
 
-    def record(self, frame, target):
-        result = original(self, frame, target)
+    def record(self, frame, target, **kwargs):
+        result = original(self, frame, target, **kwargs)
         fitted.append((frame.index.tolist(), self.medians["x"]))
         return result
 
@@ -271,7 +271,7 @@ def test_autogluon_context_split_metric_and_refit_resources(
         y = pd.Series(np.arange(len(X)) / 3, index=X.index)
     if kind == "multiclass":
         y = pd.Series(["a", "b", "c", "a"] * 25, index=X.index)
-    model = AutoGluonCandidate(kind, {"hyperparameters": {"GBM": {}}}, 1, 42)
+    model = AutoGluonCandidate(kind, {"hyperparameters": {"GBM": {}}, "comparison": True}, 1, 42)
     model.configure_validation(
         {"kind": strategy, "group_column": "group", "time_column": "time", "metric": metric}
     )
@@ -280,6 +280,8 @@ def test_autogluon_context_split_metric_and_refit_resources(
     assert (
         selected_metric if isinstance(selected_metric, str) else selected_metric.name
     ) == expected
+    assert observed["fit"]["fit_weighted_ensemble"] is True
+    assert observed["fit"]["num_stack_levels"] == 0
     assert observed["fit"]["num_cpus"] == observed["refit"]["num_cpus"] == 1
     assert observed["fit"]["num_gpus"] == observed["refit"]["num_gpus"] == 0
     assert observed["refit"]["model"] == "best"
@@ -337,3 +339,14 @@ def test_autogluon_real_metric_context_and_full_refit(
     assert info["num_samples"] == len(X)
     assert model.predict(X.iloc[:3]).shape == (3,)
     assert Path(model.path_).parent == tmp_path
+
+
+def test_comparison_autogluon_has_full_allowed_cpu_families_and_ensemble():
+    model = build_model("regression", {"backend": "autogluon-comparison"}, 4, 42)
+    assert set(model.hyperparameters) == {"CAT", "GBM", "XGB"}
+    assert model.hyperparameters["CAT"]["thread_count"] == 4
+    assert model.hyperparameters["XGB"]["device"] == "cpu"
+    assert model.comparison is True and model.time_limit == 600
+    legacy = build_model("regression", {"backend": "autogluon"}, 4, 42)
+    assert set(legacy.hyperparameters) == {"CAT"}
+    assert legacy.comparison is False and legacy.time_limit == 60

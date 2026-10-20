@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from test_prepare_task import task_fixture
 from test_research_workspace import ScriptedProposalModel
 
@@ -65,7 +66,8 @@ def build_transformer():
             )
 
     task, result = setup(tmp_path, monkeypatch, Model())
-    assert result["status"] == "api_error"
+    assert result["status"] == "numeric_error_limit"
+    assert result["sessions"][-1]["reason"] == "api_error"
     assert result["reports"][-1]["status"] == "succeeded"
     assert result["reports"][-1]["resolved_spec"]["python_transform"]
     assert result["finalization"]["refit_status"] == "succeeded"
@@ -107,3 +109,11 @@ def test_next_hypothesis_sees_actual_optuna_parameters(tmp_path, monkeypatch):
     assert first["executed_recipe"]["parameters"] == fitted
     assert model.starts[1]["parent_recipe"]["parameters"] == fitted
     assert model.starts[1]["parent_recipe"]["tuning"] == {}
+
+
+@pytest.fixture(autouse=True)
+def focused_semantic_search(monkeypatch):
+    """These tests isolate proposal/refit behavior; numeric continuation has its own test."""
+    from ml_harness.adapters.research.workspace import ResearchWorkspace
+
+    monkeypatch.setattr(ResearchWorkspace, "numeric_batch", lambda *args: False)

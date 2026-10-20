@@ -20,6 +20,7 @@ from ml_harness.adapters.execution.runner import SubprocessRunner
 from ml_harness.adapters.ml.evaluation import validate_predictions
 from ml_harness.adapters.research.workspace import write_json
 from ml_harness.adapters.storage.lease import RunLease
+from ml_harness.adapters.storage.run_result import save_run_result
 from ml_harness.adapters.storage.submission import (
     AtomicSubmissionWriter,
     IndependentEvaluator,
@@ -112,7 +113,17 @@ def main(*, started_at: float | None = None) -> int:
     parser = argparse.ArgumentParser(description="Autonomous tabular ML research harness")
     parser.add_argument("task", nargs="?", default=Path("task.md"), type=Path)
     parser.add_argument(
-        "--backend", choices=("portfolio", "catboost", "lightgbm", "autogluon"), default="portfolio"
+        "--backend",
+        choices=(
+            "portfolio",
+            "catboost",
+            "lightgbm",
+            "autogluon",
+            "autogluon-comparison",
+            "flaml",
+            "linear",
+        ),
+        default="portfolio",
     )
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=8)
     parser.add_argument("--seed", type=int, default=42)
@@ -123,7 +134,7 @@ def main(*, started_at: float | None = None) -> int:
     parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--search-mode", choices=("qwen", "optuna", "none"))
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--research-sessions", type=int, default=3)
+    parser.add_argument("--research-sessions", type=int, default=12)
     parser.add_argument("--research-steps", type=int, default=12)
     parser.add_argument("--llm-token-limit", type=int, default=32000)
     args = parser.parse_args()
@@ -150,6 +161,9 @@ def main(*, started_at: float | None = None) -> int:
     task: PreparedTask | None = None
     try:
         with RunLease(work_dir / ".run.lock"):
+            marker = work_dir / "research/pipeline-version.json"
+            if args.resume and marker.exists() and json.loads(marker.read_text()) != {"version": 3}:
+                raise ContractError("Pipeline v2 cannot resume with v3; use a new run directory")
             if not args.resume and any(path.name != ".run.lock" for path in work_dir.iterdir()):
                 raise ContractError("Run directory already contains artifacts; use --resume")
             budget_path = work_dir / "budget.json"
@@ -305,6 +319,17 @@ def main(*, started_at: float | None = None) -> int:
                         base_runner=underlying,
                     )
                 save_budget()
+                details["run_result"] = save_run_result(
+                    work_dir,
+                    task,
+                    details,
+                    {
+                        "wall_seconds": clock.now() - started,
+                        "peak_worker_rss_bytes": getattr(underlying, "peak_memory_bytes", None),
+                        "threads": args.threads,
+                        "memory_limit_mb": args.memory_limit_mb,
+                    },
+                )
                 write_json(work_dir / "summary.json", details)
                 print(json.dumps(details, ensure_ascii=False, indent=2))
     except (BudgetExpired, ContractError, OSError, ValueError) as exc:
@@ -319,6 +344,16 @@ def main(*, started_at: float | None = None) -> int:
                 "submission_path": task.spec.submission_path,
                 "reason": str(exc),
             }
+            details["run_result"] = save_run_result(
+                work_dir,
+                task,
+                details,
+                {
+                    "wall_seconds": clock.now() - started,
+                    "threads": args.threads,
+                    "memory_limit_mb": args.memory_limit_mb,
+                },
+            )
             write_json(work_dir / "summary.json", details)
             print(json.dumps(details, ensure_ascii=False, indent=2))
             return 0

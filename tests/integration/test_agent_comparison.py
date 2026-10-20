@@ -84,7 +84,10 @@ def test_verify_run_verifies_structured_proposal_without_llm_summary(
         token_limit=32000,
         max_sessions=1,
     )
-    (harness / "summary.json").write_text(json.dumps({"research": report}))
+    from ml_harness.adapters.storage.run_result import save_run_result
+
+    canonical = save_run_result(harness, task, {"research": report}, {})
+    (harness / "summary.json").write_text(json.dumps({"research": report, "run_result": canonical}))
     verified = comparison.verify_run(tmp_path, task_path, 42)
     assert verified["refit_verified"]
     assert verified["experiments"] == 1
@@ -110,6 +113,11 @@ def test_verify_run_verifies_structured_proposal_without_llm_summary(
         changed[key] = value
         with pytest.raises(ValueError):
             verify_recipe(changed, task, report["reports"])
+    changed_canonical = {**canonical, "selected": "forged"}
+    (harness / "run-result.json").write_text(json.dumps(changed_canonical))
+    with pytest.raises(ValueError):
+        comparison.verify_run(tmp_path, task_path, 42)
+    (harness / "run-result.json").write_text(json.dumps(canonical))
     Path(task.spec.submission_path).write_text("key,response\nwrong,1\n")
     with pytest.raises(ValueError):
         comparison.verify_run(tmp_path, task_path, 42)
@@ -122,12 +130,12 @@ def test_gate_rejects_legacy_empty_missing_and_changed_configuration(comparison)
 
     expected = {"regression": {"train": "a"}, "classification": {"train": "b"}}
     config = {
-        "gate_version": 2,
+        "gate_version": 3,
         "gate": True,
         "seeds": [42],
         "modes": ["qwen"],
         "tasks": [{"path": k, "inputs": v} for k, v in expected.items()],
-        "sessions": 3,
+        "sessions": 12,
         "threads": 4,
         "time_budget": 1800,
         "worker_timeout": 300,
@@ -138,7 +146,7 @@ def test_gate_rejects_legacy_empty_missing_and_changed_configuration(comparison)
     validate_gate_shape(config, runs, expected)
     for key, value in [
         ("gate_version", 1),
-        ("sessions", 12),
+        ("sessions", 3),
         ("threads", 8),
         ("tasks", config["tasks"][:1]),
         ("seeds", [7]),
@@ -157,12 +165,12 @@ def test_saved_gate_rechecks_runtime_configuration_and_artifacts(tmp_path, monke
 
     tasks = {"regression": {"data": "abc"}, "classification": {"data": "abc"}}
     config = {
-        "gate_version": 2,
+        "gate_version": 3,
         "gate": True,
         "seeds": [42],
         "modes": ["qwen"],
         "tasks": [{"path": k, "inputs": v} for k, v in tasks.items()],
-        "sessions": 3,
+        "sessions": 12,
         "threads": 4,
         "time_budget": 1800,
         "worker_timeout": 300,
@@ -176,7 +184,7 @@ def test_saved_gate_rechecks_runtime_configuration_and_artifacts(tmp_path, monke
     configuration = tmp_path / "configuration.json"
     configuration.write_text(json.dumps(config))
     report = {
-        "gate_version": 2,
+        "gate_version": 3,
         "gate_passed": False,
         "configuration": str(configuration),
         "configuration_hash": comparison._hash(configuration),
@@ -223,3 +231,11 @@ def test_saved_gate_rechecks_runtime_configuration_and_artifacts(tmp_path, monke
     configuration.write_text("{}")
     with pytest.raises(ValueError, match="hash"):
         comparison.validate_saved_gate(path, config["code"], "qwen", "hashed")
+
+
+@pytest.fixture(autouse=True)
+def focused_semantic_search(monkeypatch):
+    """These tests isolate proposal/refit behavior; numeric continuation has its own test."""
+    from ml_harness.adapters.research.workspace import ResearchWorkspace
+
+    monkeypatch.setattr(ResearchWorkspace, "numeric_batch", lambda *args: False)

@@ -149,6 +149,7 @@ class SubprocessRunner:
             raise ContractError("Memory limit must be positive")
         self.memory_limit_mb = memory_limit_mb
         self._cleanup_failed = False
+        self.peak_memory_bytes = 0
 
     def run(self, request: RunRequest, timeout_seconds: float) -> ExecutionResult:
         if self._cleanup_failed:
@@ -192,6 +193,7 @@ class SubprocessRunner:
         observed: dict[int, float] = {}
         started = time.monotonic()
         status, detail = ExperimentStatus.FAILED, ""
+        peak_rss = 0
         with (
             (output_dir / "stdout.log").open("wb") as stdout,
             (output_dir / "stderr.log").open("wb") as stderr,
@@ -229,6 +231,8 @@ class SubprocessRunner:
                         rss = sum(
                             child.memory_info().rss for child in processes if child.is_running()
                         )
+                        peak_rss = max(peak_rss, rss)
+                        self.peak_memory_bytes = max(self.peak_memory_bytes, rss)
                         if rss > self.memory_limit_mb * 1024 * 1024:
                             detail = "Worker process tree exceeded memory limit"
                             break
@@ -245,6 +249,16 @@ class SubprocessRunner:
             finally:
                 self._cleanup_failed = True
                 self._cleanup_failed = not _cleanup_worker(process, observed)
+                (output_dir / "resources.json").write_text(
+                    json.dumps(
+                        {
+                            "peak_worker_rss_bytes": peak_rss,
+                            "memory_measurement": "sampled_process_tree_rss_50ms",
+                            "elapsed_seconds": time.monotonic() - started,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
             if self._cleanup_failed:
                 raise ContractError(
                     "Worker descendants may remain active; further execution refused"

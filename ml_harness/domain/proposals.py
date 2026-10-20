@@ -34,6 +34,10 @@ class ResolvedExperiment:
         return asdict(self)
 
 
+# The complete executable pipeline retains the established serialization contract.
+PipelineRecipe = ResolvedExperiment
+
+
 @dataclass(frozen=True)
 class ValidationResult:
     resolved: ResolvedExperiment | None
@@ -57,7 +61,36 @@ RANGES = {
 }
 
 
-def resolve(proposal: Proposal, task_kind: str, features: tuple[str, ...]) -> ValidationResult:
+CLASSIFICATION_CHOICES: dict[str, dict[str, tuple[Any, ...]]] = {
+    "catboost": {"auto_class_weights": (None, "Balanced", "SqrtBalanced")},
+    "lightgbm": {"class_weight": (None, "balanced")},
+}
+
+
+def resolve(
+    proposal: Proposal,
+    task_kind: str,
+    features: tuple[str, ...],
+    parent_recipe: ResolvedExperiment | dict[str, Any] | None = None,
+) -> ValidationResult:
+    """Empty feature fields inherit the executed parent; nonempty fields replace them.
+
+    Model parameters override the same-backend parent. Backend switches retain features
+    and receive backend defaults. Tuning is always an explicit request, never inherited.
+    """
+    parent = (
+        parent_recipe.to_dict() if isinstance(parent_recipe, ResolvedExperiment) else parent_recipe
+    )
+    transforms = (
+        proposal.transforms or tuple(parent.get("transforms", ()))
+        if parent
+        else proposal.transforms
+    )
+    python_transform = (
+        proposal.python_transform or parent.get("python_transform", "")
+        if parent
+        else proposal.python_transform
+    )
     errors = []
     if proposal.task_kind != task_kind or task_kind not in ("regression", "binary", "multiclass"):
         errors.append("task_kind must equal the supplied task kind")
@@ -71,15 +104,13 @@ def resolve(proposal: Proposal, task_kind: str, features: tuple[str, ...]) -> Va
         if proposal.backend == "catboost"
         else {"n_estimators": 200, "num_leaves": 31}
     )
+    if parent and parent.get("backend") == proposal.backend:
+        options.update(parent.get("parameters", {}))
     for key, value in proposal.parameters.items():
-        if key == "auto_class_weights" and proposal.backend == "catboost":
-            if task_kind == "regression" or value not in ("Balanced", "SqrtBalanced"):
-                errors.append(
-                    "auto_class_weights requires classification and Balanced/SqrtBalanced"
-                )
-        elif key == "class_weight" and proposal.backend == "lightgbm":
-            if task_kind == "regression" or value != "balanced":
-                errors.append("class_weight requires classification and balanced")
+        if key in CLASSIFICATION_CHOICES[proposal.backend]:
+            choices = CLASSIFICATION_CHOICES[proposal.backend][key]
+            if task_kind == "regression" or value not in choices:
+                errors.append(f"{key} requires classification and one of {choices}")
         elif key in RANGES[proposal.backend]:
             low, high, kind = RANGES[proposal.backend][key]
             if (
@@ -93,7 +124,7 @@ def resolve(proposal: Proposal, task_kind: str, features: tuple[str, ...]) -> Va
             errors.append(f"Unsupported or harness-owned parameter: {key}")
         options[key] = value
     remaining_features = set(features)
-    for transform in proposal.transforms:
+    for transform in transforms:
         if set(transform) != {"operation", "columns"} or transform.get("operation") not in (
             "drop",
             "signed_log1p",
@@ -117,9 +148,7 @@ def resolve(proposal: Proposal, task_kind: str, features: tuple[str, ...]) -> Va
                 errors.append("Cannot drop all input features")
     if type(proposal.tune) is not bool:
         errors.append("tune must be boolean")
-    if proposal.tune and (proposal.transforms or proposal.python_transform):
-        errors.append("Tuning and feature transforms are separate experiments in version 2")
-    if len(proposal.python_transform) > 12000:
+    if len(python_transform) > 12000:
         errors.append("Python transform exceeds 12000 characters")
     if errors:
         return ValidationResult(None, tuple(errors))
@@ -128,8 +157,8 @@ def resolve(proposal: Proposal, task_kind: str, features: tuple[str, ...]) -> Va
             task_kind,
             proposal.backend,
             options,
-            proposal.transforms,
-            proposal.python_transform,
+            transforms,
+            python_transform,
             {"trials": 2, "time_limit": 30} if proposal.tune else {},
         )
     )
@@ -161,7 +190,7 @@ def cost_estimate(
             * complexity(recipe.backend, recipe.parameters)
             / complexity(baseline_backend, baseline_parameters)
         )
-    tuning_factor = 3 if recipe.tuning else 1
+    tuning_factor = int(recipe.tuning.get("trials", 2)) + 1 if recipe.tuning else 1
     estimate = 1.5 * max(sampled, calibrated * tuning_factor)
     return {
         "estimated_full_seconds": estimate,

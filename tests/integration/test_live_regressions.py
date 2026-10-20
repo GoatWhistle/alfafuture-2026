@@ -94,6 +94,9 @@ def test_numeric_studies_continue_and_finalists_deduplicate(tmp_path):
     import optuna
 
     task, work, runner, evaluator = workspace(tmp_path)
+    # A synthetic unbeatable parent keeps the recipe fixed: this test isolates study reuse.
+    # Changing best pipelines intentionally creates different studies (tested separately).
+    work.register_baseline(Score(0, task.spec.metric, task.protocol.fingerprint), None)
     assert work.numeric_batch("catboost", 0)
     assert work.numeric_batch("catboost", 1)
     storage = "sqlite:///" + str(work.path / "numeric-studies.sqlite3")

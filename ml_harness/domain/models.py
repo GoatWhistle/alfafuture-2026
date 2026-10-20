@@ -214,6 +214,10 @@ class Experiment:
         self.status, self.score = status, score
 
 
+# Retain the established mutable state machine as the canonical measured result contract.
+ExperimentResult = Experiment
+
+
 @dataclass
 class RunBudget:
     deadline: float

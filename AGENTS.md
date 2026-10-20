@@ -1,7 +1,7 @@
 # Работа в репозитории
 
 - Перед реализацией прочитай `docs/ARCHITECTURE.md` и текущий этап `docs/PLAN.md`. Выполняй этапы последовательно и отмечай завершение по указанным критериям.
-- Текущая работа в `fix/qwen-live-cycle` — этап 9 `docs/PLAN.md`; задание исполнителю — `docs/PIPELINE_HANDOFF.md`. `docs/NIGHTLY_HANDOFF.md` и `docs/NIGHTLY_RESULT.md` сохраняют историю предыдущей попытки, а не текущий порядок действий.
+- Текущая работа в `feat/refactor-harness-v3` — этап 10 `docs/PLAN.md`, требования — `docs/REFACTOR-HARNESS.md`, фактическая приёмка — `docs/REFACTOR_RESULT.md`. Handoff и результаты этапа 9 сохраняют историю. Live на целевой Qwen выполняется после получения её конфигурации по `docs/MODEL_MIGRATION.md`.
 - Направление импортов проверяется контрактами в `pyproject.toml`. Домен и application используют стандартную библиотеку; внешние библиотеки и I/O размещаются в adapters, связывание — в entrypoints.
 - Версии runtime-зависимостей сверяй с `task/reference/requirements.txt`. Меняй `pyproject.toml` вместе с `uv.lock`; инструменты разработки держи в группе dev.
 - Перед коммитом запускай `make check` и относящиеся к изменению тесты. Live-проверки используют только выданную Qwen, явно отделены от обычных тестов.

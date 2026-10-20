@@ -52,7 +52,7 @@ class TabularCandidate:
             )
         return result
 
-    def fit(self, X: Any, y: Any) -> "TabularCandidate":
+    def fit(self, X: Any, y: Any, validation: Any = None) -> "TabularCandidate":
         self.categories.clear()
         self.medians.clear()
         for column in X.columns:
@@ -66,8 +66,25 @@ class TabularCandidate:
         labels = y if self.regression else self.encoder.fit_transform(y)
         if not self.regression:
             self.classes_ = self.encoder.classes_
-        kwargs = {"cat_features": list(self.categories)} if self.backend == "catboost" else {}
+        kwargs: dict[str, Any] = (
+            {"cat_features": list(self.categories)} if self.backend == "catboost" else {}
+        )
+        if validation is not None:
+            valid_X, valid_y = validation
+            valid_labels = valid_y if self.regression else self.encoder.transform(valid_y)
+            kwargs["eval_set"] = (self._transform(valid_X), valid_labels)
+            if self.backend == "catboost":
+                kwargs.update(early_stopping_rounds=20, use_best_model=True)
+            else:
+                from lightgbm import early_stopping
+
+                kwargs["callbacks"] = [early_stopping(20, verbose=False)]
         self.model.fit(self._transform(X), labels, **kwargs)
+        self.selected_iterations_ = (
+            int(self.model.tree_count_)
+            if self.backend == "catboost"
+            else int(self.model.best_iteration_ or self.model.n_estimators_)
+        )
         return self
 
     def predict(self, X: Any) -> Any:
@@ -82,16 +99,28 @@ class TabularCandidate:
 
 def build_model(kind: str, parameters: dict[str, Any], threads: int, seed: int) -> Any:
     """Build an unfitted CPU candidate; optional engines are imported only on demand."""
+    if parameters.get("backend") == "linear":
+        from ml_harness.adapters.ml.linear import LinearCandidate
+
+        return LinearCandidate(kind, parameters, threads, seed)
+    if parameters.get("backend") == "flaml":
+        from ml_harness.adapters.ml.flaml import FlamlCandidate
+
+        return FlamlCandidate(kind, parameters, threads, seed)
     tuning = parameters.get("tuning", {})
     if tuning and tuning.get("enabled", True):
         from ml_harness.adapters.ml.tuning import TunedCandidate
 
         return TunedCandidate(kind, parameters, threads, seed)
-    if parameters.get("backend") == "autogluon":
+    if parameters.get("backend") in ("autogluon", "autogluon-comparison"):
         from ml_harness.adapters.ml.automl import AutoGluonCandidate
 
         options = dict(parameters)
         options.pop("tuning", None)
+        if options.get("backend") == "autogluon-comparison":
+            options["backend"] = "autogluon"
+            options["hyperparameters"] = {"CAT": {}, "GBM": {}, "XGB": {}}
+            options["comparison"] = True
         return AutoGluonCandidate(kind, options, threads, seed)
     options = dict(parameters)
     options.pop("tuning", None)

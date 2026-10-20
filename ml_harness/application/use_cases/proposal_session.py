@@ -11,12 +11,14 @@ from ml_harness.application.ports.language_model import (
     ModelError,
     ToolExecutor,
 )
+from ml_harness.application.use_cases.context import bound_context
 from ml_harness.application.use_cases.research import SessionResult
 from ml_harness.domain.models import RunBudget
 
 PROMPT = (
     "You are the Qwen researcher. Propose one specific experiment addressing measured errors. "
-    "Use propose_experiment exactly once per reply. Harness validates and trains it. "
+    "Use propose_experiment exactly once per reply, or column_details to inspect features first. "
+    "Harness validates and trains it. "
     "Prefer a concrete feature/imbalance/model-family hypothesis; numerical search uses tune=true. "
     "target_error identifies supplied evidence; prefix exploratory: if unmeasured. "
     "Choose a small executable change within the fresh budget. Never invent results. "
@@ -45,7 +47,10 @@ def run_proposal_session(
     initial_tokens = budget.tokens_used
     known = accounted = True
     reason, detail = "correction_limit", None
-    for _ in range(min(3, max_steps)):
+    detail_requests = proposal_attempts = 0
+    for _ in range(min(3, max_steps) + 3):
+        if proposal_attempts >= min(3, max_steps):
+            break
         if not budget.can_search(clock.now(), reserve_seconds()):
             reason = "budget_exhausted"
             break
@@ -62,7 +67,7 @@ def run_proposal_session(
         }
         messages = [
             {"role": "system", "content": PROMPT},
-            {"role": "user", "content": json.dumps(state, ensure_ascii=False)},
+            {"role": "user", "content": bound_context(state)},
         ]
         try:
             if isinstance(model, BudgetAwareLanguageModel):
@@ -89,9 +94,11 @@ def run_proposal_session(
         output_tokens += reply.output_tokens
         known = known and reply.usage_known
         accounted = accounted and (reply.usage_known or reply.unreported_tokens_upper_bound > 0)
-        if not accounted:
+        if not accounted or not known:
             reason = "unknown_usage"
             break
+        if len(reply.tool_calls) != 1 or reply.tool_calls[0].name != "column_details":
+            proposal_attempts += 1
         if len(reply.tool_calls) != 1 or reply.finish_reason == "length":
             failures.append({"error": "Return exactly one complete propose_experiment call"})
             continue
@@ -100,6 +107,13 @@ def run_proposal_session(
             break
         call = reply.tool_calls[0]
         response = tools.execute(call)
+        if call.name == "column_details":
+            detail_requests += 1
+            if detail_requests > 3:
+                reason = "column_request_limit"
+                break
+            initial["column_details"] = response
+            continue
         report = response.get("result")
         if isinstance(report, dict) and "id" in report:
             reports.append(report)
@@ -113,6 +127,8 @@ def run_proposal_session(
         failures.append(
             {**response, "tool_name": call.name, "requested_proposal": requested_proposal}
         )
+        if len(failures) >= min(3, max_steps):
+            break
     return SessionResult(
         reason,
         "",

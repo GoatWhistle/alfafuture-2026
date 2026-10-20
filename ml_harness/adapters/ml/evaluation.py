@@ -73,7 +73,31 @@ def validate_predictions(
     if sorted(order) != list(range(len(spec.classes))):
         raise ContractError("Worker classes disagree with task classes")
     if spec.prediction_kind == PredictionKind.LABELS:
+        if "probabilities" in result:
+            validate_probabilities(spec, expected_ids, result)
         return [spec.classes[_class_index(value, spec.classes)] for value in predictions]
+    return _probability_rows(predictions, order)
+
+
+def validate_probabilities(
+    spec: TaskSpec, expected_ids: list[str], result: dict[str, Any]
+) -> list[Prediction]:
+    """Validate auxiliary class probabilities independently of submission format."""
+    if result.get("ids") != expected_ids:
+        raise ContractError("Probability IDs must match expected IDs")
+    classes = result.get("classes")
+    if not isinstance(classes, list):
+        raise ContractError("Worker classes must be a list")
+    order = [_class_index(label, spec.classes) for label in classes]
+    if sorted(order) != list(range(len(spec.classes))):
+        raise ContractError("Worker classes disagree with task classes")
+    rows = result.get("probabilities")
+    if not isinstance(rows, list) or len(rows) != len(expected_ids):
+        raise ContractError("Probability row count disagrees with IDs")
+    return _probability_rows(rows, order)
+
+
+def _probability_rows(predictions: list[Any], order: list[int]) -> list[Prediction]:
     output: list[Prediction] = []
     for row in predictions:
         if not isinstance(row, list) or len(row) != len(order):

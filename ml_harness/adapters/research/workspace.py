@@ -35,7 +35,7 @@ Do not read package source files; the supported interface is documented here.
 
 Export build_model(kind, parameters, threads, seed), returning an unfitted object.
 fit(X, y) receives a pandas DataFrame of features and a Series of training targets.
-predict(X) returns a 1D array. Classification must expose classes_ and, when required,
+predict(X) returns a 1D array. Classification must expose classes_ and always
 predict_proba(X) with columns in classes_ order. All learned transformations fit on X/y
 from fit only; reuse them at prediction. Never read targets or split files yourself.
 
@@ -220,33 +220,96 @@ class ResearchWorkspace:
         return sum(r["id"].startswith("numeric-") for r in self.reports)
 
     def numeric_batch(self, backend: str, index: int) -> bool:
-        storage = "sqlite:///" + str(self.path / "numeric-studies.sqlite3")
-        options = {
-            "backend": backend,
-            "tuning": {
-                "trials": 5,
-                "time_limit": 60,
-                "storage": storage,
-                "study_name": backend,
-                "batch": index,
-            },
-        }
-        code = (
-            "from ml_harness.adapters.ml.candidates import build_model as base_model\n"
-            "def build_model(kind, parameters, threads, seed):\n"
-            f"    options = {options!r}\n"
-            "    options.update(parameters)\n"
-            "    return base_model(kind, options, threads, seed)\n"
+        from ml_harness.adapters.llm.proposals import digest, materialize
+        from ml_harness.application.use_cases.directions import choose_direction
+        from ml_harness.domain.proposals import ResolvedExperiment
+
+        if self.baseline_report is None:
+            raise ContractError("Numeric search requires a measured baseline")
+        score = self.baseline_report["full_score"]
+        direction = choose_direction(
+            self.task,
+            Score(score["value"], self.task.spec.metric, score["protocol_id"], "full"),
+            self.reports,
+            baseline_report=self.baseline_report,
         )
-        (self.path / "candidate.py").write_text(code)
+        parent = next(r for r in self.read_experiments() if r["id"] == direction.best_id)
+        source = parent.get("executed_recipe") or parent.get("resolved_spec")
+        if source is None:
+            source = {
+                "task_kind": self.task.spec.kind.value,
+                "backend": parent["backend"],
+                "parameters": {
+                    k: v
+                    for k, v in parent.get("parameters", {}).items()
+                    if k not in ("backend", "tuning")
+                },
+                "transforms": (),
+                "python_transform": "",
+                "tuning": {},
+            }
+        if source["backend"] not in ("catboost", "lightgbm"):
+            return False
+        # Selected early-stopping counts describe the fitted parent, not the next search ceiling.
+        source = deepcopy(source)
+        tree_key = "iterations" if source["backend"] == "catboost" else "n_estimators"
+        source["parameters"][tree_key] = max(200, source["parameters"].get(tree_key, 200))
+        recipe = ResolvedExperiment(
+            **{
+                **source,
+                "tuning": {
+                    "trials": 5,
+                    "time_limit": 60,
+                    "storage": "sqlite:///" + str(self.path / "numeric-studies.sqlite3"),
+                    "study_name": source["backend"],
+                    "batch": index,
+                },
+            }
+        )
+        code = materialize(recipe)
+        self.path.joinpath("candidate.py").write_text(code)
+        self.active_parent_id = None
+        self.active_direction = None
+        resolved = recipe.to_dict()
+        from ml_harness.adapters.execution.budget import BudgetedRunner
+        from ml_harness.domain.proposals import cost_estimate
+
+        def admit(seconds: float) -> dict[str, Any]:
+            estimate = cost_estimate(
+                recipe,
+                seconds,
+                len(self.task.protocol.train_indices),
+                len(smoke_task(self.task).protocol.train_indices),
+                parent.get("elapsed_seconds", 0),
+                source["backend"],
+                source["parameters"],
+            )
+            available = self.timeout_seconds
+            if isinstance(self.runner, BudgetedRunner):
+                available = min(available, self.runner.budget.available(self.runner.clock.now()))
+            allowed = estimate["estimated_full_seconds"] <= available
+            return {
+                **estimate,
+                "available_seconds": available,
+                "allowed": allowed,
+                "reason": "admitted" if allowed else "Numeric pipeline exceeds search budget",
+            }
+
         result = self.run_experiment(
             {
                 "experiment_id": f"numeric-{index:05d}",
-                "parent_id": "baseline",
-                "hypothesis": f"Continue train-only {backend} study, batch {index}",
+                "parent_id": parent["id"],
+                "hypothesis": f"Tune complete pipeline from {parent['id']}, batch {index}",
                 "hypothesis_source": "deterministic_optuna",
                 "expected_effect": "Improve development score",
-            }
+                "recipe_provenance": {
+                    "pipeline_version": 3,
+                    "resolved_spec": resolved,
+                    "resolved_hash": digest(resolved),
+                    "effective_code_hash": hashlib.sha256(code.encode()).hexdigest(),
+                },
+            },
+            admit_full=admit,
         )
         return result.get("status") == "succeeded"
 
@@ -352,6 +415,12 @@ class ResearchWorkspace:
                 error_report=self.analyzer.analyze(self.task, output),
                 diagnostic_status="measured",
             )
+            if "refit_parameters" in output:
+                if not isinstance(output["refit_parameters"], dict):
+                    raise ContractError("Baseline refit parameters must be an object")
+                report["refit_parameters"] = output["refit_parameters"]
+            if "tuning_report" in output:
+                report["tuning_report"] = output["tuning_report"]
         self.store.append(
             {"event_id": "baseline", "kind": "baseline_registered", "payload": report}
         )
@@ -445,7 +514,7 @@ class ResearchWorkspace:
                 digest, path = self.store.save_code(code)
                 report.update(refit_code_hash=digest, refit_code_path=path)
 
-        if report.get("pipeline_version") == 2:
+        if report.get("pipeline_version") in (2, 3):
             fitted = frozen_recipe(report["resolved_spec"], report.get("refit_parameters"))
             report["executed_recipe"] = fitted
             report["executed_recipe_hash"] = hashlib.sha256(
@@ -549,6 +618,7 @@ class ResearchWorkspace:
             "summary": session["summary"],
             "experiment_ids": [report["id"] for report in session["reports"]],
             "reason": session["reason"],
+            "improved": session.get("improved", False),
             "tool_failures": session.get("tool_failures", [])[-3:],
             "error_detail": session.get("error_detail"),
             "usage": {

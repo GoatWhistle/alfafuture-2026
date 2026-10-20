@@ -327,3 +327,173 @@ def test_same_pid_with_different_create_time_is_not_a_live_worker(tmp_path):
     runner.crash_control = False
     assert finish(task, workspace, runner, evaluator)["selected"] == "regularization"
     assert runner.calls.count(("control", 1)) == 1
+
+
+def test_control_cannot_change_development_winner_or_frozen_weights(tmp_path):
+    task, workspace, runner, evaluator = setup(tmp_path)
+    register(task, workspace, evaluator, "baseline", -3)
+    register(task, workspace, evaluator, "candidate", 1)
+    original = runner.run
+
+    def reversed_control(request, timeout):
+        if request.mode == "control":
+            runner.calls.append(("control", request.parameters["offset"]))
+            # Make the baseline perfect and the development ensemble bad on control.
+            offset = 0 if request.parameters["offset"] == -3 else 100
+            return ExecutionResult(
+                ExperimentStatus.SUCCEEDED, 0.01, predictions(request.task, offset)
+            )
+        return original(request, timeout)
+
+    runner.run = reversed_control
+    result = finish(task, workspace, runner, evaluator)
+    assert result["selected"].startswith("ensemble:")
+    ensemble = next(item for item in result["finalists"] if item["id"] == result["selected"])
+    assert ensemble["weights"] == [0.75, 0.25]
+    assert result["control_scores"]["baseline"]["value"] == 0
+    assert result["selection_reason"] == "development_frozen_control_audit"
+
+
+def test_checkpoint_publishes_improvement_without_control_or_freezing(tmp_path):
+    from ml_harness.adapters.research.checkpoint import publish_checkpoint
+    from ml_harness.domain.budget import WallClockBudget
+
+    task, workspace, _, evaluator = setup(tmp_path)
+    register(task, workspace, evaluator, "candidate", 1)
+
+    class Clock:
+        def now(self):
+            return 0.0
+
+    class Runner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, request, timeout):
+            self.calls.append(request.mode)
+            assert request.mode == "refit"
+            return ExecutionResult(
+                ExperimentStatus.SUCCEEDED, 1, predictions(task, request.parameters["offset"], True)
+            )
+
+    runner = Runner()
+    budget = WallClockBudget(1000, validation_seconds=2, refit_seconds=3)
+    checkpoint = publish_checkpoint(
+        task, workspace, runner, AtomicSubmissionWriter(), budget, Clock()
+    )
+    assert checkpoint["id"] == "candidate"
+    assert runner.calls == ["refit"]
+    assert not (workspace.path / "finalists.json").exists()
+    assert (workspace.path / "checkpoint.json").exists()
+    assert (
+        publish_checkpoint(task, workspace, runner, AtomicSubmissionWriter(), budget, Clock())
+        is None
+    )
+    register(task, workspace, evaluator, "improved", 0)
+    constrained = WallClockBudget(20, validation_seconds=2, refit_seconds=3)
+    previous = Path(task.spec.submission_path).read_bytes()
+    assert (
+        publish_checkpoint(task, workspace, runner, AtomicSubmissionWriter(), constrained, Clock())
+        is None
+    )
+    assert runner.calls == ["refit"]
+    assert Path(task.spec.submission_path).read_bytes() == previous
+    checkpoint = publish_checkpoint(
+        task, workspace, runner, AtomicSubmissionWriter(), budget, Clock()
+    )
+    assert checkpoint["id"] == "improved"
+    assert runner.calls == ["refit", "refit"]
+
+
+def test_first_checkpoint_requires_improvement_over_baseline(tmp_path):
+    from ml_harness.adapters.research.checkpoint import publish_checkpoint
+    from ml_harness.domain.budget import WallClockBudget
+
+    task, workspace, runner, evaluator = setup(tmp_path)
+    register(task, workspace, evaluator, "baseline", 1)
+    register(task, workspace, evaluator, "worse", 2)
+
+    class Clock:
+        def now(self):
+            return 0
+
+    previous = Path(task.spec.submission_path).read_bytes()
+    assert (
+        publish_checkpoint(
+            task, workspace, runner, AtomicSubmissionWriter(), WallClockBudget(1000), Clock()
+        )
+        is None
+    )
+    assert runner.calls == []
+    assert Path(task.spec.submission_path).read_bytes() == previous
+    assert not (workspace.path / "checkpoint.json").exists()
+
+
+@pytest.mark.parametrize("matching_checkpoint", [True, False])
+def test_refit_timeout_cannot_replace_verified_checkpoint_with_worse_baseline(
+    tmp_path, matching_checkpoint
+):
+    from ml_harness.adapters.research.checkpoint import publish_checkpoint
+    from ml_harness.domain.budget import WallClockBudget
+
+    task, workspace, runner, evaluator = setup(tmp_path)
+    register(task, workspace, evaluator, "baseline", 4)
+    register(task, workspace, evaluator, "checkpoint-winner", 1)
+
+    class Clock:
+        def now(self):
+            return 0.0
+
+    class CheckpointRunner:
+        def run(self, request, timeout):
+            return ExecutionResult(
+                ExperimentStatus.SUCCEEDED, 1, predictions(task, request.parameters["offset"], True)
+            )
+
+    checkpoint = publish_checkpoint(
+        task,
+        workspace,
+        CheckpointRunner(),
+        AtomicSubmissionWriter(),
+        WallClockBudget(1000, validation_seconds=2, refit_seconds=3),
+        Clock(),
+    )
+    assert checkpoint["id"] == "checkpoint-winner"
+    previous = Path(task.spec.submission_path).read_bytes()
+    if not matching_checkpoint:
+        checkpoint["submission_hash"] = "stale"
+        write_json(workspace.path / "checkpoint.json", checkpoint)
+    register(task, workspace, evaluator, "later-best", 0)
+    original = runner.run
+
+    def timeout_improved(request, timeout):
+        if request.mode == "refit" and request.parameters["offset"] < 4:
+            runner.calls.append(("refit", request.parameters["offset"]))
+            return ExecutionResult(ExperimentStatus.TIMED_OUT, 10, detail="deadline")
+        return original(request, timeout)
+
+    runner.run = timeout_improved
+    result = finish(task, workspace, runner, evaluator)
+    if matching_checkpoint:
+        assert result["refit_status"] == "failed_checkpoint_preserved"
+        assert result["selected"] == "checkpoint-winner"
+        assert result["preserved_checkpoint"]["submission_hash"] == checkpoint["submission_hash"]
+        assert ("refit", 4) not in runner.calls
+        assert Path(task.spec.submission_path).read_bytes() == previous
+        # Control still ran once for every frozen member before the preservation fallback.
+        assert set(offset for mode, offset in runner.calls if mode == "control") == {0, 1, 4}
+        from ml_harness.adapters.storage.run_result import save_run_result
+
+        canonical = save_run_result(
+            tmp_path,
+            task,
+            {"research": {"finalization": result, "reports": workspace.reports}},
+            {},
+        )
+        assert canonical["selected"] == "checkpoint-winner"
+        assert canonical["result_status"] == "preserved"
+        assert canonical["score"] == checkpoint["score"]
+    else:
+        assert result["selected"] == "baseline"
+        assert result["refit_status"] == "succeeded"
+        assert ("refit", 4) in runner.calls

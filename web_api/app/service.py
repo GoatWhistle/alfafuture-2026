@@ -116,8 +116,26 @@ class Service:
                 "tokensUncertain": facts["tokensUncertain"],
             },
             "experiments": facts["experiments"],
+            **{
+                key: facts[key]
+                for key in (
+                    "resultStatus",
+                    "researchStatus",
+                    "stopReason",
+                    "selectedRecipe",
+                    "selectedOrigin",
+                    "rejections",
+                    "searchDecisions",
+                    "canonicalVersion",
+                )
+            },
             "csvAvailable": csv_path is not None,
-            "finalCsv": csv_path is not None and status == "completed",
+            "finalCsv": csv_path is not None
+            and (
+                facts["resultStatus"] == "refitted"
+                if facts["canonicalVersion"] == 3
+                else status == "completed"
+            ),
             "note": note,
         }
 

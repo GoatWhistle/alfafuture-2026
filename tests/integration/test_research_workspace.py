@@ -117,7 +117,8 @@ def test_interrupted_model_session_never_resets_unknown_provider_usage(tmp_path,
 
     monkeypatch.setattr(entrypoint, "QwenLanguageModel", forbidden_model)
     report = entrypoint.research_after_baseline(task, baseline, tmp_path / "research", **arguments)
-    assert report["status"] == "unknown_usage"
+    assert report["status"] == "numeric_error_limit"
+    assert not report["usage_known"]
     assert report["sessions"] == []
     assert Path(task.spec.submission_path).read_text() == "saved baseline bytes"
 
@@ -302,7 +303,8 @@ def test_api_failure_retains_baseline_csv(tmp_path, monkeypatch):
         token_limit=1000,
         max_sessions=1,
     )
-    assert report["status"] == "api_error" and report["selected"] == "baseline"
+    assert report["status"] == "numeric_error_limit" and report["selected"] == "baseline"
+    assert report["sessions"][0]["reason"] == "api_error"
     assert len(report["sessions"]) == 1
     assert report["sessions"][0]["error_detail"] == "unavailable"
     assert Path(task.spec.submission_path).read_text() == "previous valid file"
@@ -377,7 +379,7 @@ def test_resume_preserves_conservative_charge_after_successful_retry(tmp_path, m
         },
     )
 
-    (directory / "pipeline-version.json").write_text(json.dumps({"version": 2}))
+    (directory / "pipeline-version.json").write_text(json.dumps({"version": 3}))
 
     class ForbiddenModel:
         def complete(self, messages, tools):
@@ -398,7 +400,7 @@ def test_resume_preserves_conservative_charge_after_successful_retry(tmp_path, m
     )
     assert report["tokens_used"] == 1400
     assert report["budget_accounted"] and not report["usage_known"]
-    assert report["status"] == "budget_exhausted"
+    assert report["status"] == "numeric_error_limit"
 
 
 def test_real_worker_failure_reaches_model_and_repairs_in_same_session(tmp_path):
@@ -479,3 +481,33 @@ def test_real_worker_failure_reaches_model_and_repairs_in_same_session(tmp_path)
     assert [report["status"] for report in result.reports] == ["failed", "succeeded"]
     assert result.reports[1]["full_score"]["level"] == "full"
     assert model.step == 6
+
+
+@pytest.fixture(autouse=True)
+def focused_semantic_search(monkeypatch):
+    """These tests isolate proposal/refit behavior; numeric continuation has its own test."""
+    from ml_harness.adapters.research.workspace import ResearchWorkspace
+
+    monkeypatch.setattr(ResearchWorkspace, "numeric_batch", lambda *args: False)
+
+
+def test_v2_unfinished_research_cannot_resume_with_v3(tmp_path):
+    import ml_harness.entrypoints.research as entrypoint
+    from ml_harness.application.use_cases.baseline import BaselineResult
+    from ml_harness.domain.models import Metric, Score
+
+    task = CsvTaskData().prepare(str(task_fixture(tmp_path)), 42)
+    baseline = BaselineResult(
+        Score(1, Metric.RMSE, task.protocol.fingerprint), task.spec.submission_path, 1, 1
+    )
+    directory = tmp_path / "research"
+    directory.mkdir()
+    marker = directory / "pipeline-version.json"
+    marker.write_text(json.dumps({"version": 2}))
+    before = marker.read_bytes()
+    with pytest.raises(ValueError, match="Incompatible"):
+        entrypoint.research_after_baseline(
+            task, baseline, directory, threads=1, timeout_seconds=10, max_steps=3, token_limit=1000
+        )
+    assert marker.read_bytes() == before
+    assert not (directory / "memory").exists()

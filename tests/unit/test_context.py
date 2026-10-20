@@ -250,3 +250,32 @@ def test_compact_report_distinguishes_selected_classes_from_full_metric_changes(
     }
     assert compact["parent_backend"] == "catboost"
     assert compact["hypothesis_source"] == "tool_call"
+
+
+def test_final_bound_preserves_contract_and_late_feature_description():
+    from ml_harness.application.use_cases.context import bound_context
+
+    evidence = [{"key": "segment:late", "definition": {"feature": "late"}, "support": 50}]
+    state = {
+        "task": {"metric": "rmse"},
+        "budget": {"seconds_remaining": 100},
+        "parent_recipe": {"backend": "catboost", "parameters": {"depth": 3}},
+        "selected_evidence": evidence,
+        "dataset_profile": {
+            "fit_partition": "train",
+            "columns": {
+                **{f"x{i}": {"dictionary": {"description": "unused"}} for i in range(200)},
+                "late": {"dictionary": {"description": "important late feature"}},
+            },
+        },
+        "last_measurements": ["x" * 50000],
+    }
+    result = bound_context(state, max_chars=2000)
+    assert len(result) <= 2000
+    parsed = json.loads(result)
+    for key in ("task", "budget", "parent_recipe", "selected_evidence"):
+        assert parsed[key] == state[key]
+    assert (
+        parsed["dataset_profile"]["details"]["late"]["dictionary"]["description"]
+        == "important late feature"
+    )

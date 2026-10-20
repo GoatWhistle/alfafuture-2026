@@ -40,6 +40,7 @@ export function ExperimentDrawer({ run, exp, onClose }: { run: Run; exp: Experim
 
       <div className="drawer-body">
         <dl className="kv">
+          {exp.origin && <div><dt>Источник</dt><dd>{exp.origin === "qwen_proposal" ? "Qwen" : exp.origin.includes("optuna") ? "Численный поиск" : exp.origin}</dd></div>}
           <div>
             <dt>Родитель</dt>
             <dd>{exp.parentId === "baseline" ? "baseline" : (exp.parentId ?? "—")}</dd>

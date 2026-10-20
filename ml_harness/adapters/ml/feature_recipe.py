@@ -21,6 +21,8 @@ class FeatureRecipe:
     ):
         self.model = build_model(kind, options, threads, seed)
         self.backend = options["backend"]
+        if hasattr(self.model, "set_feature_pipeline"):
+            self.model.set_feature_pipeline(transforms, python_source)
         self.transforms, self.python_source = transforms, python_source
         self.frequencies: dict[str, Any] = {}
         self.custom: Any = None
@@ -72,12 +74,31 @@ class FeatureRecipe:
         return frame
 
     def fit(self, X: Any, y: Any) -> "FeatureRecipe":
-        self.model.fit(self._transform(X, fitting=True), y)
+        if hasattr(self.model, "set_feature_pipeline"):
+            try:
+                self.model.fit(X, y)
+            finally:
+                self.tuning_report_ = self.model.tuning_report_
+            self.refit_parameters_ = self.model.refit_parameters_
+        else:
+            self.model.fit(self._transform(X, fitting=True), y)
         self.classes_ = self.model.classes_
         return self
 
+    def fit_inner(self, X: Any, y: Any, validation: Any) -> "FeatureRecipe":
+        valid_X, valid_y = validation
+        train = self._transform(X, fitting=True)
+        self.model.fit(train, y, validation=(self._transform(valid_X), valid_y))
+        self.classes_ = self.model.classes_
+        self.selected_iterations_ = self.model.selected_iterations_
+        return self
+
     def predict(self, X: Any) -> Any:
-        return self.model.predict(self._transform(X))
+        return self.model.predict(
+            X if hasattr(self.model, "set_feature_pipeline") else self._transform(X)
+        )
 
     def predict_proba(self, X: Any) -> Any:
-        return self.model.predict_proba(self._transform(X))
+        return self.model.predict_proba(
+            X if hasattr(self.model, "set_feature_pipeline") else self._transform(X)
+        )

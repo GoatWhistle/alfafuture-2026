@@ -151,19 +151,27 @@ class FinalizationWorkspace:
         ranked = rank_finalists(candidates, len(candidates))
         if len(ranked) >= 2:
             members = ranked[:2]
-            combined = combine_predictions(
-                self.task.spec, self._ids(self.task), [outputs[item.id] for item in members]
-            )
-            measured = self.evaluator.evaluate(self.task, combined)
-            if measured.better_than(ranked[0].score):
-                candidates.append(
+            # Evaluate the fixed grid on development only, then freeze one recipe.
+            blends: list[Finalist] = []
+            for weights in ((0.25, 0.75), (0.5, 0.5), (0.75, 0.25)):
+                combined = combine_predictions(
+                    self.task.spec,
+                    self._ids(self.task),
+                    [outputs[item.id] for item in members],
+                    weights,
+                )
+                measured = self.evaluator.evaluate(self.task, combined)
+                blends.append(
                     Finalist(
                         "ensemble:" + "+".join(item.id for item in members),
                         tuple(item.members[0] for item in members),
                         measured,
-                        (0.5, 0.5),
+                        weights,
                     )
                 )
+            best_blend = rank_finalists(blends, 1)[0]
+            if best_blend.score.better_than(ranked[0].score):
+                candidates.append(best_blend)
         finalists_list = list(rank_finalists(candidates, 3))
         baseline = next((item for item in candidates if item.id == "baseline"), None)
         if baseline and all(item.id != "baseline" for item in finalists_list):
@@ -318,13 +326,39 @@ class FinalizationWorkspace:
                         measured = self.evaluator.evaluate(task, combined)
                     checked[finalist.id] = asdict(measured)
                     self._save()
-                scores[finalist.id] = _score(checked[finalist.id])
+                # Control is an audit, never an optimization or ranking signal.
+                scores[finalist.id] = finalist.score
             self.state["selection_protocol"] = task.protocol.fingerprint
         selected = select_finalists(finalists, scores)
         self.state["selection"] = list(selected)
         self.state["selected_once"] = selected[0] if selected else None
         self._save()
         return selected
+
+    def _checkpoint(self) -> dict[str, Any] | None:
+        """Trust a checkpoint floor only while its exact published CSV is present."""
+        path = self.workspace.path / "checkpoint.json"
+        if not path.exists():
+            return None
+        try:
+            checkpoint = json.loads(path.read_text())
+            if not isinstance(checkpoint, dict):
+                return None
+            score = _score(checkpoint["score"])
+            if (
+                not isinstance(checkpoint.get("id"), str)
+                or not checkpoint["id"]
+                or checkpoint.get("protocol_id") != self.task.protocol.fingerprint
+                or score.protocol_id != self.task.protocol.fingerprint
+                or score.metric != self.task.spec.metric
+                or score.level != "full"
+                or checkpoint.get("submission_hash")
+                != hashlib.sha256(Path(self.task.spec.submission_path).read_bytes()).hexdigest()
+            ):
+                return None
+            return cast(dict[str, Any], checkpoint)
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     def finish(self) -> dict[str, Any]:
         finalists = self._freeze()
@@ -336,11 +370,20 @@ class FinalizationWorkspace:
         self.state["plan_checksum"] = checksum
         selected = self._selection(finalists)
         status = "failed_baseline_preserved" if finalists and not selected else "not_needed"
-        winner = "baseline"
+        checkpoint = self._checkpoint()
+        winner = checkpoint["id"] if checkpoint else "baseline"
+        if checkpoint:
+            status = "failed_checkpoint_preserved"
         if self.state.get("published"):
             return dict(self.state["published"])
         for identifier in selected:
             finalist = next(item for item in finalists if item.id == identifier)
+            if checkpoint and _score(checkpoint["score"]).better_than(finalist.score):
+                self.diagnostics.append(
+                    f"Skipped worse refit {identifier}: "
+                    f"verified checkpoint {checkpoint['id']} retained"
+                )
+                continue
             try:
                 outputs = [
                     self._member_output(member, self.task, "refit") for member in finalist.members
@@ -360,7 +403,9 @@ class FinalizationWorkspace:
                 if isinstance(error, _PendingWorker):
                     raise
                 self.diagnostics.append(f"Refit finalist {identifier}: {error}")
-                status = "failed_baseline_preserved"
+                status = (
+                    "failed_checkpoint_preserved" if checkpoint else "failed_baseline_preserved"
+                )
         report = {
             "selected": winner,
             "refit_status": status,
@@ -372,12 +417,14 @@ class FinalizationWorkspace:
                 if not finalists
                 else "control_unavailable_preserved_csv"
                 if self.task.protocol.control_indices and not selected
-                else "checked_control"
+                else "development_frozen_control_audit"
                 if self.task.protocol.control_indices
                 else "no_control_partition"
             ),
             "diagnostics": self.diagnostics,
         }
+        if checkpoint and status != "succeeded":
+            report["preserved_checkpoint"] = checkpoint
         normalized: dict[str, Any] = json.loads(json.dumps(report, allow_nan=False))
         self.state["published"] = normalized
         self._save()

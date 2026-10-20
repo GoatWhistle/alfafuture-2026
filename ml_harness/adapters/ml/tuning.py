@@ -15,6 +15,7 @@ from sklearn.model_selection import (  # type: ignore[import-untyped]
 )
 
 from ml_harness.domain.models import ContractError
+from ml_harness.domain.proposals import CLASSIFICATION_CHOICES, RANGES
 
 
 class TunedCandidate:
@@ -37,10 +38,30 @@ class TunedCandidate:
             raise ContractError("Tuning requires 1..10 trials and a time limit in (0, 300]")
         if self.parameters.get("backend", "catboost") not in ("catboost", "lightgbm"):
             raise ContractError("Tuning supports CatBoost and LightGBM only")
+        self.transforms: list[dict[str, Any]] = []
+        self.python_source = ""
         self.context: dict[str, Any] = {}
         self.tuning_report_: dict[str, Any] = {}
         self.model: Any = None
         self.classes_: Any = np.array([])
+
+    def set_feature_pipeline(self, transforms: list[dict[str, Any]], source: str) -> None:
+        self.transforms, self.python_source = transforms, source
+
+    def _candidate(self, parameters: dict[str, Any]) -> Any:
+        from ml_harness.adapters.ml.candidates import TabularCandidate
+        from ml_harness.adapters.ml.feature_recipe import FeatureRecipe
+
+        if self.transforms or self.python_source:
+            return FeatureRecipe(
+                self.kind,
+                {**parameters, "tuning": {"enabled": False}},
+                self.threads,
+                self.seed,
+                self.transforms,
+                self.python_source,
+            )
+        return TabularCandidate(self.kind, parameters, self.threads, self.seed)
 
     def configure_validation(self, context: dict[str, Any]) -> None:
         self.context = dict(context)
@@ -128,8 +149,6 @@ class TunedCandidate:
         raise ContractError("Unsupported tuning metric")
 
     def fit(self, X: Any, y: Any) -> "TunedCandidate":
-        from ml_harness.adapters.ml.candidates import TabularCandidate
-
         inner_train, validation = self._split(X, y)
         metric = self.context.get("metric", "rmse" if self.kind == "regression" else "macro_f1")
         if metric not in ("rmse", "mae", "macro_f1", "accuracy", "roc_auc", "log_loss"):
@@ -144,6 +163,27 @@ class TunedCandidate:
         fingerprint = hashlib.sha256(json.dumps(split, sort_keys=True).encode())
         fingerprint.update(pd.util.hash_pandas_object(X, index=True).values.tobytes())
         fingerprint.update(pd.util.hash_pandas_object(y, index=True).values.tobytes())
+        compatibility = {
+            "version": 3,
+            "kind": self.kind,
+            "metric": metric,
+            "parameters": self.parameters,
+            "transforms": self.transforms,
+            "source": self.python_source,
+            "space": {
+                k: [low, high, typ.__name__]
+                for k, (low, high, typ) in RANGES[
+                    self.parameters.get("backend", "catboost")
+                ].items()
+            },
+            "classification_choices": CLASSIFICATION_CHOICES if self.kind != "regression" else {},
+            "seed": self.seed,
+            "context": self.context,
+            "columns": [(str(c), str(X[c].dtype)) for c in X.columns],
+        }
+        study_fingerprint = hashlib.sha256(
+            fingerprint.digest() + json.dumps(compatibility, sort_keys=True).encode()
+        ).hexdigest()
         study = optuna.create_study(
             storage=self.storage,
             study_name=(
@@ -151,7 +191,7 @@ class TunedCandidate:
                 + ":"
                 + self.context.get("level", "full")
                 + ":"
-                + fingerprint.hexdigest()[:16]
+                + study_fingerprint
             )
             if self.storage
             else None,
@@ -162,13 +202,25 @@ class TunedCandidate:
 
         def objective(trial: optuna.Trial) -> float:
             params = dict(self.parameters)
-            params["learning_rate"] = trial.suggest_float("learning_rate", 0.02, 0.2, log=True)
-            if params.get("backend", "catboost") == "catboost":
-                params["depth"] = trial.suggest_int("depth", 3, 7)
+            backend = params.get("backend", "catboost")
+            for name, (low, high, kind) in RANGES[backend].items():
+                if name in ("iterations", "n_estimators"):
+                    high = min(high, params.get(name, 200))
+                    low = min(low, high)
+                if kind is int:
+                    params[name] = trial.suggest_int(name, int(low), int(high))
+                else:
+                    params[name] = trial.suggest_float(name, low, high, log=low > 0)
+            if self.kind != "regression":
+                for name, choices in CLASSIFICATION_CHOICES[backend].items():
+                    params[name] = trial.suggest_categorical(name, choices)
+            model = self._candidate(params)
+            valid = (X.iloc[validation], y.iloc[validation])
+            if hasattr(model, "fit_inner"):
+                model.fit_inner(X.iloc[inner_train], y.iloc[inner_train], valid)
             else:
-                params["num_leaves"] = trial.suggest_int("num_leaves", 7, 31)
-            model = TabularCandidate(self.kind, params, self.threads, self.seed)
-            model.fit(X.iloc[inner_train], y.iloc[inner_train])
+                model.fit(X.iloc[inner_train], y.iloc[inner_train], validation=valid)
+            trial.set_user_attr("selected_iterations", model.selected_iterations_)
             value = self._score(model, X.iloc[validation], y.iloc[validation], metric)
             if not math.isfinite(value):
                 raise ContractError("Inner metric must be finite")
@@ -194,6 +246,7 @@ class TunedCandidate:
             ],
             "best": None,
             "inner_split_fingerprint": fingerprint.hexdigest(),
+            "study_fingerprint": study_fingerprint,
             "inner_split": split,
             "metric": metric,
         }
@@ -206,11 +259,18 @@ class TunedCandidate:
             "params": best.params,
             "value": best.value,
         }
-        self.model = TabularCandidate(
-            self.kind, {**self.parameters, **best.params}, self.threads, self.seed
+        selected = dict(best.params)
+        key = (
+            "iterations"
+            if self.parameters.get("backend", "catboost") == "catboost"
+            else "n_estimators"
         )
+        if best.user_attrs.get("selected_iterations"):
+            selected[key] = best.user_attrs["selected_iterations"]
+        self.tuning_report_["best"]["refit_params"] = selected
+        self.model = self._candidate({**self.parameters, **selected})
         self.model.fit(X, y)
-        self.refit_parameters_ = {**self.parameters, **best.params, "tuning": {"enabled": False}}
+        self.refit_parameters_ = {**self.parameters, **selected, "tuning": {"enabled": False}}
         self.classes_ = self.model.classes_
         return self
 

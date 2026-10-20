@@ -242,6 +242,7 @@ def _measure(
         environment.update(llm_environment)
     started, peak, termination = time.monotonic(), 0, "exited"
     ready_snapshot: dict[str, Any] | None = None
+    first_trained_seconds: float | None = None
     with (
         (directory / "stdout.log").open("wb") as stdout,
         (directory / "stderr.log").open("wb") as stderr,
@@ -257,6 +258,13 @@ def _measure(
         try:
             while True:
                 peak = max(peak, _rss(process))
+                if first_trained_seconds is None:
+                    try:
+                        baseline = _json(directory / "harness/baseline.json")
+                        if isinstance(baseline.get("score"), dict):
+                            first_trained_seconds = time.monotonic() - started
+                    except (OSError, ValueError):
+                        pass
                 if ready_snapshot is None:
                     ready_file = directory / "harness/ready.json"
                     try:
@@ -292,6 +300,7 @@ def _measure(
         "rss_scope": "cli_and_descendants",
         "termination": termination,
         "ready_snapshot": ready_snapshot,
+        "time_to_first_trained_result_seconds": first_trained_seconds,
     }
 
 

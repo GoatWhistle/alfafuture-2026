@@ -97,3 +97,74 @@ def test_invalid_weights_have_structured_errors(weights):
         combine_predictions(
             spec(), ["1"], [{"ids": ["1"], "predictions": [1], "classes": []}], weights
         )
+
+
+def test_label_ensemble_averages_probabilities_before_argmax():
+    task = replace(
+        spec(),
+        kind=TaskKind.BINARY,
+        metric=Metric.ACCURACY,
+        prediction_kind=PredictionKind.LABELS,
+        classes=("z", "a"),
+    )
+    outputs = [
+        {
+            "ids": ["1", "2"],
+            "predictions": ["z", "a"],
+            "classes": ["z", "a"],
+            "probabilities": [[0.51, 0.49], [0.1, 0.9]],
+        },
+        {
+            "ids": ["2", "1"],
+            "predictions": ["z", "a"],
+            "classes": ["a", "z"],
+            "probabilities": [[0.2, 0.8], [0.99, 0.01]],
+        },
+    ]
+    result = combine_predictions(task, ["1", "2"], outputs, (0.75, 0.25))
+    assert result["predictions"] == ["a", "a"]
+    assert result["probabilities"][0] == pytest.approx([0.385, 0.615])
+    assert result["probabilities"][1] == pytest.approx([0.275, 0.725])
+    assert result["classes"] == ["z", "a"]
+
+
+def test_invalid_auxiliary_probabilities_are_rejected():
+    from ml_harness.adapters.ml.evaluation import validate_predictions
+
+    task = replace(
+        spec(),
+        kind=TaskKind.BINARY,
+        metric=Metric.ACCURACY,
+        prediction_kind=PredictionKind.LABELS,
+        classes=("z", "a"),
+    )
+    with pytest.raises(ContractError, match="sum to one"):
+        validate_predictions(
+            task,
+            ["1"],
+            {
+                "ids": ["1"],
+                "predictions": ["z"],
+                "classes": ["z", "a"],
+                "probabilities": [[0.1, 0.2]],
+            },
+        )
+
+
+def test_single_model_preserves_executed_label_rule():
+    task = replace(
+        spec(),
+        kind=TaskKind.BINARY,
+        metric=Metric.ACCURACY,
+        prediction_kind=PredictionKind.LABELS,
+        classes=("a", "z"),
+    )
+    output = {
+        "ids": ["2", "1"],
+        "predictions": ["z", "z"],
+        "classes": ["z", "a"],
+        "probabilities": [[0.4, 0.6], [0.45, 0.55]],
+    }
+    result = combine_predictions(task, ["1", "2"], [output])
+    assert result["predictions"] == ["z", "z"]
+    assert result["probabilities"] == [[0.55, 0.45], [0.6, 0.4]]

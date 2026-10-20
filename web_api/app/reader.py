@@ -203,6 +203,8 @@ def experiments(
                 "code": code if isinstance(code, str) and code else None,
                 "backend": str(r.get("backend", "")),
                 "kind": "experiment",
+                "origin": r.get("hypothesis_source", "unknown"),
+                "branch": str(parent or "baseline"),
             }
         )
     rows.extend(_failed_sessions(events))
@@ -335,6 +337,25 @@ def run_facts(run_dir: Path) -> dict[str, Any]:
         best = selected["score"]
     tokens, uncertain = token_usage(events, budget, research)
     submission = spec.get("submission_path")
+    canonical = read_json(harness / "run-result.json")
+    canonical = canonical if isinstance(canonical, dict) and canonical.get("version") == 3 else {}
+    if canonical:
+        raw_score = canonical.get("score")
+        canonical_score = _score(canonical, "score")
+        if isinstance(raw_score, dict) and canonical_score is not None:
+            metric = str(raw_score.get("metric") or metric)
+            direction = direction_for(metric)
+            best = canonical_score
+            selected = {"id": str(canonical.get("selected", "baseline")), "score": best}
+        else:
+            best = None
+            selected = None
+        submission = canonical.get("submission_path")
+        usage = canonical.get("usage") or {}
+        if isinstance(usage.get("tokens_used"), int):
+            tokens = usage["tokens_used"]
+        uncertain = usage.get("usage_known") is not True
+    decisions = [event["payload"] for event in events if event.get("kind") == "search_decision"]
     return {
         "metric": metric,
         "direction": direction,
@@ -342,13 +363,20 @@ def run_facts(run_dir: Path) -> dict[str, Any]:
         "baseline": baseline,
         "best": best,
         "experiments": rows,
-        "stage": stage_of(harness),
+        "stage": "result" if canonical else stage_of(harness),
         "tokens": tokens,
         "tokensUncertain": bool(uncertain),
         "submission": Path(submission) if isinstance(submission, str) else None,
-        "researchStatus": research.get("status"),
+        "researchStatus": canonical.get("search_status", research.get("status")),
+        "resultStatus": canonical.get("result_status"),
+        "stopReason": canonical.get("stop_reason"),
+        "selectedRecipe": canonical.get("recipe"),
+        "selectedOrigin": canonical.get("origin"),
+        "rejections": canonical.get("rejections", []),
+        "searchDecisions": decisions,
+        "canonicalVersion": canonical.get("version"),
         "selected": selected,
-        "hasSummary": bool(summary),
+        "hasSummary": bool(summary) or bool(canonical),
     }
 
 

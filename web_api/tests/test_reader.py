@@ -141,3 +141,45 @@ def test_running_usage_counts_finished_sessions_and_marks_pending():
         200,
         True,
     )
+
+
+def test_v3_canonical_result_overrides_legacy_summary(tmp_path: Path):
+    harness = tmp_path / "harness"
+    harness.mkdir()
+    (harness / "summary.json").write_text(json.dumps({"research": {"status": "completed"}}))
+    canonical = {
+        "version": 3,
+        "result_status": "preserved",
+        "search_status": "local_only",
+        "selected": "numeric-1",
+        "score": {"metric": "rmse", "value": 2.5, "level": "full"},
+        "origin": "deterministic_optuna",
+        "recipe": {"parameters": {"depth": 4}},
+        "stop_reason": "budget_exhausted",
+        "submission_path": str(tmp_path / "answer.csv"),
+        "usage": {"tokens_used": 123, "usage_known": False},
+        "rejections": [{"id": "qwen-1", "error": "resource admission"}],
+    }
+    (harness / "run-result.json").write_text(json.dumps(canonical))
+    facts = reader.run_facts(tmp_path)
+    assert facts["resultStatus"] == "preserved"
+    assert facts["researchStatus"] == "local_only"
+    assert facts["best"] == 2.5
+    assert facts["selected"] == {"id": "numeric-1", "score": 2.5}
+    assert facts["tokens"] == 123 and facts["tokensUncertain"]
+    assert facts["selectedOrigin"] == "deterministic_optuna"
+    assert facts["selectedRecipe"] == canonical["recipe"]
+    assert facts["rejections"] == canonical["rejections"]
+
+
+def test_experiment_origin_and_branch(tmp_path: Path):
+    payload = {
+        "id": "numeric-1",
+        "parent_id": "qwen-2",
+        "status": "succeeded",
+        "hypothesis_source": "deterministic_optuna",
+        "full_score": {"value": 1},
+    }
+    [row] = reader.experiments([json.loads(_event(payload))], "rmse", 2, tmp_path)
+    assert row["origin"] == "deterministic_optuna"
+    assert row["branch"] == "qwen-2"

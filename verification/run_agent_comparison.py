@@ -53,6 +53,16 @@ def verify_run(directory: Path, task_path: Path, seed: int) -> dict[str, Any]:
     summary = read_json(directory / "harness/summary.json")
     research = summary.get("research", {})
     final = research.get("finalization", {})
+    if research.get("pipeline_version") == 3:
+        facts = read_json(directory / "harness/run-result.json")
+        if (
+            facts.get("version") != 3
+            or summary.get("run_result") != facts
+            or facts.get("selected") != final.get("selected")
+            or facts.get("protocol") != task.protocol.fingerprint
+            or facts.get("result_status") != "refitted"
+        ):
+            raise ValueError("Canonical run result disagrees with measured finalization")
     saved = load_submission(task)
     winner = next((r for r in final.get("finalists", []) if r["id"] == final.get("selected")), None)
     if final.get("refit_status") != "succeeded" or winner is None:
@@ -419,7 +429,7 @@ def main() -> int:
     parser.add_argument(
         "--modes", nargs="+", choices=("qwen", "optuna"), default=["qwen", "optuna"]
     )
-    parser.add_argument("--sessions", type=int, default=3)
+    parser.add_argument("--sessions", type=int, default=12)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--time-budget", type=float, default=1800)
     args = parser.parse_args()

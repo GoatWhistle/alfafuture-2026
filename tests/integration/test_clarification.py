@@ -73,8 +73,11 @@ def snapshots(tmp_path):
 
 
 def test_real_cli_accounts_clarification_and_resumes_without_another_request(tmp_path, monkeypatch):
+    from ml_harness.adapters.research.workspace import ResearchWorkspace
     from ml_harness.entrypoints import cli
 
+    # Isolate preparation accounting; real hybrid fallback has a dedicated worker test.
+    monkeypatch.setattr(ResearchWorkspace, "numeric_batch", lambda *args: False)
     monkeypatch.chdir(tmp_path)
     path = fixture(tmp_path)
     original = snapshots(tmp_path)
@@ -100,7 +103,8 @@ def test_real_cli_accounts_clarification_and_resumes_without_another_request(tmp
     assert json.loads((run / "prepared.json").read_text())["protocol"]["seed"] == 7
     summary = json.loads((run / "summary.json").read_text())
     assert summary["research"]["tokens_used"] == 15
-    assert summary["research"]["status"] == "not_configured"
+    assert summary["research"]["status"] == "numeric_error_limit"
+    assert summary["research"]["llm_stop_reason"] == "not_configured"
     assert (
         summary["research"]["finalization"]["finalists"][0]["members"][0]["backend"] == "lightgbm"
     )
