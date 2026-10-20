@@ -39,6 +39,7 @@ ACTION_SYSTEM_PROMPT = (
     "Follow the current phase and only the tools provided in this request. "
     "Use candidate_code and candidate_contract already supplied in context. "
     "Do not restart file navigation. State a concrete hypothesis and test the written code. "
+    "Use a new experiment ID for changed code. "
     "The harness measures smoke and full validation independently; never invent scores. "
     "Never modify the evaluator, split or submission format. Do not download data, weights "
     "or packages or request other language models. "
@@ -403,6 +404,7 @@ def run_session(
             elif call.name == "run_experiment":
                 reports.append(result["result"])
                 if result["result"].get("status") != "succeeded":
+                    pending_action = "edit_file"
                     errors += 1
                     failures.append(
                         {

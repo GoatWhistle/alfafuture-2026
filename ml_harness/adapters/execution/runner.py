@@ -128,6 +128,21 @@ def _cleanup_worker(process: subprocess.Popen[bytes], observed: dict[int, float]
                 signal.raise_signal(signal.SIGALRM)
 
 
+def _worker_failure_detail(returncode: int | None, stderr_path: Path) -> str:
+    detail = f"Worker exited with code {returncode}"
+    try:
+        # Read a bounded suffix, even if generated code produced a very large log.
+        with stderr_path.open("rb") as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - 4096))
+            lines = stream.read(4096).decode("utf-8", errors="replace").strip().splitlines()
+        if lines:
+            return detail + "; " + lines[-1].strip()[:300]
+    except OSError:
+        pass
+    return detail + "; see stderr.log"
+
+
 class SubprocessRunner:
     def __init__(self, *, memory_limit_mb: int = 28000) -> None:
         if memory_limit_mb <= 0:
@@ -224,7 +239,9 @@ class SubprocessRunner:
                     if process.returncode == 0:
                         status = ExperimentStatus.SUCCEEDED
                     else:
-                        detail = f"Worker exited with code {process.returncode}; see stderr.log"
+                        detail = _worker_failure_detail(
+                            process.returncode, output_dir / "stderr.log"
+                        )
             finally:
                 self._cleanup_failed = True
                 self._cleanup_failed = not _cleanup_worker(process, observed)

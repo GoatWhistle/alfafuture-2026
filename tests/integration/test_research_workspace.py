@@ -380,3 +380,83 @@ def test_resume_preserves_conservative_charge_after_successful_retry(tmp_path, m
     assert report["tokens_used"] == 1400
     assert report["budget_accounted"] and not report["usage_known"]
     assert report["status"] == "budget_exhausted"
+
+
+def test_real_worker_failure_reaches_model_and_repairs_in_same_session(tmp_path):
+    task = CsvTaskData().prepare(str(task_fixture(tmp_path)), 42)
+    workspace = ResearchWorkspace(
+        task,
+        tmp_path / "research",
+        SubprocessRunner(),
+        IndependentEvaluator(),
+        threads=1,
+        timeout_seconds=10,
+    )
+    tools = ResearchTools(
+        workspace.path, workspace.inspect_data, workspace.run_experiment, workspace.read_experiments
+    )
+    bad_options = {"backend": "lightgbm", "n_estimators": 3, "early_stopping_rounds": 2}
+    good_options = {"backend": "lightgbm", "n_estimators": 3}
+
+    def source(options):
+        return (
+            "from ml_harness.adapters.ml.candidates import build_model as base_model\n"
+            "def build_model(kind, parameters, threads, seed):\n"
+            f"    options = {options!r}\n"
+            "    options.update(parameters)\n"
+            "    return base_model(kind, options, threads, seed)\n"
+        )
+
+    def call(name, arguments, identifier):
+        return ModelReply("", (ToolCall(identifier, name, json.dumps(arguments)),))
+
+    class RepairModel:
+        step = 0
+
+        def set_limits(self, *limits):
+            pass
+
+        def complete(self, messages, schemas):
+            step = self.step
+            self.step += 1
+            if step in (0, 2):
+                if step == 2:
+                    context = json.dumps(messages)
+                    assert "ValueError" in context and "at least one dataset" in context
+                    assert '"failure_phase":"smoke"' in messages[-1]["content"]
+                    assert [s["function"]["name"] for s in schemas] == ["edit_file"]
+                return call(
+                    "edit_file",
+                    {
+                        "path": "candidate.py",
+                        "content": source(bad_options if step == 0 else good_options),
+                    },
+                    f"edit-{step}",
+                )
+            if step in (1, 3):
+                return call(
+                    "run_experiment",
+                    {
+                        "experiment_id": "broken" if step == 1 else "fixed",
+                        "hypothesis": "Test the written LightGBM configuration",
+                        "expected_effect": "A measured RMSE",
+                    },
+                    f"run-{step}",
+                )
+            assert step == 4
+            return ModelReply("The repaired written candidate completed full validation.")
+
+    model = RepairModel()
+    clock = SystemClock()
+    result = run_session(
+        model,
+        tools,
+        json.dumps({"candidate_code": STARTER}),
+        RunBudget(clock.now() + 60, 32000, 10),
+        clock,
+        reserve_seconds=0,
+    )
+    assert result.reason == "model_finished" and result.tool_errors == 1
+    assert [report["status"] for report in result.reports] == ["failed", "succeeded"]
+    assert result.reports[1]["full_score"]["level"] == "full"
+    assert model.step == 5

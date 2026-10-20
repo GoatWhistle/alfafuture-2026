@@ -23,6 +23,7 @@ def experiment_observation(report: dict[str, Any]) -> dict[str, Any]:
             "smoke_score",
             "protocol_id",
             "level",
+            "failure_phase",
             "measured_by",
             "code_hash",
             "parent_code_hash",
