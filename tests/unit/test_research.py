@@ -428,3 +428,39 @@ def test_review_compaction_retains_draft_code_and_latest_measurement():
     assert '"draft_truncated":true' in review
     assert "12.5" in review and "13.0" in review
     assert len(json.dumps(model.messages[2], ensure_ascii=False).encode()) < 6000
+
+
+def test_factory_runtime_contract_survives_run_interpretation_and_review_compaction():
+    class Model(FakeLanguageModel):
+        def set_limits(self, *limits):
+            pass
+
+    contract = {
+        "kind_selects": "task_type",
+        "backend_option": "backend",
+        "default_backend": "catboost",
+    }
+    model = Model(
+        [
+            ModelReply("", (ToolCall("edit", "edit_file", '{"content":"changed"}'),)),
+            ModelReply("", (ToolCall("run", "run_experiment", "{}"),)),
+            ModelReply("Measured draft."),
+            ModelReply("Reviewed measured interpretation."),
+        ]
+    )
+    result = run_session(
+        model,
+        FakeTools(
+            [
+                {"ok": True, "result": {"written": True}},
+                {"ok": True, "result": {"status": "succeeded", "full_score": 1}},
+            ]
+        ),
+        json.dumps({"candidate_runtime_contract": contract}),
+        RunBudget(1000, 32000, 10),
+        FakeClock(),
+    )
+    assert result.reason == "model_finished"
+    for messages in model.messages[1:]:
+        assert json.loads(messages[1]["content"])["candidate_runtime_contract"] == contract
+        assert "candidate_runtime_contract" in messages[0]["content"]

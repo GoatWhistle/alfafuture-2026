@@ -38,7 +38,9 @@ never a full result. The previously saved baseline remains available if the expe
 ACTION_SYSTEM_PROMPT = (
     "You are an autonomous tabular ML researcher using only the provided Qwen model. "
     "Follow the current phase and only the tools provided in this request. "
-    "Use candidate_code and candidate_contract already supplied in context. "
+    "Use candidate_code and the supplied construction contracts. "
+    "For imported base_model use candidate_runtime_contract: kind selects task type, "
+    "not learner; backend is explicit in options or uses the documented default. "
     "Do not restart file navigation. State a concrete hypothesis and test the written code. "
     "Use a new experiment ID for changed code. "
     "Scale experiment compute to measured baseline times and worker/smoke limits in budget. "
@@ -240,6 +242,7 @@ def run_session(
                         "direction",
                         "candidate_code",
                         "candidate_code_truncated",
+                        "candidate_runtime_contract",
                         "next_action",
                         "budget",
                     )

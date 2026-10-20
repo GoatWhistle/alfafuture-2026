@@ -194,7 +194,17 @@ def test_research_promotes_measured_improvement_after_valid_refit(tmp_path, monk
         token_limit=1000,
         max_sessions=1,
     )
-    context_budget = json.loads(model.observed[1]["content"])["budget"]
+    initial_context = json.loads(model.observed[1]["content"])
+    from ml_harness.adapters.ml.candidates import build_model as base_model
+
+    contract = initial_context["candidate_runtime_contract"]
+    assert contract == {
+        "kind_selects": "task_type",
+        "backend_option": "backend",
+        "default_backend": "catboost",
+    }
+    assert contract["default_backend"] == base_model("regression", {}, 1, 42).backend
+    context_budget = initial_context["budget"]
     assert {
         key: context_budget[key]
         for key in (

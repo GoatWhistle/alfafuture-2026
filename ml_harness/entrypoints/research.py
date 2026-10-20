@@ -223,8 +223,16 @@ def research_after_baseline(
             )
             context_value = json.loads(context)
             context_value["candidate_code"] = (directory / "candidate.py").read_text()[:4000]
+            context_value["candidate_runtime_contract"] = {
+                "kind_selects": "task_type",
+                "backend_option": "backend",
+                "default_backend": "catboost",
+            }
             context_value["candidate_contract"] = (
                 "build_model(kind, parameters, threads, seed) returns an unfitted model. "
+                "kind is the task type (regression/binary/multiclass), not the learner. "
+                "base_model defaults to CatBoost if options['backend'] is omitted; "
+                "LightGBM requires options['backend']='lightgbm' explicitly. "
                 "Use from ml_harness.adapters.ml.candidates import build_model as base_model. "
                 "Merge parameters into options; base_model(kind, options, threads, seed) handles "
                 "imputation/categories and fit/predict/predict_proba. CatBoost: backend=catboost, "
