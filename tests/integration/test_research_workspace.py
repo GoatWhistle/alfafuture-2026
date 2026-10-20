@@ -44,6 +44,9 @@ class ScriptedModel:
                     ),
                 ),
                 ModelReply("Measured result received; this observation does not prove causality."),
+                ModelReply(
+                    "Reviewed the measured result; a single split does not prove causality."
+                ),
             ]
         )
         self.observed = []
@@ -118,7 +121,7 @@ def test_edit_smoke_full_evaluation_and_idempotence(tmp_path):
     assert report["full_score"]["level"] == "full"
     assert report["full_score"]["protocol_id"] == task.protocol.fingerprint
     assert report["smoke_score"]["protocol_id"] != task.protocol.fingerprint
-    assert "full_score" in model.observed[-2]["content"]
+    assert any("full_score" in m.get("content", "") for m in model.observed if m["role"] == "tool")
     report_file = workspace.path / "experiments/regularization/experiment.json"
     before = report_file.stat().st_mtime_ns
     repeated = workspace.run_experiment(
@@ -208,6 +211,10 @@ def test_research_promotes_measured_improvement_after_valid_refit(tmp_path, monk
         "baseline_validation_seconds": 2.5,
         "baseline_refit_seconds": 4.0,
     }
+    observed_reports = [
+        json.loads(m["content"]).get("result", {}) for m in model.observed if m["role"] == "tool"
+    ]
+    assert any(r.get("parent_backend") == "catboost" for r in observed_reports)
     assert report["selected"] == "regularization"
     assert report["refit_status"] == "succeeded"
     assert Path(task.spec.submission_path).read_text().startswith("key,response")
@@ -304,6 +311,7 @@ def test_new_hypotheses_get_short_sessions_with_prior_evidence(tmp_path, monkeyp
                     2,
                 ),
                 ModelReply(f"interpretation {index}", (), 5, 2),
+                ModelReply(f"interpretation {index}"),
             ]
         )
 
@@ -346,7 +354,7 @@ def test_new_hypotheses_get_short_sessions_with_prior_evidence(tmp_path, monkeyp
     )
     assert restored.reports[0]["usage"]["scope"] == "shared_session"
     assert restored.reports[0]["usage"]["input_tokens"] == 10
-    assert restored.reports[0]["usage"]["api_attempts"] == 2
+    assert restored.reports[0]["usage"]["api_attempts"] == 3
 
 
 def test_resume_preserves_conservative_charge_after_successful_retry(tmp_path, monkeypatch):
@@ -461,7 +469,7 @@ def test_real_worker_failure_reaches_model_and_repairs_in_same_session(tmp_path)
                     },
                     f"run-{step}",
                 )
-            assert step == 4
+            assert step in (4, 5)
             return ModelReply("The repaired written candidate completed full validation.")
 
     model = RepairModel()
@@ -477,4 +485,4 @@ def test_real_worker_failure_reaches_model_and_repairs_in_same_session(tmp_path)
     assert result.reason == "model_finished" and result.tool_errors == 1
     assert [report["status"] for report in result.reports] == ["failed", "succeeded"]
     assert result.reports[1]["full_score"]["level"] == "full"
-    assert model.step == 5
+    assert model.step == 6

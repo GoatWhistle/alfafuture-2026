@@ -27,6 +27,8 @@ def experiment_observation(report: dict[str, Any]) -> dict[str, Any]:
             "measured_by",
             "code_hash",
             "parent_code_hash",
+            "parent_backend",
+            "hypothesis_source",
             "elapsed_seconds",
             "parent_score",
             "delta",

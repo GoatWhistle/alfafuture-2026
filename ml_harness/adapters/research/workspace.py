@@ -611,6 +611,7 @@ class ResearchWorkspace:
                 "expected_effect": arguments["expected_effect"],
                 "parent_score": parent.get("full_score") if parent else None,
                 "parent_code_hash": parent.get("code_hash") if parent else None,
+                "parent_backend": parent.get("backend") if parent else None,
                 "reused_from": duplicate["id"],
                 "hypothesis_source": arguments.get("hypothesis_source", "tool_call"),
                 "elapsed_seconds": 0.0,
@@ -645,6 +646,7 @@ class ResearchWorkspace:
                 json.dumps(arguments.get("parameters", {}), sort_keys=True).encode()
             ).hexdigest(),
             "parent_code_hash": parent.get("code_hash") if parent else None,
+            "parent_backend": parent.get("backend") if parent else None,
             "parent_score": parent.get("full_score") if parent else None,
             "code_path": version_path,
             "artifacts": [str(directory / "smoke"), str(directory / "full")],

@@ -213,3 +213,40 @@ def test_recent_failure_and_timeout_are_kept(task: PreparedTask) -> None:
         "reports"
     ]
     assert {"parent", "failure", "timeout"} <= {r["id"] for r in summaries}
+
+
+def test_compact_report_distinguishes_selected_classes_from_full_metric_changes():
+    from ml_harness.application.use_cases.observations import experiment_observation
+
+    rows = [
+        {
+            "class": str(i),
+            "support": 100,
+            "sufficient_support": True,
+            "f1": 0.1 + i * 0.07,
+            "recall": 0.2,
+            "delta": {"precision": -0.1 if i < 7 else 0.1, "recall": 0.1, "f1": 0.01},
+        }
+        for i in range(10)
+    ]
+    compact = experiment_observation(
+        {
+            "id": "measured",
+            "status": "succeeded",
+            "measured_by": "harness",
+            "parent_backend": "catboost",
+            "hypothesis_source": "tool_call",
+            "error_report": {"class_report": rows, "measured_by": "harness"},
+        }
+    )
+    measured = compact["measured_errors"]
+    assert len(measured["target_errors"]) == 3
+    assert measured["focus_scope"] == {"selected": 3, "classes_total": 10, "exhaustive": False}
+    assert measured["class_metric_changes"]["precision"] == {
+        "increased": 3,
+        "decreased": 7,
+        "unchanged": 0,
+        "unavailable": 0,
+    }
+    assert compact["parent_backend"] == "catboost"
+    assert compact["hypothesis_source"] == "tool_call"

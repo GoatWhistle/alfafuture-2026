@@ -52,12 +52,39 @@ def diagnostic_summary(diagnostic: dict[str, Any], limit: int = 3) -> dict[str, 
                 "delta": focus.get("delta"),
             }
         )
-    return {
+    rows = diagnostic.get("class_report", [])
+    scope = {"selected": len(items), "exhaustive": False}
+    if rows:
+        scope["classes_total"] = len(rows)
+        scope["exhaustive"] = len(items) == len(rows) and all(
+            item["error"].startswith("class:") for item in items
+        )
+    result = {
         "measured_by": diagnostic.get("measured_by"),
         "overall_delta": diagnostic.get("delta"),
         "target_errors": items,
+        "focus_scope": scope,
         "interpretation": "Observations on validation; no causal claim",
     }
+    if any(isinstance(row.get("delta"), dict) for row in rows):
+        changes = {}
+        for metric in ("precision", "recall", "f1"):
+            counts = dict(increased=0, decreased=0, unchanged=0, unavailable=0)
+            for row in rows:
+                value = (row.get("delta") or {}).get(metric)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int | float)
+                    or not isfinite(value)
+                ):
+                    counts["unavailable"] += 1
+                else:
+                    counts[
+                        "increased" if value > 0 else "decreased" if value < 0 else "unchanged"
+                    ] += 1
+            changes[metric] = counts
+        result["class_metric_changes"] = changes
+    return result
 
 
 def build_context(

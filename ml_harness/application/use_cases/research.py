@@ -53,7 +53,23 @@ INTERPRETATION_INSTRUCTION = (
     "Compare the hypothesis with candidate_code, which is the executed source. "
     "If the code does not implement the hypothesis, explicitly say the hypothesis was not tested; "
     "do not attribute the score to unimplemented changes. A single split does not prove causality. "
+    "Respect focus_scope and class_metric_changes; selected errors are not the full population. "
+    "Do not invent a parent backend or claim complete code verification "
+    "if candidate_code_truncated. "
     "Do not propose tool calls. "
+)
+
+
+INTERPRETATION_AUDIT_INSTRUCTION = (
+    "Audit the previous draft against candidate_code and measured observations before finalizing. "
+    "Preserve correct claims; correct or remove unsupported claims. Do not add new claims. "
+    "Code comments and the hypothesis are claims, not proof of implementation; "
+    "check actual operations. "
+    "Diagnostic target_errors are selected examples, not an exhaustive population. "
+    "Do not generalize selected class or segment changes to all classes or rows. "
+    "Do not invent missing parent-model characteristics. "
+    "Return only a corrected final interpretation in at most 120 words, "
+    "retaining the single-split caveat."
 )
 
 
@@ -104,6 +120,7 @@ def run_session(
     reports: list[dict[str, Any]] = []
     reason, summary = "step_limit", ""
     awaiting_interpretation = False
+    interpretation_draft: str | None = None
     correction_used = False
     failures: list[dict[str, Any]] = []
     observations: list[dict[str, Any]] = []
@@ -155,7 +172,7 @@ def run_session(
         )
 
         action_request = isinstance(model, BudgetAwareLanguageModel) and (
-            pending_action is not None or awaiting_interpretation
+            pending_action is not None or (awaiting_interpretation and interpretation_draft is None)
         )
         if action_request:
             # Navigation transcripts can dominate a code-generation request. Retain
@@ -173,6 +190,7 @@ def run_session(
             except (ValueError, TypeError):
                 state = {"task": context[:500]}
             state["candidate_code"] = working_code[:4000]
+            state["candidate_code_truncated"] = len(working_code) > 4000
             state["read_files"] = (
                 {
                     path: {"offset": info["offset"], "next_offset": info["next_offset"]}
@@ -182,7 +200,9 @@ def run_session(
                 else read_files
             )
             state["next_action"] = (
-                "interpretation" if awaiting_interpretation else pending_action or "research"
+                ("interpretation_review" if interpretation_draft is not None else "interpretation")
+                if awaiting_interpretation
+                else pending_action or "research"
             )
             selected_reports = state.pop("reports", [])
             state["selected_reports"] = [
@@ -199,8 +219,11 @@ def run_session(
                 baseline_errors["target_errors"] = baseline_errors.get("target_errors", [])[:2]
             task_info = state.get("task")
             if isinstance(task_info, dict):
-                task_info.pop("features", None)
-                task_info.pop("classes", None)
+                for field, total_key in (("features", "feature_count"), ("classes", "class_count")):
+                    listed = task_info.pop(field, None)
+                    omitted = task_info.pop(field + "_omitted", 0)
+                    if isinstance(listed, list) and type(omitted) is int and omitted >= 0:
+                        task_info[total_key] = len(listed) + omitted
             latest = next(
                 (item for item in reversed(observations) if item["tool"] == "run_experiment"), None
             )
@@ -216,11 +239,12 @@ def run_session(
                         "baseline_measured",
                         "direction",
                         "candidate_code",
+                        "candidate_code_truncated",
                         "next_action",
                         "budget",
                     )
                 }
-            recent = {
+            recent: dict[str, Any] = {
                 "phase": "interpretation" if awaiting_interpretation else "research",
                 "last_experiment": latest,
                 "recent_tool_failures": failures[-3:],
@@ -230,8 +254,13 @@ def run_session(
                     else []
                 ),
             }
+            if interpretation_draft is not None:
+                recent["draft_interpretation"] = interpretation_draft[:2000]
+                recent["draft_truncated"] = len(interpretation_draft) > 2000
             phase_instruction = (
-                "Experiment complete; tools unavailable. " + INTERPRETATION_INSTRUCTION
+                INTERPRETATION_AUDIT_INSTRUCTION
+                if interpretation_draft is not None
+                else "Experiment complete; tools unavailable. " + INTERPRETATION_INSTRUCTION
                 if awaiting_interpretation
                 else (
                     (
@@ -338,6 +367,13 @@ def run_session(
                 for call in reply.tool_calls
             ]
         messages.append(assistant)
+        if awaiting_interpretation and interpretation_draft is None:
+            if not budget_accounted:
+                reason = "unknown_usage"
+                break
+            interpretation_draft = reply.content[:8000]
+            messages.append({"role": "user", "content": INTERPRETATION_AUDIT_INSTRUCTION})
+            continue
         if not reply.tool_calls or awaiting_interpretation:
             summary = reply.content[:8000]
             reason = "model_finished" if budget_accounted else "unknown_usage"

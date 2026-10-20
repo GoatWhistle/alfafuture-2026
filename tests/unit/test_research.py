@@ -50,6 +50,7 @@ def test_tool_observation_returns_to_model_and_usage_is_counted():
         [
             ModelReply("hypothesis", (call,), 5, 3, attempts=2),
             ModelReply("measured summary", (), 6, 4),
+            ModelReply("Reviewed measured summary."),
         ]
     )
     tools = FakeTools([{"ok": True, "result": {"status": "succeeded", "full_score": 1}}])
@@ -137,6 +138,7 @@ def test_large_measured_report_keeps_score_after_compaction():
         [
             ModelReply("", (ToolCall("run", "run_experiment", "{}"),)),
             ModelReply("Measured gain 0.5"),
+            ModelReply("Reviewed measured gain 0.5."),
         ]
     )
     result = session(model, FakeTools([{"ok": True, "result": report}]), history_char_limit=4096)
@@ -224,6 +226,7 @@ def test_navigation_transitions_to_edit_then_validation_then_interpretation():
             ),
             ModelReply("", (ToolCall("run", "run_experiment", "{}"),)),
             ModelReply("Measured result received"),
+            ModelReply("Reviewed measured result."),
         ]
     )
     tools = Tools(
@@ -235,7 +238,7 @@ def test_navigation_transitions_to_edit_then_validation_then_interpretation():
     )
     result = session(model, tools)
     assert result.reason == "model_finished" and len(result.reports) == 1
-    assert model.allowed[1:] == [["edit_file"], ["edit_file"], ["run_experiment"], []]
+    assert model.allowed[1:] == [["edit_file"], ["edit_file"], ["run_experiment"], [], []]
     assert "prior response was incomplete" in json.dumps(model.messages[2])
     assert all(message["role"] != "tool" for message in model.messages[3])
     assert "changed" in json.dumps(model.messages[3])
@@ -262,7 +265,12 @@ def test_action_request_discards_navigation_history_but_keeps_research_facts():
 
     context = json.dumps(
         {
-            "task": {"target": "energy", "metric": "rmse"},
+            "task": {
+                "target": "energy",
+                "metric": "rmse",
+                "classes": ["A", "B"],
+                "classes_omitted": 8,
+            },
             "candidate_code": "def build_model(): pass",
             "candidate_contract": "fit(X,y), predict(X)",
             "baseline_measured": {"value": 42.2},
@@ -294,6 +302,9 @@ def test_action_request_discards_navigation_history_but_keeps_research_facts():
     assert "def build_model" in request and "file-2" in request
     assert all(message["role"] != "tool" for message in model.messages[-1])
     assert result.reason == "model_error"
+    task_state = json.loads(model.messages[-1][1]["content"])["task"]
+    assert task_state["class_count"] == 10
+    assert "classes_omitted" not in task_state
 
 
 def test_out_of_phase_tool_is_rejected_before_execution_and_can_be_corrected():
@@ -315,6 +326,7 @@ def test_out_of_phase_tool_is_rejected_before_execution_and_can_be_corrected():
             ModelReply("", (ToolCall("edit", "edit_file", '{"content":"changed"}'),)),
             ModelReply("", (ToolCall("run", "run_experiment", "{}"),)),
             ModelReply("The measured score is 1."),
+            ModelReply("Reviewed: the measured score is 1."),
         ]
     )
     tools = Tools(
@@ -334,3 +346,85 @@ def test_out_of_phase_tool_is_rejected_before_execution_and_can_be_corrected():
     assert result.input_tokens == 12 and result.output_tokens == 4
     corrective = json.dumps(model.messages[2])
     assert "tool_not_allowed" in corrective and "edit_file" in corrective
+
+
+def test_interpretation_draft_is_audited_before_session_finishes():
+    model = FakeLanguageModel(
+        [
+            ModelReply("", (ToolCall("run", "run_experiment", "{}"),), 2, 1),
+            ModelReply("Draft incorrectly claims all classes improved.", (), 5, 3),
+            ModelReply(
+                "Only the selected classes improved; one split is not causal evidence.", (), 7, 4
+            ),
+        ]
+    )
+    tools = FakeTools([{"ok": True, "result": {"status": "succeeded", "full_score": 1}}])
+    result = session(model, tools)
+    assert result.summary == "Only the selected classes improved; one split is not causal evidence."
+    assert result.reason == "model_finished" and result.steps == 3
+    assert (result.input_tokens, result.output_tokens, result.api_attempts) == (14, 8, 3)
+    assert model.messages[2][-2]["content"].startswith("Draft incorrectly")
+    assert "Audit the previous draft" in model.messages[2][-1]["content"]
+
+
+def test_unreviewed_draft_does_not_count_as_finished_at_step_limit():
+    model = FakeLanguageModel(
+        [
+            ModelReply("", (ToolCall("run", "run_experiment", "{}"),)),
+            ModelReply("An unreviewed draft."),
+        ]
+    )
+    result = session(
+        model,
+        FakeTools([{"ok": True, "result": {"status": "succeeded"}}]),
+        max_steps=2,
+    )
+    assert result.reason == "step_limit" and result.summary == ""
+    assert len(result.reports) == 1
+
+
+def test_review_compaction_retains_draft_code_and_latest_measurement():
+    class Model(FakeLanguageModel):
+        def set_limits(self, *limits):
+            pass
+
+    code = (
+        "def build_model(kind, parameters, threads, seed): "
+        "return base_model(kind, parameters, threads, seed)"
+    )
+    model = Model(
+        [
+            ModelReply("", (ToolCall("run", "run_experiment", "{}"),)),
+            ModelReply("unreviewed draft " * 800),
+            ModelReply("Reviewed: RMSE 12.5 vs 13.0 on one split."),
+        ]
+    )
+    tools = FakeTools(
+        [
+            {
+                "ok": True,
+                "result": {
+                    "id": "changed",
+                    "status": "succeeded",
+                    "full_score": {"value": 12.5},
+                    "parent_score": {"value": 13.0},
+                },
+            }
+        ]
+    )
+    result = run_session(
+        model,
+        tools,
+        json.dumps({"candidate_code": code}),
+        RunBudget(1000, 32000, 10),
+        FakeClock(),
+        history_char_limit=6000,
+    )
+    assert result.reason == "model_finished" and result.steps == 3
+    state = json.loads(model.messages[2][1]["content"])
+    assert state["candidate_code"] == code and not state["candidate_code_truncated"]
+    review = model.messages[2][-1]["content"]
+    assert "Audit the previous draft" in review and "draft_interpretation" in review
+    assert '"draft_truncated":true' in review
+    assert "12.5" in review and "13.0" in review
+    assert len(json.dumps(model.messages[2], ensure_ascii=False).encode()) < 6000
