@@ -125,3 +125,43 @@ def test_session_repairs_have_fresh_budget_and_are_bounded():
     assert result.steps == 3 and result.reason == "correction_limit"
     assert [x["seconds_remaining"] for x in seen] == [970, 940, 910]
     assert [x["tokens_remaining"] for x in seen] == [100, 90, 80]
+
+
+@pytest.mark.parametrize(
+    "arguments, rejected",
+    [
+        (
+            '{"backend": "lightgbm", "parameters": {"num_leaves": 127}}',
+            {"backend": "lightgbm", "parameters": {"num_leaves": 127}},
+        ),
+        ('{"backend":', '{"backend":'),
+    ],
+)
+def test_correction_receives_exact_rejected_recipe(arguments, rejected):
+    class Clock:
+        def now(self):
+            return 0
+
+    seen = []
+
+    class Model:
+        def complete(self, messages, tools):
+            seen.append(json.loads(messages[1]["content"]))
+            return ModelReply("", (ToolCall("bad", "propose_experiment", arguments),))
+
+    class Tools:
+        schemas = []
+
+        def execute(self, call):
+            return {"ok": False, "error": {"message": "num_leaves must be int in [4, 63]"}}
+
+    run_proposal_session(
+        Model(),
+        Tools(),
+        "{}",
+        RunBudget(1000, 1000, 9),
+        Clock(),
+        max_steps=2,
+        reserve_seconds=lambda: 30,
+    )
+    assert seen[1]["previous_attempts"][-1]["requested_proposal"] == rejected

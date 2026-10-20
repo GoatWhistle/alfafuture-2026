@@ -100,6 +100,7 @@ def test_verify_run_verifies_structured_proposal_without_llm_summary(
         ("proposal_hash", "forged"),
         ("resolved_hash", "forged"),
         ("effective_code_hash", "forged"),
+        ("executed_recipe_hash", "forged"),
         ("parent_code_hash", "forged"),
         ("status", "running"),
         ("pipeline_version", 1),

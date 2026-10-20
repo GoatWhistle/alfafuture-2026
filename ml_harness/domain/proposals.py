@@ -180,3 +180,20 @@ def require_resolved(result: ValidationResult) -> ResolvedExperiment:
     if result.resolved is None:
         raise ContractError("; ".join(result.errors))
     return result.resolved
+
+
+def frozen_recipe(
+    recipe: dict[str, Any], refit_parameters: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Separate the requested search strategy from the fitted learner used by descendants."""
+    from copy import deepcopy
+
+    result = deepcopy(recipe)
+    if refit_parameters is not None:
+        if refit_parameters.get("backend", result["backend"]) != result["backend"]:
+            raise ContractError("Fitted backend differs from the resolved recipe")
+        result["parameters"] = {
+            k: v for k, v in refit_parameters.items() if k not in ("backend", "tuning")
+        }
+        result["tuning"] = {}
+    return result

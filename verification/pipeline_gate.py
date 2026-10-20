@@ -6,7 +6,7 @@ from typing import Any
 
 from ml_harness.adapters.llm.proposals import digest, materialize
 from ml_harness.adapters.storage.submission import IndependentEvaluator
-from ml_harness.domain.proposals import Proposal, require_resolved, resolve
+from ml_harness.domain.proposals import Proposal, frozen_recipe, require_resolved, resolve
 
 VERSION = 2
 
@@ -45,8 +45,8 @@ def verify_recipe(report: dict[str, Any], task: Any, reports: list[dict[str, Any
         raise ValueError("Parent provenance mismatch")
     if report["code_hash"] == parent["code_hash"] or report.get("reused_from"):
         raise ValueError("Unchanged or reused candidate is not a new experiment")
-    if parent.get("resolved_spec"):
-        parent_spec = parent["resolved_spec"]
+    if parent.get("executed_recipe") or parent.get("resolved_spec"):
+        parent_spec = parent.get("executed_recipe") or parent["resolved_spec"]
     elif parent["backend"] not in ("catboost", "lightgbm"):
         parent_spec = {"backend": parent["backend"], "parameters": parent.get("parameters", {})}
     else:
@@ -89,7 +89,15 @@ def verify_recipe(report: dict[str, Any], task: Any, reports: list[dict[str, Any
     predictions = Path(report["prediction_path"])
     if hashlib.sha256(predictions.read_bytes()).hexdigest() != report["prediction_hash"]:
         raise ValueError("Prediction hash mismatch")
-    score = IndependentEvaluator().evaluate(task, json.loads(predictions.read_text()))
+    output = json.loads(predictions.read_text())
+    fitted = frozen_recipe(spec, output.get("refit_parameters"))
+    if (
+        digest(fitted) != report["executed_recipe_hash"]
+        or digest(report["executed_recipe"]) != digest(fitted)
+        or report.get("refit_parameters") != output.get("refit_parameters")
+    ):
+        raise ValueError("Fitted recipe differs from measured worker parameters")
+    score = IndependentEvaluator().evaluate(task, output)
     if asdict(score) != report["full_score"]:
         raise ValueError("Measured full score mismatch")
     if hashlib.sha256(Path(parent["code_path"]).read_bytes()).hexdigest() != parent["code_hash"]:

@@ -88,3 +88,22 @@ def test_expensive_recipe_smoke_never_starts_full_and_repeat_deduplicates(tmp_pa
     assert experiments[0]["admission"]["estimated_full_seconds"] > 10
     assert not list((tmp_path / "research/experiments").glob("*/full/request.json"))
     assert Path(tmp_path / "submission.csv").exists() or result["selected"] == "baseline"
+
+
+def test_next_hypothesis_sees_actual_optuna_parameters(tmp_path, monkeypatch):
+    class Model(ScriptedProposalModel):
+        def complete(self, messages, tools):
+            reply = super().complete(messages, tools)
+            if len(self.starts) != 1:
+                return reply
+            raw = json.loads(reply.tool_calls[0].arguments)
+            raw["tune"] = True
+            return ModelReply("", (ToolCall("tune", "propose_experiment", json.dumps(raw)),), 5, 2)
+
+    model = Model()
+    _, result = setup(tmp_path, monkeypatch, model)
+    first = next(r for r in result["reports"] if r.get("tuning_report"))
+    fitted = {k: v for k, v in first["refit_parameters"].items() if k not in ("backend", "tuning")}
+    assert first["executed_recipe"]["parameters"] == fitted
+    assert model.starts[1]["parent_recipe"]["parameters"] == fitted
+    assert model.starts[1]["parent_recipe"]["tuning"] == {}

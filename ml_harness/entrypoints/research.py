@@ -232,7 +232,7 @@ def research_after_baseline(
             )
             context_value = json.loads(context)
             parent = next(r for r in workspace.read_experiments() if r["id"] == direction.parent_id)
-            context_value["parent_recipe"] = parent.get(
+            context_value["parent_recipe"] = parent.get("executed_recipe") or parent.get(
                 "resolved_spec",
                 {
                     "backend": parent.get("backend"),
@@ -255,6 +255,7 @@ def research_after_baseline(
                         "parent_delta",
                         "admission",
                         "resolved_spec",
+                        "executed_recipe",
                         "error",
                         "error_report",
                     )
@@ -270,7 +271,7 @@ def research_after_baseline(
                 for event in workspace.store.read_events()
                 if event["kind"] == "session_finished"
                 for failure in event["payload"].get("tool_failures", [])
-            ][-3:]
+            ][-1:]
             context = json.dumps(context_value, ensure_ascii=False)
             workspace.store.append(
                 {

@@ -27,6 +27,7 @@ from ml_harness.domain.models import (
     TaskKind,
     ValidationProtocol,
 )
+from ml_harness.domain.proposals import frozen_recipe
 
 CANDIDATE_API = """# Candidate interface
 Only candidate.py is editable. Read task.md and data_dictionary.csv for task semantics.
@@ -443,6 +444,13 @@ class ResearchWorkspace:
                 )
                 digest, path = self.store.save_code(code)
                 report.update(refit_code_hash=digest, refit_code_path=path)
+
+        if report.get("pipeline_version") == 2:
+            fitted = frozen_recipe(report["resolved_spec"], report.get("refit_parameters"))
+            report["executed_recipe"] = fitted
+            report["executed_recipe_hash"] = hashlib.sha256(
+                json.dumps(fitted, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
 
     def _restore(self) -> None:
         experiments: dict[str, dict[str, Any]] = {}

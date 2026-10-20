@@ -22,6 +22,8 @@ PROMPT = (
     "Choose a small executable change within the fresh budget. Never invent results. "
     "Do not override evaluation, splits, paths, threads or seed. Python is only for feature "
     "transformers, fit(X) receives training features only. Never read files/network/targets. "
+    "parent_recipe contains fitted parameters, including actual Optuna choices. "
+    "Error deltas on one split are observations, not causal proof. "
     "The tool result is the measured fact. No final interpretation or review is required."
 )
 
@@ -56,7 +58,7 @@ def run_proposal_session(
                 "reserved_seconds": reserve_seconds(),
                 "tokens_remaining": max(0, budget.token_limit - budget.tokens_used),
             },
-            "previous_attempts": failures[-2:],
+            "previous_attempts": failures[-1:],
         }
         messages = [
             {"role": "system", "content": PROMPT},
@@ -96,14 +98,21 @@ def run_proposal_session(
         if not budget.can_search(clock.now(), reserve_seconds()):
             reason = "budget_exhausted"
             break
-        response = tools.execute(reply.tool_calls[0])
+        call = reply.tool_calls[0]
+        response = tools.execute(call)
         report = response.get("result")
         if isinstance(report, dict) and "id" in report:
             reports.append(report)
         if response.get("ok") and report and report.get("status") == "succeeded":
             reason = "experiment_completed"
             break
-        failures.append(response)
+        try:
+            requested_proposal = json.loads(call.arguments)
+        except ValueError:
+            requested_proposal = call.arguments
+        failures.append(
+            {**response, "tool_name": call.name, "requested_proposal": requested_proposal}
+        )
     return SessionResult(
         reason,
         "",

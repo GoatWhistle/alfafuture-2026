@@ -93,6 +93,8 @@ class ProposalTools:
                         "python_transform exports build_transformer() with fit(X), transform(X); "
                         "Return DataFrame, stable index/order/schema. No files/network/targets. "
                         "tune=true: 2 train-only Optuna trials, 30s; no transforms with tuning. "
+                        "Optuna varies learning_rate .02...2 and CatBoost depth 3..7 "
+                        "or LightGBM num_leaves 7..31; other parameters stay fixed. "
                         "Harness owns seed, threads, objectives, metric, paths and splits."
                     ),
                     "parameters": ProposalArguments.model_json_schema(),
@@ -121,7 +123,7 @@ class ProposalTools:
             parent = next(
                 r for r in self.workspace.read_experiments() if r["id"] == proposal.parent_id
             )
-            parent_recipe = parent.get("resolved_spec")
+            parent_recipe = parent.get("executed_recipe") or parent.get("resolved_spec")
             if parent_recipe is None and parent["backend"] not in ("catboost", "lightgbm"):
                 parent_recipe = {
                     "backend": parent["backend"],
