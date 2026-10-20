@@ -26,10 +26,10 @@ export function ExperimentDrawer({ run, exp, onClose }: { run: Run; exp: Experim
     <Modal title={`Эксперимент ${exp.id}`} onClose={onClose} side>
       <header className="drawer-head">
         <div>
-          <h2>Эксперимент {exp.id}</h2>
+          <h2>{exp.kind === "llm_request" ? "Запрос к Qwen" : `Эксперимент ${exp.id}`}</h2>
           <div className="row">
             <ExpBadge status={exp.status} />
-            <span className="tag">{exp.level === "full" ? "full" : "smoke"}</span>
+            <span className="tag">{exp.kind === "llm_request" ? "запрос Qwen" : exp.level}</span>
             <span className="tag">{exp.backend}</span>
           </div>
         </div>
@@ -58,7 +58,7 @@ export function ExperimentDrawer({ run, exp, onClose }: { run: Run; exp: Experim
           </div>
         </dl>
 
-        {exp.level === "smoke" && (
+        {exp.level === "smoke" && exp.kind !== "llm_request" && (
           <p className="note">Smoke-проверка: метрика не сравнивается с полной validation.</p>
         )}
 

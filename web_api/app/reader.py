@@ -91,6 +91,17 @@ def _read_code(path: Any, base: Path) -> str | None:
         return None
 
 
+def _changes(recipe: dict[str, Any]) -> list[str]:
+    out = []
+    for t in recipe.get("transforms") or []:
+        if isinstance(t, dict):
+            columns = ", ".join(str(c) for c in t.get("columns") or [])
+            out.append(f"{t.get('operation', '?')}: {columns}")
+    if recipe.get("python_transform"):
+        out.append("python_transform: build_transformer()")
+    return out
+
+
 def _status(report: dict[str, Any]) -> str:
     state = str(report.get("status", ""))
     if state == "running":
@@ -129,8 +140,25 @@ def experiments(
         score = scores[identifier]
         delta = None if score is None or parent_score is None else score - parent_score
         status = _status(r)
-        executed = _params(r.get("parameters"))
-        requested = _params(r.get("requested_parameters") or r.get("parameters"))
+        proposal = (
+            r.get("requested_proposal") if isinstance(r.get("requested_proposal"), dict) else {}
+        )
+        recipe = r.get("executed_recipe") if isinstance(r.get("executed_recipe"), dict) else {}
+        admission = r.get("admission") if isinstance(r.get("admission"), dict) else {}
+        refit = r.get("refit_parameters") if isinstance(r.get("refit_parameters"), dict) else {}
+        # Optuna: найденные параметры сохраняются для refit, служебные ключи не показываем
+        refit = {k: v for k, v in refit.items() if k not in ("backend", "tuning")}
+        executed = _params(recipe.get("parameters") or refit or r.get("parameters"))
+        requested = _params(
+            proposal.get("parameters") or r.get("requested_parameters") or r.get("parameters")
+        )
+        if proposal.get("tune"):
+            requested["tune"] = True
+        if recipe.get("tuning"):
+            executed["tune"] = True
+        changes = _changes(recipe or proposal) or [str(c) for c in r.get("feature_changes") or []]
+        if admission.get("allowed") is False:
+            status = "rejected"
         if status == "ok" and score is not None:
             measured = f"{metric} {_fmt(score, metric)}"
             if delta is not None:
@@ -138,33 +166,107 @@ def experiments(
                 measured += f": {sign}{_fmt(abs(delta), metric)} к родителю"
         elif status == "running":
             measured = "Выполняется…"
+        elif status == "rejected" and "estimated_full_seconds" in admission:
+            measured = (
+                f"Отклонено по ресурсам: прогноз {admission['estimated_full_seconds']:.0f} с, "
+                f"доступно {admission.get('available_seconds', 0):.0f} с. Параметры не уменьшались."
+            )
         else:
             measured = str(r.get("error") or "Результата нет.")
+        executed_text = (
+            ", ".join(f"{k} {v}" for k, v in executed.items()) or "Параметры по умолчанию"
+        )
+        if status == "rejected":
+            executed_text = "Не запускалось: отклонено до обучения."
+        code = recipe.get("python_transform") or _read_code(r.get("code_path"), base)
         rows.append(
             {
                 "id": identifier,
                 "parentId": None if parent is None else str(parent),
                 "level": "full" if r.get("level", "full") == "full" else "smoke",
                 "status": status,
-                "observed": _text(r.get("target_error") or r.get("observed")),
-                "proposed": _text(r.get("hypothesis")),
-                "executed": ", ".join(f"{k} {v}" for k, v in executed.items())
-                or "Параметры по умолчанию",
+                "observed": _text(
+                    proposal.get("target_error") or r.get("target_error") or r.get("observed")
+                ),
+                "proposed": _text(proposal.get("rationale") or r.get("hypothesis")),
+                "executed": executed_text,
                 "measured": measured,
                 "proposedParams": requested,
                 "executedParams": executed,
-                "featureChanges": [str(c) for c in r.get("feature_changes") or []],
+                "featureChanges": changes,
                 "score": score,
                 "delta": delta,
                 "durationSec": r.get("elapsed_seconds")
                 if isinstance(r.get("elapsed_seconds"), int | float)
                 else None,
                 "error": r.get("error") if isinstance(r.get("error"), str) else None,
-                "code": _read_code(r.get("code_path"), base),
+                "code": code if isinstance(code, str) and code else None,
                 "backend": str(r.get("backend", "")),
+                "kind": "experiment",
+            }
+        )
+    rows.extend(_failed_sessions(events))
+    return rows
+
+
+_SESSION_OK = {"completed", "experiment_completed", "success", "succeeded", "budget_exhausted"}
+
+
+def _failed_sessions(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """LLM sessions that failed before any experiment: the error belongs to that attempt."""
+    rows = []
+    for event in events:
+        if event.get("kind") != "session_finished":
+            continue
+        session = event["payload"]
+        reason = str(session.get("reason") or "")
+        if reason in _SESSION_OK or session.get("experiment_ids"):
+            continue
+        detail = session.get("error_detail")
+        rows.append(
+            {
+                "id": "qwen-" + str(session.get("id", ""))[:8],
+                "parentId": None,
+                "level": "full",
+                "status": "failed",
+                "observed": "—",
+                "proposed": "Предложение не получено.",
+                "executed": "Эксперимент не запускался.",
+                "measured": f"Сессия Qwen завершилась: {reason or 'ошибка'}.",
+                "proposedParams": {},
+                "executedParams": {},
+                "featureChanges": [],
+                "score": None,
+                "delta": None,
+                "durationSec": None,
+                "error": str(detail) if detail else reason or None,
+                "code": None,
+                "backend": "qwen",
+                "kind": "llm_request",
             }
         )
     return rows
+
+
+def _selected(research: dict[str, Any], metric: str) -> dict[str, Any] | None:
+    """Score of the finalist written to the CSV, only if measured as full on this metric."""
+    final = research.get("finalization")
+    if not isinstance(final, dict):
+        return None
+    chosen = final.get("selected") or research.get("selected")
+    for item in final.get("finalists") or []:
+        if not isinstance(item, dict) or item.get("id") != chosen:
+            continue
+        score = item.get("score")
+        if (
+            isinstance(score, dict)
+            and score.get("level") == "full"
+            and score.get("metric") == metric
+        ):
+            value = _score(item, "score")
+            if value is not None:
+                return {"id": str(chosen), "score": value}
+    return None
 
 
 def stage_of(harness: Path) -> str:
@@ -202,6 +304,10 @@ def run_facts(run_dir: Path) -> dict[str, Any]:
                 best = row["score"]
     research = summary.get("research") if isinstance(summary, dict) else None
     research = research if isinstance(research, dict) else {}
+    selected = _selected(research, metric)
+    if selected is not None:
+        # В итоговый CSV входит выбранный финалист; показываем его измеренную метрику
+        best = selected["score"]
     tokens = research.get("tokens_used")
     if not isinstance(tokens, int):
         tokens = int(budget.get("preparation_tokens", 0)) if isinstance(budget, dict) else 0
@@ -221,6 +327,7 @@ def run_facts(run_dir: Path) -> dict[str, Any]:
         "tokensUncertain": bool(uncertain),
         "submission": Path(submission) if isinstance(submission, str) else None,
         "researchStatus": research.get("status"),
+        "selected": selected,
         "hasSummary": bool(summary),
     }
 

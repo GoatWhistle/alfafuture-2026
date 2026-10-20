@@ -78,8 +78,17 @@ class Service:
             note = "Запуск прерван пользователем. Существующий CSV сохранён."
         elif status == "failed":
             note = "Процесс завершился с ошибкой. Журнал сохранён, существующий CSV доступен."
-        elif status == "completed" and facts["researchStatus"] not in (None, "completed"):
-            note = f"Поиск завершён со статусом «{facts['researchStatus']}»; итоговый CSV сохранён."
+        elif status == "completed":
+            parts = []
+            if facts["researchStatus"] not in (None, "completed"):
+                parts.append(f"Поиск завершён со статусом «{facts['researchStatus']}».")
+            if facts["selected"]:
+                chosen = facts["selected"]
+                parts.append(
+                    f"В итоговый CSV вошёл {chosen['id']} "
+                    f"({facts['metric']} {chosen['score']:.4f} на полной validation)."
+                )
+            note = " ".join(parts) or None
         return {
             "id": run_id,
             "title": meta["title"],

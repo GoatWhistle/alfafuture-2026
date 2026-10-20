@@ -190,6 +190,7 @@ const qwenFail = base("demo-qwenfail", "Скоринг заявок на кре�
       proposed: "Предложение не получено.",
       executed: "Эксперимент не запускался.",
       measured: "Нет измерений. Usage последнего запроса неизвестен — учтён консервативно.",
+      kind: "llm_request",
       error: "LLM API: 503 Service Unavailable после 3 попыток (задержки 2, 4, 8 с).",
     }),
   ],

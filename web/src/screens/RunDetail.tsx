@@ -37,7 +37,7 @@ export function RunDetail() {
 
   const exp = run.experiments.find((e) => e.id === selected) ?? null;
   const delta = run.best !== null && run.baseline !== null ? run.best - run.baseline : null;
-  const fullDone = run.experiments.filter((e) => e.level === "full" && e.status !== "running").length;
+  const fullDone = run.experiments.filter((e) => e.level === "full" && e.kind !== "llm_request" && e.status !== "running").length;
   const play = source.playback?.get(run.id) ?? null;
 
   const download = async (kind: DownloadKind) => {
@@ -150,9 +150,9 @@ export function RunDetail() {
               <li key={e.id}>
                 <button className="feed-item" onClick={() => setSelected(e.id)}>
                   <div className="feed-top">
-                    <strong>Эксперимент {e.id}</strong>
+                    <strong>{e.kind === "llm_request" ? "Запрос к Qwen" : `Эксперимент ${e.id}`}</strong>
                     <ExpBadge status={e.status} />
-                    <span className="tag">{e.level}</span>
+                    <span className="tag">{e.kind === "llm_request" ? "запрос Qwen" : e.level}</span>
                     <span className="feed-score">
                       {e.score !== null && <>{fmtScore(e.score, run.metric)} </>}
                       {e.delta !== null && <span className={`tone-${deltaTone(run.direction, e.delta)}`}>{fmtDelta(e.delta, run.metric)}</span>}

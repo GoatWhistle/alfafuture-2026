@@ -30,6 +30,8 @@ export interface Experiment {
   error: string | null;
   code: string | null;
   backend: string;
+  /** llm_request — запрос к Qwen, завершившийся ошибкой до запуска эксперимента */
+  kind?: "experiment" | "llm_request";
 }
 
 export interface Budget {
