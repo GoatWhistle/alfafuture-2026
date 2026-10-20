@@ -118,3 +118,14 @@ smoke остановлены 503. После согласования forced too
 в 980cb43 добавлены измеренные baseline timings и worker/smoke limits в контекст.
 Новый gate-v2 начат на frozen runtime 980cb43 после make check, 619 offline-тестов
 в macOS/Linux и повторной Linux-проверки ZIP. Сравнение остаётся 0/18.
+
+Gate-v2 завершён и не принят по содержанию интерпретаций, несмотря на два
+реальных changed full и корректные CSV/refit. 895708f исправил ложный счётчик
+baseline-prefix у verifier. 1ede55d добавил диагностический scope/агрегаты,
+backend родителя, корректные counts и bounded review интерпретации той же Qwen.
+624 offline-теста прошли в macOS/Linux, ZIP перепроверен в Linux без сети.
+Smoke-v5 принят с реальным review и проверенным frozen-refit CSV. Gate-v3
+выполняется на 1ede55d; процесс искать через runs/nightly/ACTIVE.json и
+подтверждать живость handle/PID. Все три диагностических раунда исчерпаны;
+дополнительные API probes за ночь не запускать. Сравнение ещё 0/18, разрешено
+только после ручной приёмки обеих задач нового gate.

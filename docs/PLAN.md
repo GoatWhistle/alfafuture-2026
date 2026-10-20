@@ -362,3 +362,25 @@ Linux на 980cb43 — 619 passed / 1 live deselected (84.88 s), без сети
 побайтово сопоставлен с исходниками, распакованный entrypoint в Linux без сети
 прошёл regression/diabetes с валидными CSV и refit. Новый gate-v2 начат
 на обеих публичных задачах с прежними лимитами. Старый gate не переносится.
+
+Gate-v2 на 980cb43 завершён: оба Qwen-кандидата действительно прошли full и
+CSV/refit проверены, но ручная приёмка не пройдена. Regression: full RMSE
+42.0071741965 против 42.1966696526; summary ошибочно называет smoothed group means
+leave-one-out. Classification: macro-F1 0.5944175769 против 0.5652431446;
+summary ошибочно обобщает падение precision на все классы (3/10 выросли).
+Control scores не просматривались. Verifier дополнительно дал ложный changed=0
+из-за ID baseline-catboost-sqrtbalanced; 895708f исправляет счётчик по provenance,
+не переписывая старый report и не перенося его на новые исходники.
+
+Третий и последний диагностический раунд — 12 последовательных replay без ML,
+33 079 reported/charged tokens. 1ede55d добавляет scope и полные агрегаты
+class metrics, backend родителя, исправляет omission counts и требует review
+черновика той же Qwen в существующем бюджете; неподтверждённый draft не завершает
+сессию. make check; macOS/Linux offline — 624 passed / 1 live deselected
+(83.46 / 90.22 s). ZIP 56 файлов, SHA-256
+c94ac43b5a0f5cce8b48e258409c4b45aeed6c70aeaee608b23edae89c443192,
+Linux без сети: regression/diabetes, валидные CSV и refit.
+Новый smoke-v5 принят: changed full RMSE 60.1943223042 против 62.4779271142,
+review завершён, 88 строк frozen-refit CSV, 6 запросов / 17 208 tokens.
+Gate-v3 на frozen runtime 1ede55d запущен на обеих публичных задачах. Матрица
+остаётся 0/18 до ручной приёмки обоих запусков; старые gate не заменяют новый.

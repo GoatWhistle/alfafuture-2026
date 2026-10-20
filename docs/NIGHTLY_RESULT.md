@@ -1,149 +1,150 @@
 # Ночная стабилизация Qwen: фактический результат
 
-Промежуточный отчёт, работа продолжается в `fix/qwen-live-cycle` одним агентом.
-Короткий измеренный цикл принят. Первый публичный gate не принят, второй выполняется; сравнение с Optuna
-ещё не разрешено. Польза агента пока не измерена.
+Промежуточный отчёт: работа продолжается одним агентом в fix/qwen-live-cycle.
+Короткий измеренный цикл принят, включая новый review интерпретации.
+Два публичных gate не приняты; gate-v3 выполняется. Сравнение — 0/18,
+польза Qwen относительно Optuna ещё не измерена.
 
-## 503 и некорректные tool calls
+## 503 и контракт tools
 
-503 воспроизводятся примерно за 60–66 s, с `capacity_unavailable`. Снятие
-forced tool_choice не устраняет сбой. Серверные capacity, timeout и routing
-без телеметрии endpoint не разделены; перегрузка не доказана.
+503 воспроизводились примерно за 60–66 s с capacity_unavailable. Снятие forced
+tool_choice не устранило сбой. Capacity, внутренний timeout и routing без
+телеметрии endpoint не разделены; перегрузка не доказана. Alias — qwen3.8-flash;
+реальное семейство/размер за alias не установлены. Использован только выданный endpoint.
 
-Первый раунд (`runs/nightly/provider-round1`): 12 последовательных HTTP-попыток,
-SDK retries выключены. Исходный payload smoke-v6 в ABBA forced/auto/auto/forced
-дал 503, 503, HTTP 200 с inspect_data, HTTP 200 с inspect_data; разрешён только
-edit_file. Аргументы этих inspect_data также невалидны. Короткие messages
-с прежними tools/max_tokens дали два валидных edit_file. Замена только system
+Раунд 1: одинаковый payload smoke-v6 в ABBA forced/auto/auto/forced дал
+503, 503, HTTP 200 с inspect_data, HTTP 200 с inspect_data, хотя разрешён только
+edit_file. Аргументы inspect_data тоже невалидны. Короткие messages с прежними
+tools/max_tokens дали валидный edit_file в обоих режимах. Замена только system
 prompt и удаление только повторных страниц дали по два 503. Исходные messages/tools
-с max_tokens=1536 вместо 4096 дали два валидных edit_file, но позднейшие smoke
+с max_tokens=1536 вместо 4096 дали два валидных edit_file, но последующие smoke
 подтвердили, что уменьшение output cap не гарантирует устранения 503.
 
-Второй раунд (`runs/nightly/provider-round2`): 8 HTTP-попыток на payload smoke-v3.
-Четыре default forced/auto/auto/forced дали 503. С enable_thinking=False
-forced/auto дали валидный edit_file. В обратной паре default тоже восстановился,
-а false снова успешен. Итого false — 3/3 валидных ответа; это не доказывает,
-что все 503 вызваны thinking. Реальное семейство за alias qwen3.8-flash не установлено.
-
+Раунд 2: четыре default forced/auto/auto/forced на payload smoke-v3 дали 503.
+С enable_thinking=False forced/auto дали валидный edit_file. В обратной паре
+default тоже восстановился, а false снова успешен. False — 3/3 валидных ответа;
+это не доказывает, что все 503 вызваны thinking.
 [Документация Qwen](https://docs.qwencloud.com/developer-guides/tool-calling/function-calling)
 предписывает отключать thinking перед forced выбором функции. Исправление
-применено только для единственной принудительно выбранной функции; в трассе
-сохраняются tool_choice и enable_thinking. Корректность tools дополнительно
-проверяется в application до исполнения, независимо от поведения endpoint.
+применено только для единственной принудительно выбранной функции, оба параметра
+сохраняются в трассе. Application дополнительно отклоняет tools вне текущей схемы.
+
+Раунд 3: replay интерпретаций без ML. И исходный запрос, и код без annotations
+иногда отвечают верно: единственная причина ошибок не выделена, AST-переписывание
+в runtime не добавлено. Явный охват диагностики и проверка ошибочного черновика
+той же Qwen исправляли основные ложные утверждения. Выявлены также stale omission
+counts и отсутствующий backend родителя. Replay не заменяет приёмку harness.
 
 | Диагностика | HTTP-попытки | Reported tokens | Консервативно учтено |
 |---|---:|---:|---:|
 | Раунд 1 | 12 | 13 740 | 91 070 |
 | Раунд 2 | 8 | 10 667 | 52 747 |
+| Раунд 3 | 12 | 33 079 | 33 079 |
 
-Учёт отделён от исследовательских запусков: accounting.json в каждом каталоге.
-Для ответов без usage использована верхняя граница UTF-8 prompt bytes + запас +
-max_tokens. Точный биллинг не подтверждён. Некоторые ответы сообщают 1–2 output
-tokens и полностью cached prompt при нескольких аргументах tools; эти значения
-сохранены как reported, а не как доказанный полный расход. Ключи, полные payload,
-ответы и логи остаются в игнорируемом runs/; в Git не включены.
+Итого 32 HTTP-попытки, 57 486 reported tokens, консервативно 176 896.
+Все три диагностических раунда завершены; дополнительных API probes за ночь нет.
+Учёт отделён от исследовательских запусков: runs/nightly/provider-round{1,2,3}/accounting.json.
+Для ответов без usage резерв: UTF-8 prompt bytes + запас + max_tokens.
+Точный биллинг не подтверждён; некоторые ответы сообщают 1–2 output tokens и
+полностью cached prompt при нескольких аргументах tools. Это reported counters,
+не доказательство полного расхода. Ключи, данные, полные payload/ответы и логи
+остаются локально в игнорируемом runs/, в Git не включены.
 
-## Изменения
+## Проверенные изменения
 
-Все коммиты отправлены в origin/fix/qwen-live-cycle от настроенного Git-пользователя,
-без соавторства и переписывания истории.
+Коммиты отправлены в origin/fix/qwen-live-cycle от настроенного Git-пользователя,
+без соавторства и переписывания истории. Merge и конкурсная отправка не выполнялись.
 
 | Commit | Изменение |
 |---|---|
-| d46c7c6 | Инструменты вне схемы текущего запроса отклоняются до executor; ошибка возвращается модели, фаза и расход сохраняются. |
-| a40d167 | Bounded generation ограничена 1536 tokens; action-фазы получают system prompt без стартовой навигации. Запуск и интерпретация обязаны сверять гипотезу с исполняемым candidate_code. |
-| 8319ce9 | Thinking отключён для forced tool choice; параметры выбора и режима сохраняются в API-трассе. |
-| 272fab3 | Ограниченная строка исключения stderr и failure_phase доступны модели; failed-кандидат возвращает её в edit_file для исправления. |
-| 980cb43 | В контекст Qwen передаются измеренные baseline validation/refit seconds, worker/smoke timeout и число потоков. |
+| d46c7c6 | Tools вне схемы запроса отклоняются до executor; ошибка возвращается модели, фаза/расход сохраняются. |
+| a40d167 | Bounded generation до 1536 tokens, отдельный system prompt action-фаз, сверка гипотезы с исполняемым кодом. |
+| 8319ce9 | Non-thinking для forced tool choice; параметры режима/выбора записываются в трассу. |
+| 272fab3 | Ограниченная строка worker exception и failure_phase доступны Qwen; failed-кандидат возвращает её в edit_file. |
+| 980cb43 | В контексте доступны measured baseline validation/refit seconds, worker/smoke timeout и потоки. |
+| 895708f | Verifier отличает эксперименты по hypothesis_source, а не префиксу baseline в ID. |
+| 1ede55d | Полный охват/счётчики изменений по классам, backend родителя, корректные class/feature counts; review черновика той же Qwen до model_finished в прежнем бюджете. |
 
-Регрессии сначала воспроизвели нарушения на реальных границах SDK/session,
-затем прошли после исправлений. Scripted-тесты не считаются live-приёмкой.
+Регрессии воспроизвели дефекты на границах SDK/session/worker/verifier, затем прошли.
+Незавершённый review не считается принятой интерпретацией; draft/code/measurement
+сохраняются при compaction. Scripted-тесты не считаются live-приёмкой.
 
-## Реальные короткие запуски
+## Короткие реальные запуски
 
-Каждая diabetes скопирована через verification.verify_archive.copy_task:
-только условие и четыре входных файла. Holdout targets не переданы и не открывались.
+Diabetes в каждом запуске скопирована через verification.verify_archive.copy_task:
+условие и четыре входных файла. Holdout targets не переданы и не открывались.
 
 | Каталог в runs/nightly | Результат |
 |---|---|
-| smoke-v1 | Изменённый full-кандидат: RMSE 62.4347247663 против 62.4779271142. CSV/refit проверены, но интерпретация приписала результат отсутствующим параметрам. Семантический отказ, несмотря на interpreted_successes=1 у verifier. 7 API-попыток без 503, 24 334 reported/charged tokens; затем budget_exhausted. |
-| smoke-v2 | API error на edit_file после двух 503. Изменённых full-результатов нет; baseline CSV/refit проверены. |
-| smoke-v3 | API error на edit_file после двух 503, несмотря на отдельный system prompt фазы. Изменённых full-результатов нет; baseline CSV/refit проверены. |
-| smoke-v4 | Принят: Qwen написала CatBoost depth=4, lr=0.03, l2=9, iterations=600; full RMSE 60.1898931077 против 62.4779271142. Гипотеза и интерпретация соответствуют коду/метрике, есть оговорка об одном split. verify_run подтвердил 88 строк CSV и совпадение с выбранным refit. 5 API-попыток, 14 606 reported/charged tokens, usage_known=true, без tool errors/503. |
+| smoke-v1 | Changed full: RMSE 62.4347247663 против 62.4779271142, refit CSV проверен. Семантический отказ: объяснение приписало результат отсутствующим параметрам. 7 API-попыток без 503, 24 334 reported/charged tokens; затем budget_exhausted. |
+| smoke-v2 | Два 503 на edit_file; changed=0, interpreted=0. Baseline CSV/refit проверены. |
+| smoke-v3 | Два 503 на edit_file, несмотря на отдельный system prompt; changed=0, interpreted=0. Baseline CSV/refit проверены. |
+| smoke-v4 | Принят на 8319ce9: CatBoost depth=4/lr=0.03/l2=9/600 итераций; full RMSE 60.1898931077 против 62.4779271142, корректная интерпретация и 88 строк refit CSV. 5 запросов, 14 606 reported/charged tokens, без ошибок. |
+| smoke-v5 | Принят на 1ede55d: источник задаёт CatBoost 400/d4/lr0.05/l2=5 и Optuna 8 trials/40 s. Full RMSE 60.1943223042 против 62.4779271142. Отдельный review завершён, scope диагностики соблюдён; 88 строк CSV совпадают с выбранным frozen refit. 6 API-попыток, 17 208 reported/charged tokens, без tool errors/503. |
 
-В каталогах сохранены verification.json; в smoke-v1 и smoke-v4 дополнительно
-semantic-review.json. Последний smoke подтверждает инженерный цикл, а не
-переносимость выигрыша на скрытый тест или пользу относительно Optuna.
+В smoke-v5 Optuna выбрала depth=3/lr=0.0286449874; стартовые значения в коде
+не выдаются за фиксированные параметры обученного победителя. Числовой поиск
+выполняла Optuna. verification.json, semantic-review.json и source-hashes.json
+сохранены в каталоге запуска. Это инженерная приёмка цикла, не измерение пользы.
 
-## Проверки и ZIP
+## Проверки и ZIP последнего runtime
 
-- Последний runtime 980cb43: make check успешен; SDK-тесты проверяют тело/трассу,
-  integration-регрессия — настоящий worker failure и исправление в той же сессии.
-- Полный macOS offline-прогон: 619 passed, 1 live deselected, 82.42 s;
-  runs/nightly/offline-tests-v6.log.
-- Полный Linux offline-прогон 980cb43: 619 passed, 1 live deselected, 84.88 s,
-  network=none, 2 CPU / 6 GiB; runs/nightly/linux-offline-v4/pytest.log.
-- ZIP последнего runtime: 56 файлов, побайтовое совпадение с исходниками;
-  SHA-256 286f31b3ebb10e21ebac900710619b90b0ea52a4dcb279e71e20ed59bf7024fb.
-- Распакованный entrypoint 980cb43 проверен в Linux вне checkout, без сети,
+- make check успешен; полный macOS offline — 624 passed, 1 live deselected,
+  83.46 s; runs/nightly/offline-tests-v7.log.
+- Полный Linux offline на 1ede55d — 624 passed, 1 live deselected, 90.22 s,
+  network=none, 2 CPU / 6 GiB; runs/nightly/linux-offline-v5/pytest.log.
+- ZIP: 56 файлов, побайтовое совпадение с исходниками; SHA-256
+  c94ac43b5a0f5cce8b48e258409c4b45aeed6c70aeaee608b23edae89c443192.
+- Распакованный entrypoint 1ede55d проверен в Linux вне checkout, без сети,
   Python 3.12.12, 4 CPU / 6 GiB: regression 22 449 строк, diabetes 88,
-  оба exit=0, валидный CSV, успешный refit. runs/nightly/linux-archive-v4/report.json.
-  Это режим search-mode=none, не Qwen gate. Посторонние контейнеры не останавливались.
+  оба exit=0, валидный CSV и успешный refit. runs/nightly/linux-archive-v5/report.json.
+  Это search-mode=none, не Qwen gate. Посторонние контейнеры не останавливались.
 
-Предыдущие проверки и артефакты сохранены; первый технический запуск вспомогательного
-archive-скрипта остановился до harness из-за PYTHONPATH, повтор исправлен.
+Предыдущие проверки/артефакты сохранены. Первый технический запуск вспомогательного
+archive-скрипта остановился до harness из-за PYTHONPATH; повтор исправлен.
 Точная среда 8 CPU / 32 GB остаётся непроверенной.
 
-## Публичный gate и сравнение
+## Публичные задачи
 
-Серия runs/nightly/gate-v1 завершена на зафиксированном runtime 8319ce9:
-regression и classification, seed 42, Qwen, до трёх сессий. Runtime и verification
-во время серии не меняются. Требуется ручная проверка содержания отчёта и
-интерпретации, одного gate_passed недостаточно.
-
-| Публичная задача | Приёмка |
+| Серия / задача | Приёмка |
 |---|---|
-| regression | Не принята: changed=0, interpreted=0, budget_exhausted; CSV/refit проверены (22 449 строк), wall=101.6 s. |
-| classification | Не принята: changed=0, interpreted=0, budget_exhausted; CSV/refit проверены (41 166 строк), wall=552.7 s. |
+| gate-v1 / regression | Не принята: changed=0, worker exception недоступен модели; 101.6 s. CSV/refit проверены, 22 449 строк. |
+| gate-v1 / classification | Не принята: changed=0, worker exception недоступен модели; 552.7 s. CSV/refit проверены, 41 166 строк. |
+| gate-v2 / regression | Не принята: changed full есть (RMSE 42.0071741965 против 42.1966696526), но интерпретация ошибочно утверждает LOO вместо smoothed group means. 139.0 s, CSV/refit проверены. |
+| gate-v2 / classification | Не принята: changed full есть (macro-F1 0.5944175769 против 0.5652431446), но интерпретация заявляет падение precision во всех классах; в 3/10 он вырос. 756.4 s, CSV/refit проверены. |
+| gate-v3 / regression | Выполняется на frozen runtime 1ede55d. |
+| gate-v3 / classification | Ожидает последовательного запуска. |
 
-Оба процесса exit=0; report.json gate_passed=false и acceptance-review.json
-сохранены. Control scores при диагностике не просматривались. Причины:
-LightGBM early_stopping_rounds без eval set и CatBoost class_weights="Balanced".
-Модель получала лишь generic worker exit, а stderr был недоступен через tools.
-Исправлена общая граница (272fab3): ограниченная последняя строка stderr в error,
-сохранение failure_phase и переход к edit_file после неуспешного эксперимента.
-Регрессия с настоящим LightGBM/worker сначала упала, затем исправила кандидата
-в той же ReAct-сессии и завершила full за 2.49 s. Полный macOS offline-прогон 272fab3 — 619 passed (81.85 s); Linux — 619 passed
-(86.41 s), оба с 1 live deselected. В 980cb43 дополнительно переданы measured
-baseline timings и worker/smoke limits: реальный baseline classification
-занял 93.6/120.1 s, а Qwen предложила 3000 итераций. Проверка выявила отсутствие
-этих полей на границе entrypoint → model, затем прошла. make check и полный
-macOS offline 980cb43 — 619 passed / 1 live deselected (82.42 s).
-Последние Linux/ZIP проверки успешны (см. выше).
-На frozen runtime 980cb43 выполняется новый gate-v2 на обеих задачах.
-Regression выполняется; classification ожидает последовательного запуска.
-Исходники runtime/verification не меняются; после окончания необходимо
-проверить содержание report, код кандидатов и интерпретации.
+У gate-v2 автоматический changed=0 для classification оказался ложным отказом:
+ID baseline-catboost-sqrtbalanced был исключён по префиксу. Исправленный verifier
+подтвердил по одному changed full на обеих задачах; counter-audit.json сохранён
+отдельно. Оригинальный report не переписан, post-hoc replay не подставлен вместо
+исходных summary. Из-за семантических отказов и изменения исходников старые gate
+не допускают сравнение. Control scores для исправлений не просматривались.
 
-Сравнение — 0/18, ещё не запущено. Измеренного эффекта Qwen против Optuna нет.
-Полная матрица разрешена только после приёмки обеих публичных задач на этих исходниках;
-diabetes holdout открывается verifier только после полного cohort. Control/holdout
-не используются для выбора новых runtime-изменений.
+Gate-v3 запущен после проверок и smoke-v5: обе заданные публичные задачи,
+seed 42, до трёх сессий, прежние ceilings. Runtime и verification во время серии
+не меняются. Требуется проверка содержимого отчёта, кода, интерпретации и refit CSV,
+а не только gate_passed. Локатор процесса — runs/nightly/ACTIVE.json;
+живость подтверждать tool handle или PID/create_time, а не одним файлом статуса.
 
-## Открытые пункты и следующий шаг
+## Сравнение и следующий шаг
 
-1. Дождаться текущего gate-v2 через runner.log/manifest/session и проверить
-   обе задачи: изменение кода, full, корректная интерпретация, refit CSV.
-   Живой процесс не перезапускать из-за таймаута наблюдения.
-2. После приёмки выполнить 18 запусков с параметрами PLAN через:
+Матрица — 0/18, не начата. Измеренного эффекта Qwen против Optuna нет.
+Диабетический holdout verifier открывает только после полного cohort.
+
+1. Дождаться текущего gate-v3; не перезапускать живой процесс из-за таймаута
+   наблюдения. Вручную принять обе публичные задачи на текущих исходниках.
+2. Только после этого выполнить:
 
 ```sh
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
 uv run --locked --all-extras python -m verification.run_agent_comparison \
   data/regression/task.md data/classification/task.md runs/stage7/tasks/diabetes/task.md \
-  --gate-report runs/nightly/gate-v2/report.json --output runs/nightly/comparison-v1
+  --gate-report runs/nightly/gate-v3/report.json --output runs/nightly/comparison-v1
 ```
 
-3. Записать фактические парные эффекты и оставшиеся отказы; отрицательный результат
-   допустим. После просмотра final control/holdout новые изменения не подбирать.
-   Merge в main и конкурсная отправка не выполнялись и не входят в эту работу.
+3. Сохранить все 18 попыток и парные эффекты по трём seed, обновить этот отчёт
+   фактами; отрицательный эффект допустим. После просмотра final control/holdout
+   новые изменения не подбирать. Gate и сравнение остаются незавершёнными до
+   фактической проверки; готовность агента по этой записи не объявляется.
