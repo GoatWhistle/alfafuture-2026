@@ -66,7 +66,7 @@ def verify_run(directory: Path, task_path: Path, seed: int) -> dict[str, Any]:
     combined = combine_predictions(task.spec, saved["ids"], outputs, tuple(winner["weights"]))
     if saved["ids"] != combined["ids"] or not same(saved["predictions"], combined["predictions"]):
         raise ValueError("CSV differs from selected full-data refit predictions")
-    experiments = [r for r in research.get("reports", []) if not r["id"].startswith("baseline")]
+    experiments = [r for r in research.get("reports", []) if r.get("hypothesis_source")]
     changed = [
         r
         for r in experiments

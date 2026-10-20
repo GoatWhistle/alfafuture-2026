@@ -18,7 +18,7 @@ from ml_harness.domain.models import RunBudget
 
 
 class ScriptedModel:
-    def __init__(self, code):
+    def __init__(self, code, experiment_id="regularization"):
         self.replies = iter(
             [
                 ModelReply(
@@ -34,7 +34,7 @@ class ScriptedModel:
                             "run_experiment",
                             json.dumps(
                                 {
-                                    "experiment_id": "regularization",
+                                    "experiment_id": experiment_id,
                                     "hypothesis": "Shallower trees generalize",
                                     "expected_effect": "Lower RMSE",
                                     "parent_id": "baseline",
