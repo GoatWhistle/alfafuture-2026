@@ -384,3 +384,12 @@ Linux без сети: regression/diabetes, валидные CSV и refit.
 review завершён, 88 строк frozen-refit CSV, 6 запросов / 17 208 tokens.
 Gate-v3 на frozen runtime 1ede55d запущен на обеих публичных задачах. Матрица
 остаётся 0/18 до ручной приёмки обоих запусков; старые gate не заменяют новый.
+
+Gate-v3 regression: changed full и refit CSV подтверждены, 113.5 s, но summary
+ошибочно называет два LightGBM. Реальный frozen wrapper передаёт parameters={}
+в base_model при task kind=regression; factory default даёт CatBoostRegressor
+(проверено без fit, gate-v3/backend-probe.json). Метрика 44.5598818679 против
+42.1966696526 верна, интерпретация backend — нет. Classification текущей серии
+ещё выполняется, исходники не меняются. После terminal status нужно сохранить
+минимальный точный helper contract в run/interpretation compaction и новый gate;
+сравнение остаётся закрытым. Подробная точка продолжения — NIGHTLY_RESULT.md.

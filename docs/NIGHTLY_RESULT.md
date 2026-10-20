@@ -112,7 +112,7 @@ archive-скрипта остановился до harness из-за PYTHONPATH;
 | gate-v1 / classification | Не принята: changed=0, worker exception недоступен модели; 552.7 s. CSV/refit проверены, 41 166 строк. |
 | gate-v2 / regression | Не принята: changed full есть (RMSE 42.0071741965 против 42.1966696526), но интерпретация ошибочно утверждает LOO вместо smoothed group means. 139.0 s, CSV/refit проверены. |
 | gate-v2 / classification | Не принята: changed full есть (macro-F1 0.5944175769 против 0.5652431446), но интерпретация заявляет падение precision во всех классах; в 3/10 он вырос. 756.4 s, CSV/refit проверены. |
-| gate-v3 / regression | Выполняется на frozen runtime 1ede55d. |
+| gate-v3 / regression | Не принята по содержанию: changed=1, interpreted=1, CSV/refit проверены, 113.5 s. Summary утверждает два LightGBM, но wrapper вызывает base_model без backend и фактически создаёт два CatBoost. |
 | gate-v3 / classification | Ожидает последовательного запуска. |
 
 У gate-v2 автоматический changed=0 для classification оказался ложным отказом:
@@ -128,20 +128,34 @@ seed 42, до трёх сессий, прежние ceilings. Runtime и verific
 а не только gate_passed. Локатор процесса — runs/nightly/ACTIVE.json;
 живость подтверждать tool handle или PID/create_time, а не одним файлом статуса.
 
+После завершения серии требуется дополнительное исправление контракта фабрики:
+kind задаёт тип задачи, backend выбирается через options; default — CatBoost.
+Короткий контракт импортируемой base_model сейчас теряется в run/interpretation
+compaction. В gate-v3/backend-probe.json сохранена проверка реального frozen
+wrapper без fit: task kind=regression, parameters={}, backend=catboost,
+estimator=CatBoostRegressor. Это не API probe и не повторное ML-обучение.
+Числовая метрика 44.5598818679 против 42.1966696526 рассчитана корректно,
+но нельзя объявить протестированной LightGBM-гипотезу или приписать ухудшение
+только log-blend при одновременно другом backend. Classification ещё выполняется.
+Runtime/verification текущей серии не изменяются до её terminal status.
+
 ## Сравнение и следующий шаг
 
 Матрица — 0/18, не начата. Измеренного эффекта Qwen против Optuna нет.
 Диабетический holdout verifier открывает только после полного cohort.
 
-1. Дождаться текущего gate-v3; не перезапускать живой процесс из-за таймаута
-   наблюдения. Вручную принять обе публичные задачи на текущих исходниках.
+1. Дождаться terminal status текущего gate-v3 без перезапуска живого процесса.
+   Сохранить результат classification; regression уже имеет семантический отказ.
+   Затем передать точный минимальный контракт base_model (task kind vs backend,
+   default backend) в run/interpretation, проверить через вызывающий код,
+   зафиксировать и пройти новый gate-v4. Старые summary не исправлять post-hoc.
 2. Только после этого выполнить:
 
 ```sh
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
 uv run --locked --all-extras python -m verification.run_agent_comparison \
   data/regression/task.md data/classification/task.md runs/stage7/tasks/diabetes/task.md \
-  --gate-report runs/nightly/gate-v3/report.json --output runs/nightly/comparison-v1
+  --gate-report runs/nightly/gate-v4/report.json --output runs/nightly/comparison-v1
 ```
 
 3. Сохранить все 18 попыток и парные эффекты по трём seed, обновить этот отчёт
