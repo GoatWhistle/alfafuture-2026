@@ -404,3 +404,10 @@ offline — 625 passed / 1 live deselected (84.94 / 91.17 s). ZIP 56 файло�
 SHA-256 78ce1a505111793feb48b59d81e547a98d5c2b420b355b0f646e3c2e0fb8cc6f,
 перепроверен в Linux без сети на regression/diabetes с валидными CSV/refit.
 Gate-v4 на frozen bed869d запущен на обеих публичных задачах; сравнение 0/18.
+
+Gate-v4 завершён и не принят: regression api_error/503 (238.2 s),
+classification full timed_out и budget_exhausted (935.2 s), changed=0.
+После terminal status исправлено завышение резерва неудачным worker и
+классификация fallback как validation вместо refit. make check и macOS offline:
+628 passed / 1 live deselected (84.97 s). Следующий gate-v5 — после Linux/ZIP
+проверок, без переноса старых gate. Сравнение остаётся 0/18.

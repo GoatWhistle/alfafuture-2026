@@ -143,3 +143,10 @@ Gate-v3 завершён: classification принята, regression нет, по
 локатор — runs/nightly/ACTIVE.json. Дождаться её и вручную проверить обе задачи,
 затем только сравнение. Старые gate на этот код не переносятся; API probes за ночь
 больше не запускать, все три раунда использованы.
+
+Gate-v4 завершён и не принят: regression api_error/503 (238.2 s),
+classification full timed_out и budget_exhausted (935.2 s), changed=0.
+После terminal status исправлено завышение резерва неудачным worker и
+классификация fallback как validation вместо refit. make check и macOS offline:
+628 passed / 1 live deselected (84.97 s). Следующий gate-v5 — после Linux/ZIP
+проверок, без переноса старых gate. Сравнение остаётся 0/18.

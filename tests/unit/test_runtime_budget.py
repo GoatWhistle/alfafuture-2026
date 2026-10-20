@@ -47,7 +47,7 @@ def test_invalid_wallclock_budget(kwargs):
         WallClockBudget(**({"deadline": 100} | kwargs))
 
 
-@pytest.mark.parametrize("mode", ["validation", "control", "refit"])
+@pytest.mark.parametrize("mode", ["validation", "control", "refit", "fallback"])
 def test_runner_clamps_timeout_observes_and_never_launches_when_exhausted(mode):
     clock = Clock()
     budget = WallClockBudget(100)
@@ -62,7 +62,10 @@ def test_runner_clamps_timeout_observes_and_never_launches_when_exhausted(mode):
     request = SimpleNamespace(mode=mode)
     assert wrapped.run(request, 1000).status == ExperimentStatus.SUCCEEDED
     assert calls == [85]
-    assert getattr(budget, "refit_seconds" if mode == "refit" else "validation_seconds") == 5
+    assert (
+        getattr(budget, "refit_seconds" if mode in ("refit", "fallback") else "validation_seconds")
+        == 5
+    )
     assert budget.predict_seconds == 2
     clock.value = 100
     assert wrapped.run(request, 30).status == ExperimentStatus.TIMED_OUT
@@ -248,3 +251,31 @@ def test_dynamic_reserve_changes_stop_search_after_tool():
         reserve_seconds=lambda: reserve[0],
     )
     assert result.reason == "budget_exhausted" and len(calls) == 1
+
+
+@pytest.mark.parametrize("failure", [ExperimentStatus.TIMED_OUT, ExperimentStatus.FAILED])
+def test_failed_candidate_consumes_wall_time_without_inflating_finalist_reserve(failure):
+    clock = Clock()
+    budget = WallClockBudget(1800, validation_seconds=100, refit_seconds=100)
+    calls = []
+
+    def run(request, timeout):
+        calls.append(timeout)
+        elapsed = 300 if len(calls) == 1 else 100
+        clock.value += elapsed
+        return ExecutionResult(
+            failure if len(calls) == 1 else ExperimentStatus.SUCCEEDED,
+            elapsed,
+            None if len(calls) == 1 else {"predict_seconds": 1},
+        )
+
+    runner = BudgetedRunner(SimpleNamespace(run=run), clock, budget)
+    request = SimpleNamespace(mode="validation")
+    reserve = budget.reserve_seconds()
+    assert runner.run(request, 300).status == failure
+    assert clock.now() == 300
+    assert budget.reserve_seconds() == reserve
+    assert budget.available(clock.now()) == 1800 - 300 - reserve
+    assert runner.run(request, 300).status == ExperimentStatus.SUCCEEDED
+    assert clock.now() == 400 and calls == [300, 300]
+    assert budget.validation_seconds == 100

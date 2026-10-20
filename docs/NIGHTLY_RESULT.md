@@ -115,8 +115,8 @@ archive-скрипта остановился до harness из-за PYTHONPATH;
 | gate-v2 / classification | Не принята: changed full есть (macro-F1 0.5944175769 против 0.5652431446), но интерпретация заявляет падение precision во всех классах; в 3/10 он вырос. 756.4 s, CSV/refit проверены. |
 | gate-v3 / regression | Не принята по содержанию: changed=1, interpreted=1, CSV/refit проверены, 113.5 s. Summary утверждает два LightGBM, но wrapper вызывает base_model без backend и фактически создаёт два CatBoost. |
 | gate-v3 / classification | Принята на старом runtime: changed=1, interpreted=1, корректная интерпретация SqrtBalanced/scope, CSV/refit 41 166 строк; 1090.8 s. Второй кандидат timed_out на 300 s, сохранён. На новый код этот результат не переносится. |
-| gate-v4 / regression | Выполняется на frozen runtime bed869d. |
-| gate-v4 / classification | Ожидает последовательного запуска. |
+| gate-v4 / regression | Не принята: api_error после повторных 503 на edit_file; changed=0, 238.2 s. |
+| gate-v4 / classification | Не принята: catboost-balanced-w700d8 timed_out на full, changed=0, budget_exhausted; 935.2 s. |
 
 У gate-v2 автоматический changed=0 для classification оказался ложным отказом:
 ID baseline-catboost-sqrtbalanced был исключён по префиксу. Исправленный verifier
@@ -126,7 +126,7 @@ ID baseline-catboost-sqrtbalanced был исключён по префиксу.
 не допускают сравнение. Control scores для исправлений не просматривались.
 
 Gate-v3 завершён после проверок и smoke-v5; общий автоматический флаг true,
-но ручная приёмка серии false из-за regression. Текущий gate-v4: обе заданные публичные задачи,
+но ручная приёмка серии false из-за regression. Gate-v4 также завершён и не принят: обе заданные публичные задачи,
 seed 42, до трёх сессий, прежние ceilings. Runtime и verification во время серии
 не меняются. Требуется проверка содержимого отчёта, кода, интерпретации и refit CSV,
 а не только gate_passed. Локатор процесса — runs/nightly/ACTIVE.json;
@@ -144,14 +144,21 @@ estimator=CatBoostRegressor. Это не API probe и не повторное ML
 но нельзя объявить протестированной LightGBM-гипотезу или приписать ухудшение
 только log-blend при одновременно другом backend. Результат classification
 сохранён и принят на 1ede55d; нужен новый gate на bed869d.
-Runtime/verification текущего gate-v4 не меняются до terminal status.
+Gate-v4 завершился до следующих изменений runtime. Его payload подтверждает доставку
+candidate_runtime_contract, forced edit_file и enable_thinking=False; это не устранило 503.
+
+После gate-v4 исправлен учёт резерва: неудачный/прерванный worker расходует
+wall-clock, но не повышает прогноз стоимости успешных финалистов; fallback
+учитывается как refit, а не validation. Три быстрые регрессии воспроизвели
+дефекты до исправления. make check и macOS offline: 628 passed / 1 live
+deselected (84.97 s). Linux/ZIP перепроверяются перед свежим gate-v5.
 
 ## Сравнение и следующий шаг
 
 Матрица — 0/18, не начата. Измеренного эффекта Qwen против Optuna нет.
 Диабетический holdout verifier открывает только после полного cohort.
 
-1. Дождаться terminal status текущего gate-v4 без перезапуска живого процесса.
+1. Завершить Linux/ZIP-проверки исправления бюджета и запустить свежий gate-v5.
    Проверить оба запуска: changed full, фактический backend/преобразования,
    числовая интерпретация и scope, завершённый review, refit CSV. Одного
    gate_passed недостаточно. Старые summary не исправлять post-hoc.
@@ -161,7 +168,7 @@ Runtime/verification текущего gate-v4 не меняются до termina
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
 uv run --locked --all-extras python -m verification.run_agent_comparison \
   data/regression/task.md data/classification/task.md runs/stage7/tasks/diabetes/task.md \
-  --gate-report runs/nightly/gate-v4/report.json --output runs/nightly/comparison-v1
+  --gate-report runs/nightly/gate-v5/report.json --output runs/nightly/comparison-v1
 ```
 
 3. Сохранить все 18 попыток и парные эффекты по трём seed, обновить этот отчёт

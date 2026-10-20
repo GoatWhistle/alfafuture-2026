@@ -48,7 +48,13 @@ class BudgetedRunner:
             )
         result = self.delegate.run(request, allowed)
         elapsed = max(0.0, self.clock.now() - started, result.elapsed_seconds)
-        stage = request.mode if request.mode in ("validation", "control", "refit") else "validation"
+        # Unsuccessful candidates are not finalists. Their elapsed time still
+        # consumes the absolute deadline, but must not inflate the cost forecast.
+        if result.status != ExperimentStatus.SUCCEEDED:
+            return result
+        stage = {"fallback": "refit", "control": "control", "refit": "refit"}.get(
+            request.mode, "validation"
+        )
         self.budget.observe(stage, elapsed)
         if result.output is not None:
             prediction = result.output.get("predict_seconds")
