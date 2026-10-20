@@ -2,7 +2,7 @@
 
 Промежуточный отчёт: работа продолжается одним агентом в fix/qwen-live-cycle.
 Короткий измеренный цикл принят, включая новый review интерпретации.
-Четыре публичных gate не приняты; следующий — gate-v5. Сравнение — 0/18,
+Четыре публичных gate не приняты; gate-v5 выполняется. Сравнение — 0/18,
 польза Qwen относительно Optuna ещё не измерена.
 
 ## 503 и контракт tools
@@ -117,6 +117,8 @@ archive-скрипта остановился до harness из-за PYTHONPATH;
 | gate-v3 / classification | Принята на старом runtime: changed=1, interpreted=1, корректная интерпретация SqrtBalanced/scope, CSV/refit 41 166 строк; 1090.8 s. Второй кандидат timed_out на 300 s, сохранён. На новый код этот результат не переносится. |
 | gate-v4 / regression | Не принята: api_error после повторных 503 на edit_file; changed=0, 238.2 s. |
 | gate-v4 / classification | Не принята: catboost-balanced-w700d8 timed_out на full, changed=0, budget_exhausted; 935.2 s. |
+| gate-v5 / regression | Не принята: changed full RMSE 41.1507446438 против 42.1966696526, но interpreted=0; после одного 503 и успешного retry не хватило token budget на интерпретацию. 199.0 s, CSV/refit 22 449 строк проверены. |
+| gate-v5 / classification | Выполняется на frozen 13b8c80. |
 
 У gate-v2 автоматический changed=0 для classification оказался ложным отказом:
 ID baseline-catboost-sqrtbalanced был исключён по префиксу. Исправленный verifier
@@ -162,7 +164,10 @@ regression/diabetes дали валидные CSV и успешный refit. С�
 Матрица — 0/18, не начата. Измеренного эффекта Qwen против Optuna нет.
 Диабетический holdout verifier открывает только после полного cohort.
 
-1. Завершить Linux/ZIP-проверки исправления бюджета и запустить свежий gate-v5.
+1. Дождаться terminal status gate-v5 (runtime 13b8c80, handle/PID в ACTIVE.json).
+   Regression уже не принята: changed full есть, но интерпретация не состоялась
+   из-за token budget после 503/retry. Не запускать сравнение по этому gate;
+   сохранить classification и повторить обе задачи тем же runtime в свежей серии.
    Проверить оба запуска: changed full, фактический backend/преобразования,
    числовая интерпретация и scope, завершённый review, refit CSV. Одного
    gate_passed недостаточно. Старые summary не исправлять post-hoc.

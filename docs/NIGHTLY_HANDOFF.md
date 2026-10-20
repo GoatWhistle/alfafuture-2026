@@ -155,3 +155,10 @@ classification full timed_out и budget_exhausted (935.2 s), changed=0.
 ZIP SHA-256 6f512560ea4f5208b04e4450c5e2c03c002668ac2c9f9c27b0812580c4895429,
 56 файлов, побайтовое совпадение, regression/diabetes CSV/refit в Linux без сети
 проверены. Следующая серия gate-v5 на frozen 13b8c80; локатор ACTIVE.json.
+
+Gate-v5 активен на 13b8c80 (ACTIVE.json, session 62189): regression
+завершена за 199.0 s, changed full RMSE 41.1507446438, CSV/refit проверены,
+но interpreted=0 из-за token budget после 503/retry. Поэтому серия не
+допускает сравнение. Classification продолжает работу; не перезапускать
+живой процесс. После terminal status сохранить все факты и повторить gate
+на обеих задачах тем же runtime, если endpoint позволяет. Control не читался.
