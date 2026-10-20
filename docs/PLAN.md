@@ -393,3 +393,14 @@ Gate-v3 regression: changed full и refit CSV подтверждены, 113.5 s,
 ещё выполняется, исходники не меняются. После terminal status нужно сохранить
 минимальный точный helper contract в run/interpretation compaction и новый gate;
 сравнение остаётся закрытым. Подробная точка продолжения — NIGHTLY_RESULT.md.
+
+Gate-v3 завершён: автоматический gate_passed=true, но ручная приёмка серии false.
+Classification принята (changed/reviewed full и refit CSV, 1090.8 s; дополнительный
+700-iteration кандидат timed_out и сохранён). Regression не принята из-за
+неверного backend в summary. bed869d сохраняет короткий точный factory contract
+в run/interpretation/review и уточняет, что kind — task type, backend по умолчанию
+CatBoost; ML-поведение не менялось. 26 связанных тестов, make check; macOS/Linux
+offline — 625 passed / 1 live deselected (84.94 / 91.17 s). ZIP 56 файлов,
+SHA-256 78ce1a505111793feb48b59d81e547a98d5c2b420b355b0f646e3c2e0fb8cc6f,
+перепроверен в Linux без сети на regression/diabetes с валидными CSV/refit.
+Gate-v4 на frozen bed869d запущен на обеих публичных задачах; сравнение 0/18.

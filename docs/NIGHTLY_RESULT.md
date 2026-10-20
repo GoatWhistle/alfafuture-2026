@@ -2,7 +2,7 @@
 
 Промежуточный отчёт: работа продолжается одним агентом в fix/qwen-live-cycle.
 Короткий измеренный цикл принят, включая новый review интерпретации.
-Два публичных gate не приняты; gate-v3 выполняется. Сравнение — 0/18,
+Три публичных gate не приняты; gate-v4 выполняется. Сравнение — 0/18,
 польза Qwen относительно Optuna ещё не измерена.
 
 ## 503 и контракт tools
@@ -64,6 +64,7 @@ counts и отсутствующий backend родителя. Replay не за�
 | 980cb43 | В контексте доступны measured baseline validation/refit seconds, worker/smoke timeout и потоки. |
 | 895708f | Verifier отличает эксперименты по hypothesis_source, а не префиксу baseline в ID. |
 | 1ede55d | Полный охват/счётчики изменений по классам, backend родителя, корректные class/feature counts; review черновика той же Qwen до model_finished в прежнем бюджете. |
+| bed869d | Точная семантика фабрики (task kind vs backend, default CatBoost) сохраняется в run/interpretation/review compaction. Поведение ML-фабрики не меняется. |
 
 Регрессии воспроизвели дефекты на границах SDK/session/worker/verifier, затем прошли.
 Незавершённый review не считается принятой интерпретацией; draft/code/measurement
@@ -89,15 +90,15 @@ Diabetes в каждом запуске скопирована через verifi
 
 ## Проверки и ZIP последнего runtime
 
-- make check успешен; полный macOS offline — 624 passed, 1 live deselected,
-  83.46 s; runs/nightly/offline-tests-v7.log.
-- Полный Linux offline на 1ede55d — 624 passed, 1 live deselected, 90.22 s,
-  network=none, 2 CPU / 6 GiB; runs/nightly/linux-offline-v5/pytest.log.
+- make check успешен; полный macOS offline — 625 passed, 1 live deselected,
+  84.94 s; runs/nightly/offline-tests-v8.log.
+- Полный Linux offline на bed869d — 625 passed, 1 live deselected, 91.17 s,
+  network=none, 2 CPU / 6 GiB; runs/nightly/linux-offline-v6/pytest.log.
 - ZIP: 56 файлов, побайтовое совпадение с исходниками; SHA-256
-  c94ac43b5a0f5cce8b48e258409c4b45aeed6c70aeaee608b23edae89c443192.
-- Распакованный entrypoint 1ede55d проверен в Linux вне checkout, без сети,
+  78ce1a505111793feb48b59d81e547a98d5c2b420b355b0f646e3c2e0fb8cc6f.
+- Распакованный entrypoint bed869d проверен в Linux вне checkout, без сети,
   Python 3.12.12, 4 CPU / 6 GiB: regression 22 449 строк, diabetes 88,
-  оба exit=0, валидный CSV и успешный refit. runs/nightly/linux-archive-v5/report.json.
+  оба exit=0, валидный CSV и успешный refit. runs/nightly/linux-archive-v6/report.json.
   Это search-mode=none, не Qwen gate. Посторонние контейнеры не останавливались.
 
 Предыдущие проверки/артефакты сохранены. Первый технический запуск вспомогательного
@@ -113,7 +114,9 @@ archive-скрипта остановился до harness из-за PYTHONPATH;
 | gate-v2 / regression | Не принята: changed full есть (RMSE 42.0071741965 против 42.1966696526), но интерпретация ошибочно утверждает LOO вместо smoothed group means. 139.0 s, CSV/refit проверены. |
 | gate-v2 / classification | Не принята: changed full есть (macro-F1 0.5944175769 против 0.5652431446), но интерпретация заявляет падение precision во всех классах; в 3/10 он вырос. 756.4 s, CSV/refit проверены. |
 | gate-v3 / regression | Не принята по содержанию: changed=1, interpreted=1, CSV/refit проверены, 113.5 s. Summary утверждает два LightGBM, но wrapper вызывает base_model без backend и фактически создаёт два CatBoost. |
-| gate-v3 / classification | Ожидает последовательного запуска. |
+| gate-v3 / classification | Принята на старом runtime: changed=1, interpreted=1, корректная интерпретация SqrtBalanced/scope, CSV/refit 41 166 строк; 1090.8 s. Второй кандидат timed_out на 300 s, сохранён. На новый код этот результат не переносится. |
+| gate-v4 / regression | Выполняется на frozen runtime bed869d. |
+| gate-v4 / classification | Ожидает последовательного запуска. |
 
 У gate-v2 автоматический changed=0 для classification оказался ложным отказом:
 ID baseline-catboost-sqrtbalanced был исключён по префиксу. Исправленный verifier
@@ -122,33 +125,36 @@ ID baseline-catboost-sqrtbalanced был исключён по префиксу.
 исходных summary. Из-за семантических отказов и изменения исходников старые gate
 не допускают сравнение. Control scores для исправлений не просматривались.
 
-Gate-v3 запущен после проверок и smoke-v5: обе заданные публичные задачи,
+Gate-v3 завершён после проверок и smoke-v5; общий автоматический флаг true,
+но ручная приёмка серии false из-за regression. Текущий gate-v4: обе заданные публичные задачи,
 seed 42, до трёх сессий, прежние ceilings. Runtime и verification во время серии
 не меняются. Требуется проверка содержимого отчёта, кода, интерпретации и refit CSV,
 а не только gate_passed. Локатор процесса — runs/nightly/ACTIVE.json;
 живость подтверждать tool handle или PID/create_time, а не одним файлом статуса.
 
-После завершения серии требуется дополнительное исправление контракта фабрики:
+После gate-v3 исправлена потеря контракта фабрики:
 kind задаёт тип задачи, backend выбирается через options; default — CatBoost.
-Короткий контракт импортируемой base_model сейчас теряется в run/interpretation
-compaction. В gate-v3/backend-probe.json сохранена проверка реального frozen
+Короткий candidate_runtime_contract в bed869d сохраняется в run/interpretation
+и review compaction; модель больше не получает ложную подсказку, что полный
+contract там уже доступен. Регрессии сначала воспроизвели потерю поля, затем
+проверили весь вызывающий путь и соответствие default реальной фабрике. В gate-v3/backend-probe.json сохранена проверка реального frozen
 wrapper без fit: task kind=regression, parameters={}, backend=catboost,
 estimator=CatBoostRegressor. Это не API probe и не повторное ML-обучение.
 Числовая метрика 44.5598818679 против 42.1966696526 рассчитана корректно,
 но нельзя объявить протестированной LightGBM-гипотезу или приписать ухудшение
-только log-blend при одновременно другом backend. Classification ещё выполняется.
-Runtime/verification текущей серии не изменяются до её terminal status.
+только log-blend при одновременно другом backend. Результат classification
+сохранён и принят на 1ede55d; нужен новый gate на bed869d.
+Runtime/verification текущего gate-v4 не меняются до terminal status.
 
 ## Сравнение и следующий шаг
 
 Матрица — 0/18, не начата. Измеренного эффекта Qwen против Optuna нет.
 Диабетический holdout verifier открывает только после полного cohort.
 
-1. Дождаться terminal status текущего gate-v3 без перезапуска живого процесса.
-   Сохранить результат classification; regression уже имеет семантический отказ.
-   Затем передать точный минимальный контракт base_model (task kind vs backend,
-   default backend) в run/interpretation, проверить через вызывающий код,
-   зафиксировать и пройти новый gate-v4. Старые summary не исправлять post-hoc.
+1. Дождаться terminal status текущего gate-v4 без перезапуска живого процесса.
+   Проверить оба запуска: changed full, фактический backend/преобразования,
+   числовая интерпретация и scope, завершённый review, refit CSV. Одного
+   gate_passed недостаточно. Старые summary не исправлять post-hoc.
 2. Только после этого выполнить:
 
 ```sh

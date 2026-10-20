@@ -135,3 +135,11 @@ Smoke-v5 принят с реальным review и проверенным froze
 Сначала дождаться terminal status текущего handle/PID, затем исправить потерю
 точного helper contract при compaction и выполнить новый gate. Не принимать
 старый report только по булеву полю; сравнений всё ещё 0/18.
+
+Gate-v3 завершён: classification принята, regression нет, поэтому серия не
+допускает сравнение даже при автоматическом gate_passed=true. bed869d исправляет
+потерю factory semantics в compaction, без смены ML-defaults. 625 offline-тестов
+в macOS/Linux и новый ZIP Linux прошли. Текущая серия — gate-v4 на frozen bed869d;
+локатор — runs/nightly/ACTIVE.json. Дождаться её и вручную проверить обе задачи,
+затем только сравнение. Старые gate на этот код не переносятся; API probes за ночь
+больше не запускать, все три раунда использованы.
