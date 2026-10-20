@@ -1,9 +1,15 @@
 # Ночная стабилизация Qwen: фактический результат
 
-Промежуточный отчёт: работа продолжается одним агентом в fix/qwen-live-cycle.
-Короткий измеренный цикл принят, включая новый review интерпретации.
-Шесть публичных gate не приняты; review-context исправлен в fec115c перед gate-v7. Сравнение — 0/18,
-польза Qwen относительно Optuna ещё не измерена.
+Работа выполнена одним агентом в fix/qwen-live-cycle; цель полностью не достигнута.
+Полный короткий цикл Qwen принят на diabetes на 1ede55d, но публичная приёмка
+последнего runtime fec115c не пройдена. Все семь серий gate завершены и сохранены.
+В gate-v7 regression снова получила 503; classification не получила changed full.
+Сравнение Qwen против Optuna — 0/18, измеренного эффекта нет.
+
+Продолжение упирается в повторяющийся отказ выданного endpoint. Перегрузка как
+первопричина не доказана; три разрешённых диагностических раунда исчерпаны.
+Готовность агента не объявляется. Ниже сохранены изменения, проверки и точный
+порядок возобновления после восстановления доступности endpoint.
 
 ## 503 и контракт tools
 
@@ -65,6 +71,8 @@ counts и отсутствующий backend родителя. Replay не за�
 | 895708f | Verifier отличает эксперименты по hypothesis_source, а не префиксу baseline в ID. |
 | 1ede55d | Полный охват/счётчики изменений по классам, backend родителя, корректные class/feature counts; review черновика той же Qwen до model_finished в прежнем бюджете. |
 | bed869d | Точная семантика фабрики (task kind vs backend, default CatBoost) сохраняется в run/interpretation/review compaction. Поведение ML-фабрики не меняется. |
+| 13b8c80 | Failed/timed_out worker расходует deadline, но не завышает прогноз стоимости успешных финалистов; fallback учитывается как refit. |
+| fec115c | Review при тесном бюджете сохраняет код/метрики, удаляя дубли инструкций, поисковые подсказки и пути/хеши артефактов. |
 
 Регрессии воспроизвели дефекты на границах SDK/session/worker/verifier, затем прошли.
 Незавершённый review не считается принятой интерпретацией; draft/code/measurement
@@ -90,19 +98,24 @@ Diabetes в каждом запуске скопирована через verifi
 
 ## Проверки и ZIP последнего runtime
 
-- make check успешен; полный macOS offline — 625 passed, 1 live deselected,
-  84.94 s; runs/nightly/offline-tests-v8.log.
-- Полный Linux offline на bed869d — 625 passed, 1 live deselected, 91.17 s,
-  network=none, 2 CPU / 6 GiB; runs/nightly/linux-offline-v6/pytest.log.
-- ZIP: 56 файлов, побайтовое совпадение с исходниками; SHA-256
-  78ce1a505111793feb48b59d81e547a98d5c2b420b355b0f646e3c2e0fb8cc6f.
-- Распакованный entrypoint bed869d проверен в Linux вне checkout, без сети,
-  Python 3.12.12, 4 CPU / 6 GiB: regression 22 449 строк, diabetes 88,
-  оба exit=0, валидный CSV и успешный refit. runs/nightly/linux-archive-v6/report.json.
-  Это search-mode=none, не Qwen gate. Посторонние контейнеры не останавливались.
+Проверен runtime fec115c; после него менялась только документация.
 
-Предыдущие проверки/артефакты сохранены. Первый технический запуск вспомогательного
-archive-скрипта остановился до harness из-за PYTHONPATH; повтор исправлен.
+- make check успешен: lock, Ruff, mypy, оба import contracts.
+- Полный macOS offline: 629 passed / 1 live deselected, 85.27 s;
+  runs/nightly/offline-tests-v10.log.
+- Полный Linux offline: 629 passed / 1 live deselected, 90.73 s;
+  network=none, 2 CPU / 6 GiB; runs/nightly/linux-offline-v8/pytest.log.
+- ZIP: 56 файлов, SHA-256
+  03983dd361bd9f63fe7958554ec5f35b3f3746f8e8c46787b0338e20612409eb.
+  После запуска gate-v7 архив повторно побайтово сопоставлен с текущими исходниками.
+- Распакованный entrypoint проверен вне checkout в Linux без сети,
+  Python 3.12.12, 4 CPU / 6 GiB: regression 22 449 строк, diabetes 88,
+  оба exit=0, валидный CSV и успешный refit;
+  runs/nightly/linux-archive-v8/report.json. Это search-mode=none, не Qwen gate.
+
+Зависимости pyproject.toml/uv.lock не менялись. Посторонние контейнеры не
+останавливались. Предыдущие артефакты сохранены; первый вспомогательный
+archive-скрипт ранее остановился из-за PYTHONPATH и был исправлен до проверки.
 Точная среда 8 CPU / 32 GB остаётся непроверенной.
 
 ## Публичные задачи
@@ -121,6 +134,8 @@ archive-скрипта остановился до harness из-за PYTHONPATH;
 | gate-v5 / classification | Не принята: api_error после двух edit-попыток (~61 s каждая), changed=0, interpreted=0; 624.4 s. CSV/refit 41 166 строк проверены. |
 | gate-v6 / regression | Не принята: forced edit HTTP 503 после навигации, changed=0; 104.4 s. Два read_file с file_path отклонены структурированно. CSV/refit проверены. |
 | gate-v6 / classification | Не принята: первый full timed_out; исправленный кандидат прошёл full (macro-F1 0.5241378916 против 0.5652431446), но review не уместился в token budget. 1043.8 s; CSV/refit 41 166 строк проверены. |
+| gate-v7 / regression | Не принята: первый запрос 503, retry успешен, но budget_exhausted до edit; changed=0, interpreted=0; 99.9 s. CSV/refit 22 449 строк проверены. |
+| gate-v7 / classification | Не принята: TotalPrecision вызвал smoke failure; исправленный 600/d7 кандидат timed_out на full, затем budget_exhausted; changed=0, interpreted=0; 919.7 s. CSV/refit 41 166 строк проверены. |
 
 У gate-v2 автоматический changed=0 для classification оказался ложным отказом:
 ID baseline-catboost-sqrtbalanced был исключён по префиксу. Исправленный verifier
@@ -129,12 +144,12 @@ ID baseline-catboost-sqrtbalanced был исключён по префиксу.
 исходных summary. Из-за семантических отказов и изменения исходников старые gate
 не допускают сравнение. Control scores для исправлений не просматривались.
 
-Gate-v3 завершён после проверок и smoke-v5; общий автоматический флаг true,
-но ручная приёмка серии false из-за regression. Gate-v4 также завершён и не принят: обе заданные публичные задачи,
-seed 42, до трёх сессий, прежние ceilings. Runtime и verification во время серии
-не меняются. Требуется проверка содержимого отчёта, кода, интерпретации и refit CSV,
-а не только gate_passed. Локатор процесса — runs/nightly/ACTIVE.json;
-живость подтверждать tool handle или PID/create_time, а не одним файлом статуса.
+Все серии использовали обе публичные задачи, seed 42, до трёх сессий и
+прежние ceilings. Runtime/verification не менялись до terminal status каждой
+серии. Булев gate_passed не заменяет проверку фактического кода, интерпретации
+и CSV/refit. Последний locator runs/nightly/ACTIVE.json имеет terminal status; живого
+процесса gate нет. При возобновлении проверять handle или PID/create_time,
+а не полагаться на старый файл статуса.
 
 После gate-v3 исправлена потеря контракта фабрики:
 kind задаёт тип задачи, backend выбирается через options; default — CatBoost.
@@ -147,19 +162,15 @@ estimator=CatBoostRegressor. Это не API probe и не повторное ML
 Числовая метрика 44.5598818679 против 42.1966696526 рассчитана корректно,
 но нельзя объявить протестированной LightGBM-гипотезу или приписать ухудшение
 только log-blend при одновременно другом backend. Результат classification
-сохранён и принят на 1ede55d; нужен новый gate на bed869d.
+сохранён и принят на 1ede55d; он не переносится на следующие исходники.
 Gate-v4 завершился до следующих изменений runtime. Его payload подтверждает доставку
 candidate_runtime_contract, forced edit_file и enable_thinking=False; это не устранило 503.
 
-После gate-v4 исправлен учёт резерва: неудачный/прерванный worker расходует
+После gate-v4 в 13b8c80 исправлен учёт резерва: неудачный worker расходует
 wall-clock, но не повышает прогноз стоимости успешных финалистов; fallback
-учитывается как refit, а не validation. Три быстрые регрессии воспроизвели
-дефекты до исправления. make check и macOS offline: 628 passed / 1 live
-deselected (84.97 s); Linux без сети: 628 passed / 1 live deselected (90.97 s).
-ZIP: 56 файлов, SHA-256 6f512560ea4f5208b04e4450c5e2c03c002668ac2c9f9c27b0812580c4895429.
-Распакованный ZIP побайтово совпадает с исходниками; Linux без сети, 4 CPU/6 GiB:
-regression/diabetes дали валидные CSV и успешный refit. Следующий — gate-v5
-на frozen runtime 13b8c80.
+учитывается как refit. Три быстрые регрессии воспроизвели дефекты до исправления.
+В gate-v6 после full timeout Qwen действительно получила возможность ремонта
+и успешно измерила меньший кандидат; затем остановилась перед review.
 
 После terminal status gate-v6 воспроизведён отдельный дефект review-context:
 при оставшихся 7 728 tokens исходный код/метрики с повторными инструкциями и
@@ -171,39 +182,48 @@ regression/diabetes дали валидные CSV и успешный refit. С�
 гипотеза, full/parent/smoke-метрики, вся показанная диагностика и draft сохранены.
 Offline replay теперь доходит до mocked review (5 918 bytes); это не новая
 Qwen-интерпретация и не замена исходного gate report. 19 связанных тестов прошли.
-Сводка оригинальных API attempts/session accounting: runs/nightly/live-accounting.json;
-диагностические раунды в неё не входят, точный биллинг не подтверждён.
+Сводка оригинальных research API traces/session accounting:
+runs/nightly/live-accounting.json. В smoke-v1…v5 и gate-v1…v7 — 106 попыток,
+301 434 reported tokens, 336 504 списано по session accounting. Пять сессий
+завершились без покрытия неопределённого расхода последней ошибки; продолжение
+их сессий запрещено. Поэтому эта сумма не является верхней оценкой полного
+расхода или фактическим биллингом. Диагностические 32 попытки учтены отдельно.
 
 ## Сравнение и следующий шаг
 
 Матрица — 0/18, не начата. Измеренного эффекта Qwen против Optuna нет.
 Диабетический holdout verifier открывает только после полного cohort.
 
-1. Выполнить свежий gate-v7 на обеих публичных задачах на frozen fec115c
-   после успешных проверок Linux/ZIP. Старые
-   gate не переносятся. Проверить фактический код, full-метрики, scope, review
-   и соответствие CSV/refit. Матрицу запускать только после приёмки обоих.
-2. Только после этого выполнить:
+После восстановления выданного endpoint повторить обе публичные задачи
+в новом каталоге gate-v8 на том же fec115c, без объединения успешных частей
+старых серий. Диагностические API probes за эту ночь больше не запускать.
+Старые summary/report не исправлять post-hoc. Команда gate:
+
+```sh
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+uv run --locked --all-extras python -m verification.run_agent_comparison \
+  data/regression/task.md data/classification/task.md --gate --modes qwen \
+  --seeds 42 --sessions 3 --output runs/nightly/gate-v8
+```
+
+Проверить фактический код, full-метрики, scope, завершённый review и CSV/refit
+обеих задач. Если исходники менялись, нужны проверки и новый gate того кода.
+
+Только после приёмки обеих задач выполнить:
 
 ```sh
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
 uv run --locked --all-extras python -m verification.run_agent_comparison \
   data/regression/task.md data/classification/task.md runs/stage7/tasks/diabetes/task.md \
-  --gate-report runs/nightly/gate-v7/report.json --output runs/nightly/comparison-v1
+  --gate-report runs/nightly/gate-v8/report.json --output runs/nightly/comparison-v1
 ```
 
-3. Сохранить все 18 попыток и парные эффекты по трём seed, обновить этот отчёт
+Сохранить все 18 попыток и парные эффекты по трём seed, обновить этот отчёт
    фактами; отрицательный эффект допустим. После просмотра final control/holdout
    новые изменения не подбирать. Gate и сравнение остаются незавершёнными до
    фактической проверки; готовность агента по этой записи не объявляется.
 
-Проверка review-context: make check успешен; полный macOS offline —
-629 passed / 1 live deselected (85.27 s). Linux/ZIP проверяются отдельно
-перед новым gate; эти offline результаты не означают live-приёмку.
-
-Review-context исправлен в fec115c и отправлен. make check; macOS/Linux
-offline — 629 passed / 1 live deselected (85.27 / 90.73 s). ZIP 56 файлов,
-SHA-256 03983dd361bd9f63fe7958554ec5f35b3f3746f8e8c46787b0338e20612409eb,
-побайтово совпадает с исходниками; распакованный entrypoint в Linux без сети
-(4 CPU / 6 GiB) прошёл regression/diabetes с CSV/refit. Следующий gate-v7
-на frozen fec115c, локатор — runs/nightly/ACTIVE.json. Сравнение 0/18.
+Остаются публичный gate обеих задач на последнем runtime, все 18 сравнений,
+измерение эффекта и точная платформа 8 CPU / 32 GB. В ходе ночной работы control scores
+и diabetes holdout не открывались. Все исходные отчёты сохранены;
+неудачные серии не исключаются из истории. Merge/main/конкурсная отправка не выполнялись.

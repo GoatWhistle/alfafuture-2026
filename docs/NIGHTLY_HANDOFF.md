@@ -1,5 +1,12 @@
 # Ночная стабилизация Qwen
 
+
+Актуальная точка после ночной работы: runtime fec115c проверен (629 offline
+тестов macOS/Linux, ZIP Linux). Gate-v7 terminal и не принят; процессов нет,
+сравнение 0/18. Повторяющийся 503 требует восстановления endpoint; три
+диагностических раунда исчерпаны. Итог и команды gate-v8/сравнения находятся в
+[NIGHTLY_RESULT.md](NIGHTLY_RESULT.md). Ниже сохранены исходная передача и история.
+
 ## Цель и старт
 
 Работать одним агентом в ветке `fix/qwen-live-cycle`, созданной от `main` / `e95a63c`.
@@ -188,3 +195,12 @@ SHA-256 03983dd361bd9f63fe7958554ec5f35b3f3746f8e8c46787b0338e20612409eb,
 побайтово совпадает с исходниками; распакованный entrypoint в Linux без сети
 (4 CPU / 6 GiB) прошёл regression/diabetes с CSV/refit. Следующий gate-v7
 на frozen fec115c, локатор — runs/nightly/ACTIVE.json. Сравнение 0/18.
+
+Gate-v7 terminal, runtime fec115c: regression budget_exhausted после 503/retry,
+changed=0, interpreted=0, 99.9 s; classification smoke failure +
+full timeout, budget_exhausted, changed=0, interpreted=0, 919.7 s.
+Обе CSV/refit verified (22 449 / 41 166 строк), gate не принят. Сравнение 0/18.
+Последние gate-v5/v6/v7 повторили 503 в regression; диагностика исчерпана.
+Требуется восстановление endpoint и свежий gate-v8 на обеих задачах на fec115c,
+затем только полная матрица. Все живые процессы этой серии завершены.
+Фактический отчёт и точные команды — docs/NIGHTLY_RESULT.md.
