@@ -169,11 +169,12 @@ def test_research_promotes_measured_improvement_after_valid_refit(tmp_path, monk
 
     task = CsvTaskData().prepare(str(task_fixture(tmp_path)), 42)
     baseline = BaselineResult(
-        Score(1000, Metric.RMSE, task.protocol.fingerprint), task.spec.submission_path, 1, 1
+        Score(1000, Metric.RMSE, task.protocol.fingerprint), task.spec.submission_path, 2.5, 4.0
     )
     Path(task.spec.submission_path).write_text("baseline placeholder")
     code = STARTER.replace('"iterations": 200', '"iterations": 3')
-    monkeypatch.setattr(entrypoint, "QwenLanguageModel", lambda *args: ScriptedModel(code))
+    model = ScriptedModel(code)
+    monkeypatch.setattr(entrypoint, "QwenLanguageModel", lambda *args: model)
     for name, value in (
         ("OPENAI_API_KEY", "synthetic"),
         ("OPENAI_BASE_URL", "https://invalid.test"),
@@ -190,6 +191,23 @@ def test_research_promotes_measured_improvement_after_valid_refit(tmp_path, monk
         token_limit=1000,
         max_sessions=1,
     )
+    context_budget = json.loads(model.observed[1]["content"])["budget"]
+    assert {
+        key: context_budget[key]
+        for key in (
+            "worker_timeout_seconds",
+            "smoke_timeout_seconds",
+            "threads",
+            "baseline_validation_seconds",
+            "baseline_refit_seconds",
+        )
+    } == {
+        "worker_timeout_seconds": 10,
+        "smoke_timeout_seconds": 10,
+        "threads": 1,
+        "baseline_validation_seconds": 2.5,
+        "baseline_refit_seconds": 4.0,
+    }
     assert report["selected"] == "regularization"
     assert report["refit_status"] == "succeeded"
     assert Path(task.spec.submission_path).read_text().startswith("key,response")

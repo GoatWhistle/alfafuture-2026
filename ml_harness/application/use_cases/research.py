@@ -20,6 +20,7 @@ Workspace-readable files: task.md, data_dictionary.csv, candidate_api.md, candid
 The context includes task_overview, candidate_contract and current candidate_code.
 Use files only for missing details. inspect_data(columns=...) gives selected statistics.
 Inspect once, implement one concrete hypothesis, then run_experiment.
+Scale experiment compute to measured baseline times and worker/smoke limits in budget.
 Do not reread unchanged pages. Prefer concise code reusing the documented base model.
 Do not try to read package source or absolute dataset paths. Use read_file offset for more pages.
 State a specific hypothesis
@@ -40,6 +41,7 @@ ACTION_SYSTEM_PROMPT = (
     "Use candidate_code and candidate_contract already supplied in context. "
     "Do not restart file navigation. State a concrete hypothesis and test the written code. "
     "Use a new experiment ID for changed code. "
+    "Scale experiment compute to measured baseline times and worker/smoke limits in budget. "
     "The harness measures smoke and full validation independently; never invent scores. "
     "Never modify the evaluator, split or submission format. Do not download data, weights "
     "or packages or request other language models. "

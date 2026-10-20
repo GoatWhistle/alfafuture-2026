@@ -214,6 +214,11 @@ def research_after_baseline(
                     "seconds_remaining": wall.available(clock.now()),
                     "reserved_seconds": wall.reserve_seconds(),
                     "steps_per_hypothesis": max_steps,
+                    "worker_timeout_seconds": timeout_seconds,
+                    "smoke_timeout_seconds": min(60, timeout_seconds),
+                    "threads": threads,
+                    "baseline_validation_seconds": baseline.validation_seconds,
+                    "baseline_refit_seconds": baseline.refit_seconds,
                 },
             )
             context_value = json.loads(context)
