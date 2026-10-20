@@ -1,0 +1,21 @@
+[project]
+name = "autoresearch-web-api"
+version = "0.1.0"
+description = "Local loopback API for the AutoResearch web panel; not part of the competition archive."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.32,<1",
+    "python-multipart>=0.0.12",
+    "psutil==6.1.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "httpx==0.28.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
