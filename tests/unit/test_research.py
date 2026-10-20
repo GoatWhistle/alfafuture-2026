@@ -240,6 +240,13 @@ def test_navigation_transitions_to_edit_then_validation_then_interpretation():
     assert all(message["role"] != "tool" for message in model.messages[3])
     assert "changed" in json.dumps(model.messages[3])
     assert "full_score" in json.dumps(model.messages[4])
+    assert "executes candidate_code unchanged" in json.dumps(model.messages[3])
+    assert "Compare the hypothesis with candidate_code" in json.dumps(model.messages[4])
+    assert "hypothesis was not tested" in json.dumps(model.messages[4])
+    assert "Inspect once" not in model.messages[1][0]["content"]
+    assert "Current phase: edit_file" in model.messages[1][0]["content"]
+    assert "Current phase: run_experiment" in model.messages[3][0]["content"]
+    assert "Current phase: interpretation" in model.messages[4][0]["content"]
 
 
 def test_action_request_discards_navigation_history_but_keeps_research_facts():

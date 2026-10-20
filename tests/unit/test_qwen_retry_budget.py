@@ -219,3 +219,17 @@ def test_missing_usage_is_accounted_only_with_a_bounded_request(qwen_module):
         prompt_bound(MESSAGES, TOOLS) + sent[0]["max_tokens"]
     )
     assert reply.unreported_tokens_upper_bound <= 5000
+
+
+def test_ample_budget_does_not_expand_provider_generation_window(qwen_module):
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return success()
+
+    candidate = model(qwen_module, handler)
+    candidate.set_limits(100, 1, 32000)
+    candidate.complete(MESSAGES, TOOLS)
+    # The saved live payload produced invalid tools/503 at 4096, valid edits at 1536.
+    assert sent[0]["max_tokens"] == 1536

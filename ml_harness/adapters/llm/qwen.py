@@ -118,7 +118,8 @@ class QwenLanguageModel:
                     raise ModelError(
                         "Qwen request budget exhausted", attempts=0, reason="budget_exhausted"
                     )
-                max_tokens = min(4096, remaining_tokens // attempts_allowed - prompt_bound)
+                # A larger output window produced 503/invalid tools in saved live probes.
+                max_tokens = min(1536, remaining_tokens // attempts_allowed - prompt_bound)
             except (ValueError, TypeError, UnicodeError):
                 raise ModelError("Cannot serialize Qwen request", attempts=0) from None
             if max_tokens <= 0 or attempts_allowed <= 0 or time.monotonic() >= deadline:

@@ -34,6 +34,26 @@ never a full result. The previously saved baseline remains available if the expe
 """
 
 
+ACTION_SYSTEM_PROMPT = (
+    "You are an autonomous tabular ML researcher using only the provided Qwen model. "
+    "Follow the current phase and only the tools provided in this request. "
+    "Use candidate_code and candidate_contract already supplied in context. "
+    "Do not restart file navigation. State a concrete hypothesis and test the written code. "
+    "The harness measures smoke and full validation independently; never invent scores. "
+    "Never modify the evaluator, split or submission format. Do not download data, weights "
+    "or packages or request other language models. "
+)
+
+
+INTERPRETATION_INSTRUCTION = (
+    "In at most 120 words, compare full measured quality with the parent. "
+    "Compare the hypothesis with candidate_code, which is the executed source. "
+    "If the code does not implement the hypothesis, explicitly say the hypothesis was not tested; "
+    "do not attribute the score to unimplemented changes. A single split does not prove causality. "
+    "Do not propose tool calls. "
+)
+
+
 @dataclass(frozen=True)
 class SessionResult:
     reason: str
@@ -113,6 +133,18 @@ def run_session(
                     schema for schema in schemas if schema["function"]["name"] == pending_action
                 ]
                 schemas = required or schemas
+        if pending_action or awaiting_interpretation:
+            phase = "interpretation" if awaiting_interpretation else pending_action
+            messages[0] = {
+                "role": "system",
+                "content": ACTION_SYSTEM_PROMPT
+                + f"Current phase: {phase}. "
+                + (
+                    INTERPRETATION_INSTRUCTION
+                    if awaiting_interpretation
+                    else "Return one complete call to the current phase tool."
+                ),
+            }
         request_limit = (
             min(history_char_limit, max(0, available_tokens - 1800))
             if isinstance(model, BudgetAwareLanguageModel)
@@ -196,11 +228,16 @@ def run_session(
                 ),
             }
             phase_instruction = (
-                "Experiment complete; tools unavailable. "
-                "In at most 120 words interpret the measured result. "
+                "Experiment complete; tools unavailable. " + INTERPRETATION_INSTRUCTION
                 if awaiting_interpretation
                 else (
-                    f"Use {pending_action} now. Prefer concise code reusing base_model. "
+                    (
+                        "Use run_experiment now. It executes candidate_code unchanged. "
+                        "The hypothesis must describe this written code, "
+                        "not intended future edits. "
+                        if pending_action == "run_experiment"
+                        else f"Use {pending_action} now. Prefer concise code reusing base_model. "
+                    )
                     if pending_action
                     else "Continue research using the available tools. "
                 )
@@ -404,9 +441,7 @@ def run_session(
                     "role": "user",
                     "content": (
                         "The experiment has finished. This is the final interpretation phase; "
-                        "tools are unavailable. In at most 120 words, compare measured quality "
-                        "with the parent and explain whether the hypothesis was actually tested. "
-                        "Do not propose tool calls."
+                        "tools are unavailable. " + INTERPRETATION_INSTRUCTION
                     ),
                 }
             )
