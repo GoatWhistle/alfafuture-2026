@@ -2,7 +2,7 @@
 
 Промежуточный отчёт: работа продолжается одним агентом в fix/qwen-live-cycle.
 Короткий измеренный цикл принят, включая новый review интерпретации.
-Шесть публичных gate не приняты; review-context исправляется перед gate-v7. Сравнение — 0/18,
+Шесть публичных gate не приняты; review-context исправлен в fec115c перед gate-v7. Сравнение — 0/18,
 польза Qwen относительно Optuna ещё не измерена.
 
 ## 503 и контракт tools
@@ -179,8 +179,8 @@ Qwen-интерпретация и не замена исходного gate rep
 Матрица — 0/18, не начата. Измеренного эффекта Qwen против Optuna нет.
 Диабетический holdout verifier открывает только после полного cohort.
 
-1. Завершить проверки исправления review-context, пересобрать ZIP и проверить
-   Linux без сети; затем свежий gate-v7 на обеих публичных задачах. Старые
+1. Выполнить свежий gate-v7 на обеих публичных задачах на frozen fec115c
+   после успешных проверок Linux/ZIP. Старые
    gate не переносятся. Проверить фактический код, full-метрики, scope, review
    и соответствие CSV/refit. Матрицу запускать только после приёмки обоих.
 2. Только после этого выполнить:
@@ -200,3 +200,10 @@ uv run --locked --all-extras python -m verification.run_agent_comparison \
 Проверка review-context: make check успешен; полный macOS offline —
 629 passed / 1 live deselected (85.27 s). Linux/ZIP проверяются отдельно
 перед новым gate; эти offline результаты не означают live-приёмку.
+
+Review-context исправлен в fec115c и отправлен. make check; macOS/Linux
+offline — 629 passed / 1 live deselected (85.27 / 90.73 s). ZIP 56 файлов,
+SHA-256 03983dd361bd9f63fe7958554ec5f35b3f3746f8e8c46787b0338e20612409eb,
+побайтово совпадает с исходниками; распакованный entrypoint в Linux без сети
+(4 CPU / 6 GiB) прошёл regression/diabetes с CSV/refit. Следующий gate-v7
+на frozen fec115c, локатор — runs/nightly/ACTIVE.json. Сравнение 0/18.

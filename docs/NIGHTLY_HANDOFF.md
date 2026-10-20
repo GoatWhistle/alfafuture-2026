@@ -181,3 +181,10 @@ API/ML теперь доходит до mocked review. Далее полные �
 Проверка review-context: make check успешен; полный macOS offline —
 629 passed / 1 live deselected (85.27 s). Linux/ZIP проверяются отдельно
 перед новым gate; эти offline результаты не означают live-приёмку.
+
+Review-context исправлен в fec115c и отправлен. make check; macOS/Linux
+offline — 629 passed / 1 live deselected (85.27 / 90.73 s). ZIP 56 файлов,
+SHA-256 03983dd361bd9f63fe7958554ec5f35b3f3746f8e8c46787b0338e20612409eb,
+побайтово совпадает с исходниками; распакованный entrypoint в Linux без сети
+(4 CPU / 6 GiB) прошёл regression/diabetes с CSV/refit. Следующий gate-v7
+на frozen fec115c, локатор — runs/nightly/ACTIVE.json. Сравнение 0/18.
