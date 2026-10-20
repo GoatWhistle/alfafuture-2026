@@ -61,7 +61,7 @@ def adapter(handler, **kwargs):
 
 
 @pytest.mark.parametrize("usage", [True, False])
-def test_tool_calls_usage_exact_request_and_timeout(usage):
+def test_tool_calls_usage_exact_request_and_timeout(usage, tmp_path):
     def handler(request):
         body = json.loads(request.content)
         assert body == {
@@ -69,11 +69,12 @@ def test_tool_calls_usage_exact_request_and_timeout(usage):
             "messages": [{"role": "user", "content": "inspect"}],
             "tools": TOOLS,
             "tool_choice": {"type": "function", "function": {"name": "inspect_data"}},
+            "enable_thinking": False,
         }
         assert request.extensions["timeout"]["read"] == 7
         return httpx.Response(200, json=completion(usage))
 
-    model = adapter(handler, timeout_seconds=7)
+    model = adapter(handler, timeout_seconds=7, trace_dir=tmp_path)
     assert model.client.max_retries == 0
     reply = model.complete([{"role": "user", "content": "inspect"}], TOOLS)
     assert reply.content == ""
@@ -81,6 +82,9 @@ def test_tool_calls_usage_exact_request_and_timeout(usage):
     assert reply.usage_known is usage
     assert (reply.input_tokens, reply.output_tokens) == ((12, 4) if usage else (0, 0))
     assert reply.attempts == 1
+    trace = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert trace["request"]["enable_thinking"] is False
+    assert trace["request"]["tool_choice"]["function"]["name"] == "inspect_data"
 
 
 @pytest.mark.parametrize("failure", [429, 500, 503, "timeout", "connection"])

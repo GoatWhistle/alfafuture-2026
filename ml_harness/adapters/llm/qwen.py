@@ -100,6 +100,11 @@ class QwenLanguageModel:
         deadline = math.inf
         attempts_allowed = self.max_attempts
         max_tokens: Any = NOT_GIVEN
+        forced_tool = (
+            {"type": "function", "function": {"name": tools[0]["function"]["name"]}}
+            if len(tools) == 1
+            else None
+        )
         if self._limits is not None:
             deadline, remaining_attempts, remaining_tokens = self._limits
             attempts_allowed = min(attempts_allowed, remaining_attempts)
@@ -136,7 +141,16 @@ class QwenLanguageModel:
                 "status": "started",
                 "started_unix": time.time(),
                 "attempt": attempt,
-                "request": {"messages": messages, "tools": tools, "max_tokens": max_tokens},
+                "request": {
+                    "messages": messages,
+                    "tools": tools,
+                    "max_tokens": max_tokens,
+                    **(
+                        {"tool_choice": forced_tool, "enable_thinking": False}
+                        if forced_tool
+                        else {}
+                    ),
+                },
                 "usage_observation": {
                     "prompt_upper_bound": len(
                         json.dumps(
@@ -153,12 +167,9 @@ class QwenLanguageModel:
                     model=self.model,
                     messages=cast(list[ChatCompletionMessageParam], messages),
                     tools=cast(list[ChatCompletionToolParam], tools) if tools else NOT_GIVEN,
-                    tool_choice=cast(
-                        Any,
-                        {"type": "function", "function": {"name": tools[0]["function"]["name"]}},
-                    )
-                    if len(tools) == 1
-                    else NOT_GIVEN,
+                    tool_choice=cast(Any, forced_tool) if forced_tool else NOT_GIVEN,
+                    # Qwen requires non-thinking mode for a forced function selection.
+                    extra_body={"enable_thinking": False} if forced_tool else None,
                     max_tokens=max_tokens,
                     timeout=min(self.timeout_seconds, remaining)
                     if self._limits is not None
