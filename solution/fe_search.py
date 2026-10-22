@@ -19,6 +19,8 @@ from agent_utils import log
 from eda_probe import row_keys
 
 SAMPLE_ROWS = 50_000
+SEARCH_ROW_CLASSES = 200_000  # классификация: строк валидатора × классов (цена мультикласса ~K)
+SEARCH_MIN_ROWS = 15_000
 REL_MIN = 0.002            # минимальный относительный прирост метрики
 LCB_K = 1.0                # нижняя граница: mean − k·std/√n по фолдам > 0
 N_NULL = 3                 # null-спеки (перемешанные копии признаков) для калибровки порога
@@ -147,30 +149,42 @@ def build_folds(ctx: dict) -> None:
     from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
 
     df, y = ctx["df"], ctx["y"]
+    rows = np.arange(len(df))
+    if ctx["classes"]:
+        n = max(SEARCH_MIN_ROWS, SEARCH_ROW_CLASSES // len(ctx["classes"]))
+        if n < len(df):
+            # Стратифицированная подвыборка: редкие классы сохраняются полностью до n/K.
+            per = pd.Series(np.arange(len(df))).groupby(pd.Series(y)).apply(
+                lambda g: g.sample(min(len(g), max(n // len(ctx["classes"]), int(n * len(g) / len(df)))),
+                                   random_state=17))
+            rows = np.sort(per.to_numpy())
+    sub = df.iloc[rows]
     folds, scheme = [], None
     if ctx["period"]:
-        t = pd.to_numeric(df[ctx["period"]], errors="coerce").to_numpy(float)
+        t = pd.to_numeric(sub[ctx["period"]], errors="coerce").to_numpy(float)
         periods = np.unique(t[~np.isnan(t)])
         for last in (periods[::-1][:2] if len(periods) >= 4 else periods[::-1][:1]):
-            tr_i, va_i = np.flatnonzero(t < last), np.flatnonzero(t == last)
+            tr_i, va_i = rows[t < last], rows[t == last]
             if len(tr_i) >= 500 and len(va_i) >= 200:
                 folds.append((tr_i, va_i))
         if folds:
             scheme = f"temporal({ctx['period']}, {len(folds)} фолд.)"
     if not folds and ctx["entity"] and ctx["entity"].get("coverage", 1) < ENTITY_GROUP_MAX_COVERAGE:
-        groups = row_keys(df, ctx["entity"]["key"])
+        groups = row_keys(sub, ctx["entity"]["key"])
         if pd.Series(groups).nunique() >= 3:
-            folds = list(GroupKFold(3).split(df, y, groups))
+            folds = [(rows[a], rows[b]) for a, b in GroupKFold(3).split(sub, y[rows], groups)]
             scheme = f"group({ctx['entity']['key']})"
     if not folds:
-        if ctx["classes"] and pd.Series(y).value_counts().min() >= 3:
-            folds = list(StratifiedKFold(3, shuffle=True, random_state=13).split(df, y))
+        ys = y[rows]
+        if ctx["classes"] and pd.Series(ys).value_counts().min() >= 3:
+            split = StratifiedKFold(3, shuffle=True, random_state=13).split(sub, ys)
             scheme = "stratified_kfold(3)"
         else:
-            folds = list(KFold(3, shuffle=True, random_state=13).split(df))
+            split = KFold(3, shuffle=True, random_state=13).split(sub)
             scheme = "kfold(3)"
+        folds = [(rows[a], rows[b]) for a, b in split]
     ctx["folds"], ctx["fold_scheme"] = folds, scheme
-    log(f"AutoEDA: схема валидации {scheme}")
+    log(f"AutoEDA: схема валидации {scheme} на {len(rows)} строках")
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +201,12 @@ class Evaluator:
         self.base = [(df.loc[tr, feats].reset_index(drop=True), df.loc[va, feats].reset_index(drop=True))
                      for tr, va in ctx["folds"]]
         self.n_evals = 0
+        self.spent = 0.0
+
+    def fits(self, deadline: float) -> bool:
+        """Влезет ли ещё одна оценка (по средней длительности) до дедлайна."""
+        avg = self.spent / max(self.n_evals, 1)
+        return time.time() + avg < deadline
 
     def _spec_feats(self, spec: dict):
         key = fe_dsl.spec_key(spec)
@@ -214,6 +234,7 @@ class Evaluator:
     def run(self, specs: list[dict], extra: list | None = None) -> list[float] | None:
         """Скоры по фолдам для базы + specs (drop убирает колонку) + extra (готовые признаки по фолдам)."""
         ctx = self.ctx
+        t0 = time.time()
         drops = {s["cols"][0] for s in specs if s["op"] == "drop"}
         feats_by_spec = []
         for s in specs:
@@ -240,6 +261,7 @@ class Evaluator:
             s, _, _ = fit_eval(ctx, Xtr, ctx["y"][tr], Xva, ctx["y"][va])
             scores.append(s)
         self.n_evals += 1
+        self.spent += time.time() - t0
         return scores
 
 
@@ -281,8 +303,8 @@ def search(ctx: dict, specs: list[dict], deadline: float, register=None) -> list
 
     passed = []
     for spec in sorted(specs, key=lambda s: -s["prior"]):
-        if time.time() > deadline_a:
-            log(f"AutoEDA: этап A остановлен по времени, оценено {ev.n_evals - 1}/{len(specs)}")
+        if not ev.fits(deadline_a):
+            log(f"AutoEDA: этап A остановлен по времени, оценено {ev.n_evals - 1 - N_NULL}/{len(specs)}")
             break
         scores = ev.run([spec])
         if scores is None:
@@ -301,7 +323,7 @@ def search(ctx: dict, specs: list[dict], deadline: float, register=None) -> list
     accepted: list[dict] = []
     cur = base
     for spec in sorted(passed, key=lambda s: -s["delta"]):
-        if time.time() > deadline:
+        if not ev.fits(deadline):
             log("AutoEDA: этап B остановлен по времени")
             break
         scores = ev.run(accepted + [spec])
