@@ -136,7 +136,7 @@ def _extract_json(text: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _llm_json(prompt: str, tag: str, timeout: float = 60) -> dict | None:
+def _llm_json(prompt: str, tag: str, timeout: float = 60, retries: int = 1) -> dict | None:
     """Один JSON-ответ LLM: до 2 попыток, любая ошибка -> None."""
     if not os.environ.get("OPENAI_API_KEY"):
         log(f"LLM[{tag}]: OPENAI_API_KEY не задан, работаю на дефолтах")
@@ -144,7 +144,7 @@ def _llm_json(prompt: str, tag: str, timeout: float = 60) -> dict | None:
     try:
         from openai import OpenAI
 
-        client = OpenAI(timeout=timeout, max_retries=1)
+        client = OpenAI(timeout=timeout, max_retries=retries)
         # Прокси платформы подставляет модель задачи по любому имени.
         model = os.environ.get("OPENAI_MODEL", "qwen/qwen3.8-27b")
         for attempt in (1, 2):
@@ -243,17 +243,22 @@ def _dictionary_text(dd: pd.DataFrame | None, columns: list[str], limit: int = 6
     return "\n".join(rows)[:limit]
 
 
-def _specs_prompt(question: str, facts: dict, dd_text: str, columns: list[str], task_text: str, n: int) -> str:
+def _specs_prompt(question: str, facts: dict, dd_text: str, columns: list[str], task_text: str, n: int,
+                  planned: list[str] | None = None) -> str:
+    planned_text = ""
+    if planned:
+        planned_text = ("Эти гипотезы УЖЕ в очереди проверки — НЕ повторяй их; предлагай другие ключи, "
+                        "сочетания, пороги threshold, модельные операции:\n- " + "\n- ".join(planned[:40]) + "\n\n")
     return (
         "Ты — опытный дата-сайентист в команде AutoML-агента. Детекторы агента посчитали факты о данных "
         f"(ниже). Вопрос: {question}\n"
-        f"Предложи до {n} гипотез в виде спек DSL. Каждая проверяется переобучением на валидации, "
+        f"Предложи до {n} НОВЫХ гипотез в виде спек DSL. Каждая проверяется переобучением на валидации, "
         "похожей на test; бесполезные отбрасываются, так что предлагай смело, но по фактам. "
         "Используй ТОЛЬКО операции DSL и ТОЛЬКО колонки из списка; таргет в признаки не подставляй.\n\n"
         f"{DSL_HELP}\n\n"
         'Верни СТРОГО один JSON: {"specs": [{"op": "...", "cols": [...], "params": {...}, "why": "..."}], '
         '"entity": [колонки ключа объекта или пусто], "period": "<колонка периода или null>"}.\n\n'
-        f"Колонки: {columns[:200]}\n\n"
+        f"{planned_text}Колонки: {columns[:200]}\n\n"
         f"Словарь данных:\n{dd_text}\n\n"
         f"Факты (JSON):\n{json.dumps(facts, ensure_ascii=False, default=str)[:6000]}\n\n"
         "Описание задачи:\n" + task_text[:2500]
@@ -268,7 +273,8 @@ def _parse_specs(data: dict | None, limit: int) -> dict | None:
     return {"specs": data["specs"][:limit], "entity": entity, "period": period}
 
 
-def llm_propose_specs(task_text: str, summary: dict, dd: pd.DataFrame | None, columns: list[str]) -> dict | None:
+def llm_propose_specs(task_text: str, summary: dict, dd: pd.DataFrame | None, columns: list[str],
+                      planned: list[str] | None = None) -> dict | None:
     """Раунд 1: тематические промпты Qwen параллельно, у каждого только свои факты.
 
     Возвращает {"specs": [сырые спеки с полем theme], "entity", "period"} или None.
@@ -283,8 +289,9 @@ def llm_propose_specs(task_text: str, summary: dict, dd: pd.DataFrame | None, co
         question, keys = LLM_THEMES[theme]
         facts = {**base, **{k: summary.get(k) for k in keys if summary.get(k) is not None}}
         prompt = _specs_prompt(question, facts, dd_text if theme in ("semantics", "time_objects") else "см. колонки",
-                               columns, task_text, 8)
-        return theme, _parse_specs(_llm_json(prompt, f"fe_{theme}", timeout=150), 12)
+                               columns, task_text, 8, planned)
+        # Reasoning-модель на 4 параллельных запросах отвечает минутами: один долгий запрос без повтора.
+        return theme, _parse_specs(_llm_json(prompt, f"fe_{theme}", timeout=300, retries=0), 12)
 
     with ThreadPoolExecutor(len(LLM_THEMES)) as pool:
         answers = list(pool.map(ask, LLM_THEMES))
@@ -298,7 +305,8 @@ def llm_propose_specs(task_text: str, summary: dict, dd: pd.DataFrame | None, co
     return {"specs": specs, "entity": entity, "period": period} if specs else None
 
 
-def llm_refine_specs(task_text: str, summary: dict, feedback: dict, columns: list[str]) -> dict | None:
+def llm_refine_specs(task_text: str, summary: dict, feedback: dict, columns: list[str],
+                     planned: list[str] | None = None) -> dict | None:
     """Раунд 2: Qwen видит, какие гипотезы прошли валидатор, и развивает стратегию."""
     question = (
         "Ниже итоги проверки гипотез (delta_rel — относительный прирост метрики, passed — прошла ли порог "
@@ -308,8 +316,8 @@ def llm_refine_specs(task_text: str, summary: dict, feedback: dict, columns: lis
     )
     facts = {"results": feedback, **{k: summary.get(k) for k in ("period", "entity", "segments", "tail",
                                                                   "perm_importance")}}
-    data = _llm_json(_specs_prompt(question, facts, "см. колонки", columns, task_text, 10), "fe_refine",
-                     timeout=150)
+    data = _llm_json(_specs_prompt(question, facts, "см. колонки", columns, task_text, 10, planned), "fe_refine",
+                     timeout=240, retries=0)
     return _parse_specs(data, 12)
 
 
