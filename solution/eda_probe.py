@@ -1,8 +1,6 @@
-"""EDA-зонд: компактные факты о данных для планировщика экспериментов.
+"""EDA-примитивы: ключи строк, временные колонки, квази-ID объекта, дубли.
 
-Факты считаются по выборкам и укладываются в лимит времени. Результат —
-небольшой JSON-совместимый dict: его читает LLM-планировщик, по нему же
-работает пороговый фолбэк без LLM.
+Используются детекторами AutoEDA (eda_detectors) и DSL признаков (fe_dsl).
 """
 
 from __future__ import annotations
@@ -11,8 +9,6 @@ import time
 
 import numpy as np
 import pandas as pd
-
-from agent_utils import log
 
 MAX_ROWS = 50_000          # общая выборка для статистик колонок
 QID_MAX_ROWS = 200_000     # квази-ID ломается от сабсемплинга: группы дробятся
@@ -52,25 +48,6 @@ def _is_cat(s: pd.Series) -> bool:
     return s.dtype == object or str(s.dtype) in ("category", "bool")
 
 
-def _columns_facts(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) -> dict:
-    cols = {}
-    for c in features:
-        s = train[c]
-        d = {"t": "cat" if _is_cat(s) else "num", "nu": int(s.nunique()), "miss": round(float(s.isna().mean()), 3)}
-        if d["t"] == "num" and d["nu"] > 2:
-            try:
-                d["skew"] = round(float(s.skew()), 2)
-            except (TypeError, ValueError):
-                pass
-        if d["nu"] <= 50:
-            # Доля строк test со значением, которого нет в train: сдвиг распределения.
-            unseen = float((~test[c].isin(set(s.dropna().unique()))).mean())
-            if unseen > 0:
-                d["test_unseen"] = round(unseen, 3)
-        cols[c] = d
-    return cols
-
-
 def _temporal_candidates(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) -> list[dict]:
     """Числовые колонки-«периоды»: значения test не пересекаются с train и лежат правее."""
     out = []
@@ -91,20 +68,36 @@ def _temporal_candidates(train: pd.DataFrame, test: pd.DataFrame, features: list
     return out
 
 
+def target_matrix(y: pd.Series, problem_type: str, max_classes: int = 20) -> np.ndarray | None:
+    """Таргет как матрица n×K: регрессия — один столбец, классификация — one-hot."""
+    if problem_type == "regression":
+        return pd.to_numeric(y, errors="coerce").to_numpy(float).reshape(-1, 1)
+    ys = y.astype(str).to_numpy()
+    classes = pd.unique(ys)
+    if len(classes) > max_classes:
+        return None
+    return np.column_stack([(ys == c).astype(float) for c in classes])
+
+
 def _quasi_id(train: pd.DataFrame, test: pd.DataFrame, target: str, features: list[str],
-              exclude: set[str], deadline: float) -> dict | None:
+              exclude: set[str], deadline: float, problem_type: str = "regression") -> dict | None:
     """Жадный beam-поиск ключа группы (1–4 колонки), повторяющегося в train и test.
 
     Скор = покрытие_test × (1 − std_внутри/std_глобальный). Внутригрупповой std —
-    пулированный по группам размера ≥2 (с поправкой на число групп).
+    пулированный по группам размера ≥2 (с поправкой на число групп); для
+    классификации — по one-hot таргету (сумма дисперсий индикаторов классов).
     """
-    y = pd.to_numeric(train[target], errors="coerce")
-    ok = y.notna().to_numpy()
-    train, y = train.loc[ok], y[ok].to_numpy(float)
+    train = train.loc[train[target].notna()]
+    Y = target_matrix(train[target], problem_type)
+    if Y is None:
+        return None
+    ok = ~np.isnan(Y).any(axis=1)
+    train, Y = train.loc[ok], Y[ok]
     n_tr = len(train)
-    g_std = float(y.std())
+    g_std = float(np.sqrt(Y.var(axis=0, ddof=1).sum())) if n_tr > 1 else 0.0
     if n_tr < 100 or g_std == 0:
         return None
+    ycols = [f"y{i}" for i in range(Y.shape[1])]
 
     cands = []
     for c in features:
@@ -132,9 +125,10 @@ def _quasi_id(train: pd.DataFrame, test: pd.DataFrame, target: str, features: li
             k = pd.factorize(k * (codes[c].max() + 1) + codes[c])[0].astype(np.int64)
         ktr, kte = k[:n_tr], k[n_tr:]
         coverage = float(np.isin(kte, ktr).mean())
-        df = pd.DataFrame({"k": ktr, "y": y})
-        grp = df.groupby("k")["y"]
-        cnt = grp.transform("size").to_numpy()
+        df = pd.DataFrame(Y, columns=ycols)
+        df["k"] = ktr
+        grp = df.groupby("k")
+        cnt = grp[ycols[0]].transform("size").to_numpy()
         rep = cnt >= 2
         n_groups = int(pd.Series(ktr[rep]).nunique())
         dof = int(rep.sum()) - n_groups
@@ -142,7 +136,7 @@ def _quasi_id(train: pd.DataFrame, test: pd.DataFrame, target: str, features: li
         if dof < 30 or rep.mean() < 0.02:
             res.update(score=0.0, std_within=None)
             return res
-        dev = (y - grp.transform("mean").to_numpy())[rep]
+        dev = (Y - grp[ycols].transform("mean").to_numpy())[rep]
         within = float(np.sqrt((dev ** 2).sum() / dof))
         res.update(std_within=round(within, 4), score=round(coverage * max(0.0, 1 - within / g_std), 4))
         return res
@@ -182,13 +176,14 @@ def _quasi_id(train: pd.DataFrame, test: pd.DataFrame, target: str, features: li
     k = codes[best["key"][0]]
     for c in best["key"][1:]:
         k = pd.factorize(k * (codes[c].max() + 1) + codes[c])[0].astype(np.int64)
-    df = pd.DataFrame({"k": k[:n_tr], "y": y})
-    s = df.groupby("k")["y"].transform("sum").to_numpy()
-    n = df.groupby("k")["y"].transform("size").to_numpy()
+    df = pd.DataFrame(Y, columns=ycols)
+    df["k"] = k[:n_tr]
+    s = df.groupby("k")[ycols].transform("sum").to_numpy()
+    n = df.groupby("k")[ycols[0]].transform("size").to_numpy()
     rep = n >= 2
-    loo = (s[rep] - y[rep]) / (n[rep] - 1)
+    loo = (s[rep] - Y[rep]) / (n[rep] - 1)[:, None]
     best = dict(best)
-    best["loo_rmse"] = round(float(np.sqrt(np.mean((y[rep] - loo) ** 2))), 4)
+    best["loo_rmse"] = round(float(np.sqrt(np.mean(((Y[rep] - loo) ** 2).sum(axis=1)))), 4)
     best["std_global"] = round(g_std, 4)
     best["compression"] = round(g_std / best["std_within"], 2) if best["std_within"] else None
     return {
@@ -214,43 +209,3 @@ def _duplicates(train: pd.DataFrame, test: pd.DataFrame, target: str, features: 
         "test_in_train_share": round(float(in_train.mean()), 4),
         "test_in_train_pure_share": round(float(pd.Series(kte).isin(pure).mean()), 4),
     }
-
-
-def build_facts(prof: dict, time_limit: float = 60.0) -> dict:
-    """Компактный dict фактов о задаче (для LLM-плана и порогового фолбэка)."""
-    t0 = time.time()
-    deadline = t0 + time_limit
-    target, ptype = prof["target"], prof["problem_type"]
-    features = list(prof.get("base_features") or prof["features"])
-    train_full, test_full = prof["train"], prof["test"]
-    train, test = _sample(train_full, MAX_ROWS), _sample(test_full, MAX_ROWS)
-
-    facts: dict = {
-        "problem_type": ptype, "metric": prof["metric"], "target": target,
-        "n_train": len(train_full), "n_test": len(test_full), "n_features": len(features),
-    }
-    facts["columns"] = _columns_facts(train, test, features)
-    facts["temporal_candidates"] = _temporal_candidates(train_full, test_full, features)
-
-    y = train_full[target].dropna()
-    if ptype == "regression":
-        yn = pd.to_numeric(y, errors="coerce").dropna()
-        facts["target_stats"] = {
-            "mean": round(float(yn.mean()), 4), "std": round(float(yn.std()), 4),
-            "min": round(float(yn.min()), 4), "max": round(float(yn.max()), 4),
-            "skew": round(float(yn.skew()), 3),
-        }
-        if time.time() < deadline:
-            temporal = {t["column"] for t in facts["temporal_candidates"]}
-            facts["quasi_id"] = _quasi_id(
-                _sample(train_full, QID_MAX_ROWS), _sample(test_full, QID_MAX_ROWS),
-                target, features, temporal, deadline,
-            )
-    else:
-        vc = y.astype(str).value_counts(normalize=True)
-        facts["classes"] = {k: round(float(v), 4) for k, v in vc.head(30).items()}
-        if time.time() < deadline:
-            facts["duplicates"] = _duplicates(train_full, test_full, target, features)
-
-    log(f"EDA-зонд: {time.time() - t0:.1f}s")
-    return facts
