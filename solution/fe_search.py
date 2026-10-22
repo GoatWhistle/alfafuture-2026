@@ -366,7 +366,8 @@ def perm_importance(ctx: dict, ev: Evaluator, top: int = 15) -> list[dict]:
         if c not in Xva.columns:
             continue
         Xp = Xva.copy()
-        Xp[c] = Xp[c].to_numpy()[rng.permutation(len(Xp))]
+        # iloc + set_axis сохраняет dtype (category), иначе LightGBM отвергает матрицу.
+        Xp[c] = Xp[c].iloc[rng.permutation(len(Xp))].set_axis(Xp.index)
         drop = sign * (base - score_pred(ctx, yva, predict(Xp))) / max(abs(base), 1e-9)
         out.append({"col": c, "perm_drop": round(float(drop), 4), "corr": round(_target_corr(ctx, c), 3)})
     return sorted(out, key=lambda r: -r["perm_drop"])
