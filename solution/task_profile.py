@@ -182,107 +182,63 @@ def _llm_parse(task_text: str, columns: list[str], target: str, facts: dict) -> 
 
 
 # ---------------------------------------------------------------------------
-# План экспериментов по фактам EDA-зонда.
+# Семантические гипотезы FE от LLM (спеки DSL, без кода).
 # ---------------------------------------------------------------------------
 
-# Каталог блоков: LLM выбирает и упорядочивает, но не пишет код.
-EDA_BLOCKS = {
-    "fe_group": "регрессия: cross-fitted статистики таргета (mean/median/std/count) по группе "
-                "key_columns — когда квази-ID здания/объекта повторяется в test и сжимает std таргета; "
-                'params: {"key_columns": [1-4 колонки]}',
-    "temporal_holdout": "оценка и выбор моделей на последнем периоде train, когда test — будущий период; "
-                        'params: {"column": "<колонка периода>"}',
-    "fe_log_ratio": "генерация признаков: log1p тяжёлых хвостов + отношения топ-важных числовых",
-    "label_copy_dups": "классификация: копировать метку train в test для точных дублей признаков "
-                       "без конфликта меток",
-    "class_weights": "классификация с macro-метрикой: подбор классовых множителей вероятностей",
-    "blend": "смесь AutoGluon и k-fold LightGBM по OOF",
-}
-REGRESSION_ONLY = {"fe_group"}
-CLASSIFICATION_ONLY = {"label_copy_dups", "class_weights"}
+DSL_HELP = """Операции DSL (cols — колонки train; target — таргет):
+- group_stat: статистика по группе; cols=[] -> таргет (cross-fitted), cols=[col] -> признак;
+  params {"keys": [1-5 колонок], "aggs": ["mean","median","std","count"], "bin": <число квантильных бинов числовых ключей>}
+- group_dev: cols=[col] минус среднее col по группе; params {"keys": [...]}
+- lag: история объекта в прошлых периодах; cols=[] -> таргет, cols=[col] -> признак;
+  params {"keys": [ключ объекта], "period": "<колонка периода>", "aggs": ["last","mean","count","gap"]}
+- ratio | diff | prod: cols=[a, b] — a/b, a-b, a*b
+- agg_cols: cols=[однородные колонки], params {"aggs": ["mean","std","min","max","sum","range"]}
+- log | rank | count_enc | missing_ind: cols=[col]
+- bin: cols=[col], params {"bins": q}; interaction: cols=[a, b], params {"bins": q} — код пары
+- knn_target: cols=[числовые], params {"k": 10} — таргет ближайших соседей
+- drop: cols=[col] — удалить признак (утечка/дрейф)"""
 
 
-def _validate_plan(raw, columns: set[str], problem_type: str) -> list[dict] | None:
-    """Отбрасывает неизвестные/неприменимые блоки и параметры с несуществующими колонками."""
-    if not isinstance(raw, list):
-        return None
-    plan, seen = [], set()
-    for item in raw:
-        if not isinstance(item, dict):
+def _dictionary_text(dd: pd.DataFrame | None, columns: list[str], limit: int = 6000) -> str:
+    if dd is None:
+        return "нет"
+    low = {c.lower(): c for c in dd.columns}
+    feat = low.get("feature") or dd.columns[0]
+    rows = []
+    for _, r in dd.iterrows():
+        if str(r[feat]) not in columns:
             continue
-        name = item.get("block")
-        if name not in EDA_BLOCKS or name in seen:
-            continue
-        if problem_type == "regression" and name in CLASSIFICATION_ONLY:
-            continue
-        if problem_type != "regression" and name in REGRESSION_ONLY:
-            continue
-        params = item.get("params") if isinstance(item.get("params"), dict) else {}
-        if name == "fe_group":
-            keys = params.get("key_columns")
-            if not isinstance(keys, list) or not 1 <= len(keys) <= 4 or not set(keys) <= columns:
-                log(f"план: fe_group с невалидным ключом {keys!r} отброшен")
-                continue
-            params = {"key_columns": list(dict.fromkeys(keys))}
-        elif name == "temporal_holdout":
-            col = params.get("column")
-            if col not in columns:
-                log(f"план: temporal_holdout с невалидной колонкой {col!r} отброшен")
-                continue
-            params = {"column": col}
-        else:
-            params = {}
-        seen.add(name)
-        plan.append({"block": name, "params": params, "why": str(item.get("why", ""))[:300]})
-    return plan or None
+        rows.append(" | ".join(str(r[c]) for c in dd.columns if c != low.get("role")))
+    return "\n".join(rows)[:limit]
 
 
-def llm_eda_plan(task_text: str, facts: dict, columns: list[str]) -> list[dict] | None:
-    """Qwen интерпретирует факты зонда: упорядоченный список блоков из каталога."""
-    ptype = facts.get("problem_type")
-    catalog = "\n".join(f"- {k}: {v}" for k, v in EDA_BLOCKS.items())
+def llm_propose_specs(task_text: str, summary: dict, dd: pd.DataFrame | None, columns: list[str]) -> dict | None:
+    """Qwen по сводке детекторов и словарю данных предлагает семантические признаки.
+
+    Возвращает {"specs": [сырые спеки], "entity": [...]|None, "period": str|None}
+    или None. Спеки валидирует fe_dsl.validate на стороне вызывающего.
+    """
     prompt = (
-        "Ты планируешь эксперименты AutoML-агента для табличной задачи. Ниже факты "
-        "автоматического EDA и каталог блоков. Выбери полезные блоки и упорядочь их. "
-        "Используй только блоки из каталога; колонки — только из фактов. "
-        "Каждый блок затем проверяется на валидации, так что включай блок, если факты его поддерживают. "
-        'Верни СТРОГО один JSON: {"plan": [{"block": "<имя>", "params": {...}, "why": "<кратко>"}]}.\n\n'
-        f"Тип задачи: {ptype}, метрика: {facts.get('metric')}.\n"
-        f"Каталог блоков:\n{catalog}\n\n"
-        f"Факты EDA (JSON):\n{json.dumps(facts, ensure_ascii=False)[:9000]}\n\n"
-        "Описание задачи:\n" + task_text[:4000]
+        "Ты — опытный дата-сайентист. AutoML-агент автоматически нашёл зависимости в табличных данных "
+        "(сводка ниже). Предложи до 15 НОВЫХ признаков, опираясь на смысл колонок из словаря данных: "
+        "физические величины (например, полное потребление = площадь × удельное), амплитуды, суммы "
+        "однородных показателей, отношения, история объекта. Не повторяй спеки детекторов. "
+        "Каждая гипотеза проверяется на валидации, бесполезные отбрасываются. "
+        "Используй ТОЛЬКО операции DSL и ТОЛЬКО колонки из списка; таргет в признаки не подставляй.\n\n"
+        f"{DSL_HELP}\n\n"
+        'Верни СТРОГО один JSON: {"specs": [{"op": "...", "cols": [...], "params": {...}, "why": "..."}], '
+        '"entity": [колонки ключа объекта или пусто], "period": "<колонка периода или null>"}.\n\n'
+        f"Колонки: {columns[:200]}\n\n"
+        f"Словарь данных:\n{_dictionary_text(dd, columns)}\n\n"
+        f"Сводка детекторов (JSON):\n{json.dumps(summary, ensure_ascii=False, default=str)[:6000]}\n\n"
+        "Описание задачи:\n" + task_text[:3000]
     )
-    data = _llm_json(prompt, "eda_plan", timeout=90)
-    if not data:
+    data = _llm_json(prompt, "fe_specs", timeout=120)
+    if not data or not isinstance(data.get("specs"), list):
         return None
-    return _validate_plan(data.get("plan"), set(columns), ptype)
-
-
-def default_eda_plan(facts: dict) -> list[dict]:
-    """Пороговый план без LLM — те же блоки по тем же фактам."""
-    ptype = facts.get("problem_type")
-    plan = []
-    qid = (facts.get("quasi_id") or {}).get("best")
-    if ptype == "regression" and qid and qid.get("coverage", 0) > 0.4 and (qid.get("compression") or 0) > 3:
-        plan.append({
-            "block": "fe_group", "params": {"key_columns": qid["key"]},
-            "why": f"квази-ID покрывает {qid['coverage']:.0%} test, сжатие std {qid['compression']}×",
-        })
-    temporal = facts.get("temporal_candidates") or []
-    if temporal:
-        col = temporal[0]["column"]
-        plan.append({"block": "temporal_holdout", "params": {"column": col}, "why": f"test — новый период по {col}"})
-    dups = facts.get("duplicates") or {}
-    if ptype != "regression" and dups.get("test_in_train_share", 0) > 0.02:
-        plan.append({
-            "block": "label_copy_dups", "params": {},
-            "why": f"{dups['test_in_train_share']:.1%} строк test — точные дубли train",
-        })
-    plan.append({"block": "fe_log_ratio", "params": {}, "why": "базовая генерация признаков"})
-    plan.append({"block": "blend", "params": {}, "why": "всегда"})
-    if ptype != "regression":
-        plan.append({"block": "class_weights", "params": {}, "why": "всегда для macro-метрик"})
-    return plan
+    entity = data.get("entity") if isinstance(data.get("entity"), list) else None
+    period = data.get("period") if isinstance(data.get("period"), str) else None
+    return {"specs": data["specs"][:20], "entity": entity, "period": period}
 
 
 def build_profile(task_path: Path) -> dict:
@@ -323,6 +279,7 @@ def build_profile(task_path: Path) -> dict:
         target_cols = [c for c in train.columns if c not in test.columns and c != id_col][:1]
 
     # Кросс-чек по data_dictionary (role: id/target).
+    dd = None
     if dict_p is not None:
         try:
             dd = _read_csv(dict_p)
@@ -385,6 +342,7 @@ def build_profile(task_path: Path) -> dict:
         "train": train,
         "test": test,
         "sample": sample,
+        "data_dictionary": dd,
         "id_col": id_col,
         "target_cols": target_cols,
         "target": target,

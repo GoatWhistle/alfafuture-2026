@@ -4,9 +4,9 @@
 Результат: submission.csv рядом с task.md.
 
 Каскад с гарантией результата: константный сабмит -> быстрый LightGBM ->
-EDA-зонд и план экспериментов (Qwen или пороги) -> блоки признаков из плана ->
-AutoGluon -> k-fold OOF -> бленд -> подбор классовых весов -> копирование
-меток дублей. Каждая ступень перезаписывает submission.csv только когда даёт
+AutoEDA (детекторы зависимостей + гипотезы Qwen -> спеки DSL -> валидатор на
+фолдах, похожих на тест) -> AutoGluon -> k-fold OOF -> бленд -> подбор
+классовых весов -> копирование меток дублей. Каждая ступень перезаписывает submission.csv только когда даёт
 валидные предсказания, поэтому файл существует с первых минут работы.
 Все гипотезы принимаются только по улучшению на валидации.
 """
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -22,10 +23,11 @@ import numpy as np
 import pandas as pd
 
 from agent_utils import TOTAL_BUDGET_SEC, log, time_left
-from eda_probe import build_facts
+import eda_detectors
+import fe_dsl
+import fe_search
 import models
 from models import (
-    add_group_target_stats,
     ag_oof,
     ag_predict,
     align_classes,
@@ -33,7 +35,6 @@ from models import (
     constant_predictions,
     copy_duplicate_labels,
     fit_autogluon,
-    generate_candidate_features,
     is_better,
     quick_model,
     quick_oof,
@@ -43,10 +44,11 @@ from models import (
     tune_class_weights_stable,
     write_submission,
 )
-from task_profile import build_profile, default_eda_plan, llm_eda_plan
+from task_profile import build_profile, llm_propose_specs
 
 PREDICT_RESERVE_SEC = float(os.environ.get("AGENT_PREDICT_RESERVE_SEC", 900))
 KFOLD_RESERVE_SEC = float(os.environ.get("AGENT_KFOLD_RESERVE_SEC", 600))
+AUTOEDA_SEC = float(os.environ.get("AGENT_AUTOEDA_SEC", 900))
 MACRO_METRICS = ("f1_macro", "f1_weighted", "f1", "balanced_accuracy")
 EXPERIMENTS: list[dict] = []
 
@@ -90,81 +92,84 @@ def tune_quick_weights(prof: dict, quick: dict | None, target: str, current: dic
     return pred
 
 
-def _try_features(prof: dict, quick: dict, target: str, tr_new: pd.DataFrame, te_new: pd.DataFrame,
-                  name: str, hypothesis: str) -> dict:
-    """Ворота признаков: quick-модель на расширенных данных против текущей.
+def _llm_specs(prof: dict, ctx: dict, specs: list[dict]) -> list[dict]:
+    """Семантические спеки Qwen по сводке детекторов; prior — медиана детекторов."""
+    if time_left() < 1800:
+        return []
+    columns = list(ctx["features"])
+    proposal = llm_propose_specs(prof["task_text"], eda_detectors.summary(ctx, specs),
+                                 prof.get("data_dictionary"), columns)
+    if not proposal:
+        return []
+    prior = float(np.median([s["prior"] for s in specs])) if specs else 0.0
+    numeric = set(eda_detectors._numeric(ctx))
+    raw = list(proposal["specs"])
+    entity = proposal.get("entity")
+    if entity and ctx["entity"] is None:
+        raw.append({"op": "group_stat", "cols": [], "params": {"keys": entity, "src": "target",
+                    "aggs": list(fe_dsl.TARGET_AGGS)}, "why": "ключ объекта по мнению LLM"})
+    seen = {fe_dsl.spec_key(s) for s in specs}
+    out = []
+    for r in raw:
+        if isinstance(r, dict):
+            r = {**r, "source": "qwen", "prior": prior}
+        v = fe_dsl.validate(r, columns, numeric)
+        if v is None:
+            log(f"LLM-спека отброшена: {r}")
+            continue
+        if fe_dsl.spec_key(v) not in seen:
+            seen.add(fe_dsl.spec_key(v))
+            out.append(v)
+    log(f"LLM предложила {len(raw)} спек, валидных новых {len(out)}; period-подсказка={proposal.get('period')}")
+    return out
 
-    Принято -> prof мутируется (AutoGluon и k-fold учатся на расширенных
-    данных), возвращается новая quick-модель как опорная точка.
+
+def run_autoeda(prof: dict, target: str, budget: float) -> dict:
+    """Детекторы -> спеки (+Qwen) -> валидатор -> принятые признаки в prof.
+
+    Возвращает {"period", "label_copy", "accepted"}: схему валидации для
+    финального выбора и флаг постпроцессинга.
     """
-    aug = dict(prof)
-    aug["train"] = pd.concat([prof["train"], tr_new], axis=1)
-    aug["test"] = pd.concat([prof["test"], te_new], axis=1)
-    aug["features"] = list(prof["features"]) + list(tr_new.columns)
-    q2 = quick_model(aug, target)
-    accepted = _clearly_better(prof["metric"], q2["val_score"], quick["val_score"])
-    register(name, hypothesis, q2["val_score"], accepted)
-    if not accepted:
-        return quick
-    prof["train"], prof["test"], prof["features"] = aug["train"], aug["test"], aug["features"]
-    return q2
-
-
-def run_feature_experiment(prof: dict, quick: dict | None, target: str) -> dict | None:
-    """Гипотеза: log1p тяжёлых хвостов и отношения топ-важных признаков."""
-    if quick is None or not quick.get("importances"):
-        return quick
-    cand = generate_candidate_features(prof, quick["importances"])
-    if cand is None:
-        return quick
-    tr_new, te_new = cand
-    return _try_features(
-        prof, quick, target, tr_new, te_new, "feature_gen",
-        f"{len(tr_new.columns)} новых признаков (log1p хвостов + отношения топ-важных)",
-    )
-
-
-def run_group_experiment(prof: dict, quick: dict | None, target: str, key_cols: list[str]) -> dict | None:
-    """Гипотеза: объект (здание и т.п.) повторяется в train и test — его история предсказывает таргет."""
-    if quick is None:
-        return quick
-    tr_new, te_new = add_group_target_stats(prof, target, key_cols)
-    return _try_features(
-        prof, quick, target, tr_new, te_new, "fe_group",
-        f"cross-fitted mean/median/std/count таргета по ключу {key_cols}",
-    )
-
-
-def make_eda_plan(prof: dict, target: str) -> list[dict]:
-    """EDA-зонд -> план блоков: Qwen по фактам, без LLM — пороги зонда."""
-    facts = {"problem_type": prof["problem_type"], "metric": prof["metric"]}
+    t0 = time.time()
+    deadline = t0 + budget
+    ctx = fe_search.build_context(prof, target, deadline)
+    specs = eda_detectors.run_all(ctx, t0 + 0.35 * budget)
     try:
-        facts = build_facts(prof)
+        specs += _llm_specs(prof, ctx, specs)
     except Exception:  # noqa: BLE001
-        log("EDA-зонд упал:\n" + traceback.format_exc())
-    plan, source = None, "qwen"
-    if "n_train" in facts and time_left() > 1800:
-        try:
-            plan = llm_eda_plan(prof["task_text"], facts, list(prof.get("base_features") or prof["features"]))
-        except Exception:  # noqa: BLE001
-            log("llm_eda_plan упал:\n" + traceback.format_exc())
-    if plan is None:
-        plan, source = default_eda_plan(facts), "пороги"
-    hyp = "; ".join(f"{p['block']}{p['params'] or ''} — {p['why']}" for p in plan)
-    register("eda_plan", f"[{source}] {hyp}", None, True)
-    return plan
+        log("LLM-спеки упали:\n" + traceback.format_exc())
+    register("autoeda_specs", f"{len(specs)} гипотез: " + "; ".join(
+        f"{s['source']}:{fe_dsl.describe(s)}" for s in sorted(specs, key=lambda s: -s["prior"])[:12]), None, True)
+    fe_search.build_folds(ctx)
+    accepted = fe_search.search(ctx, specs, deadline, register=register)
+
+    added = []
+    for spec in accepted:
+        if spec["op"] == "drop":
+            col = spec["cols"][0]
+            prof["features"] = [c for c in prof["features"] if c != col]
+            added.append(f"-{col}")
+            continue
+        res = fe_dsl.materialize(prof, spec, target, ctx["classes"])
+        if res is None:
+            continue
+        tr_new, te_new = res
+        new_cols = [c for c in tr_new.columns if c not in prof["train"].columns]
+        prof["train"] = pd.concat([prof["train"], tr_new[new_cols]], axis=1)
+        prof["test"] = pd.concat([prof["test"], te_new[new_cols]], axis=1)
+        prof["features"] = list(prof["features"]) + new_cols
+        added += new_cols
+    register("autoeda", f"схема {ctx['fold_scheme']}; принято {len(accepted)} спек -> {added}",
+             ctx.get("search_final"), bool(accepted))
+    log(f"AutoEDA: {time.time() - t0:.0f}s, признаков {len(prof['features'])}")
+    return {"period": ctx["period"], "label_copy": ctx["label_copy"], "accepted": accepted}
 
 
-def _plan_block(plan: list[dict], name: str) -> dict | None:
-    return next((p for p in plan if p["block"] == name), None)
-
-
-def temporal_mask(prof: dict, target: str, plan: list[dict]) -> np.ndarray | None:
+def temporal_mask(prof: dict, target: str, col: str | None) -> np.ndarray | None:
     """Маска строк последнего периода train (в порядке OOF) для temporal_holdout."""
-    block = _plan_block(plan, "temporal_holdout")
-    if block is None:
+    if col is None:
         return None
-    train, col = prof["train"], block["params"]["column"]
+    train = prof["train"]
     vals = pd.to_numeric(train.loc[train[target].notna(), col], errors="coerce")
     if vals.notna().sum() == 0:
         log(f"temporal_holdout: колонка {col} не числовая, пропускаю")
@@ -323,28 +328,30 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     except Exception:  # noqa: BLE001
         log("quick_lgbm упал:\n" + traceback.format_exc())
 
-    # Ступень 1.2: EDA-зонд и план экспериментов (Qwen или пороги).
+    # Ступень 1.5: AutoEDA — детекторы, гипотезы Qwen, валидатор на фолдах под тест.
     prof.setdefault("base_features", list(prof["features"]))
-    plan = make_eda_plan(prof, target)
-
-    # Ступень 1.5: блоки признаков в порядке плана, каждый со своими воротами.
-    for block in plan:
-        spare = min(budget, time_left()) - PREDICT_RESERVE_SEC - KFOLD_RESERVE_SEC
-        name = block["block"]
+    eda = {"period": None, "label_copy": False, "accepted": []}
+    spare = min(budget, time_left()) - PREDICT_RESERVE_SEC - KFOLD_RESERVE_SEC
+    eda_budget = min(AUTOEDA_SEC, 0.3 * spare)
+    if eda_budget >= 120:
         try:
-            if name == "fe_group" and spare > 900:
-                quick = run_group_experiment(prof, quick, target, block["params"]["key_columns"])
-            elif name == "fe_log_ratio" and spare > 1500:
-                quick = run_feature_experiment(prof, quick, target)
-            else:
-                continue
+            eda = run_autoeda(prof, target, eda_budget)
         except Exception:  # noqa: BLE001
-            log(f"{name} упал:\n" + traceback.format_exc())
-            continue
-        if quick is not None and quick["test_pred"] is not best_pred:
-            best_pred = quick["test_pred"]
-            current[target] = best_pred
-            write_submission(prof, current)
+            log("AutoEDA упал, работаю на исходных признаках:\n" + traceback.format_exc())
+    else:
+        log(f"Пропускаю AutoEDA: мало времени ({eda_budget:.0f}s)")
+    if eda["accepted"] and quick is not None:
+        try:
+            q2 = quick_model(prof, target)
+            better = is_better(metric, q2["val_score"], quick["val_score"])
+            register("quick_lgbm_fe", "quick-модель на признаках AutoEDA", q2["val_score"], better)
+            quick = q2
+            if better:
+                best_pred = quick["test_pred"]
+                current[target] = best_pred
+                write_submission(prof, current)
+        except Exception:  # noqa: BLE001
+            log("quick_lgbm на признаках AutoEDA упал:\n" + traceback.format_exc())
 
     # Ступень 2: AutoGluon.
     predictor = None
@@ -403,7 +410,7 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     ag_pack = (ag_score, ag_test_pred, ag_test_proba, ag_y, ag_oof_pred, ag_oof_proba, ag_classes)
     mask = None
     try:
-        mask = temporal_mask(prof, target, plan)
+        mask = temporal_mask(prof, target, eda["period"])
     except Exception:  # noqa: BLE001
         log("temporal_holdout упал:\n" + traceback.format_exc())
     try:
@@ -411,7 +418,7 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
             return _select_final_regression(prof, target, current, ag_pack, kq, best_pred, eval_mask=mask)
         return _select_final_classification(
             prof, target, current, quick, ag_pack, kq, best_pred,
-            eval_mask=mask, label_copy=_plan_block(plan, "label_copy_dups") is not None,
+            eval_mask=mask, label_copy=eda["label_copy"],
         )
     except Exception:  # noqa: BLE001
         log("Финальный выбор упал, остаётся последний записанный сабмит:\n" + traceback.format_exc())
