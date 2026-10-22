@@ -19,7 +19,7 @@ import pandas as pd
 
 import fe_dsl
 from agent_utils import log
-from eda_probe import _duplicates, _is_cat, _quasi_id, _sample, _temporal_candidates
+from eda_probe import _duplicates, _is_cat, _quasi_id, _sample, _temporal_candidates, row_keys
 
 DETECTOR_SEC = 60
 TOP_RESID_COLS = 12
@@ -379,6 +379,8 @@ def detect_neighbors(ctx: dict) -> list[dict]:
     prof, target = ctx["prof"], ctx["target"]
     dups = _duplicates(prof["train"], prof["test"], target, ctx["features"])
     ctx["facts"]["duplicates"] = dups
+    if ctx["classes"]:
+        ctx["facts"]["label_conflicts"] = label_conflicts(prof, target, ctx["features"])
     share = dups["test_in_train_share"]
     if ctx["classes"] and share > 0.02:
         ctx["label_copy"] = True
@@ -426,6 +428,158 @@ def detect_shift(ctx: dict) -> list[dict]:
             for s, c in top if s > 0.05]
 
 
+# ---------------------------------------------------------------------------
+# 10. Сегменты: смешанные режимы поведения.
+# ---------------------------------------------------------------------------
+
+SEG_MIN_SHARE = 0.05
+SEG_CORR_COLS = 8
+
+
+def _segment_candidates(ctx: dict) -> list[tuple[str, dict, np.ndarray]]:
+    """Естественные разделители: пропуск, ноль/не ноль, малокардинальные категории."""
+    df, out = ctx["df"], []
+    for c in ctx["features"]:
+        if c == ctx["period"]:
+            continue
+        s = df[c]
+        miss = float(s.isna().mean())
+        if SEG_MIN_SHARE < miss < 1 - SEG_MIN_SHARE:
+            out.append((c, {"rule": "nan"}, s.isna().to_numpy(np.int64)))
+        nu = s.nunique()
+        if _is_cat(s) or nu <= fe_dsl.SEGMENT_MAX_LEVELS:
+            if 2 <= nu <= fe_dsl.SEGMENT_MAX_LEVELS + 1:
+                spec = {"cols": [c], "params": {"rule": "level"}}
+                codes, _ = fe_dsl.segment_codes(spec, df, df.iloc[:0])
+                out.append((c, {"rule": "level"}, codes))
+        elif pd.api.types.is_numeric_dtype(s):
+            z = float((s == 0).mean())
+            if SEG_MIN_SHARE < z < 1 - SEG_MIN_SHARE:
+                out.append((c, {"rule": "zero"}, (s == 0).to_numpy(np.int64)))
+    return out
+
+
+def _agreement(a: np.ndarray, b: np.ndarray) -> float:
+    """Доля строк, где два разбиения совпадают (с точностью до перенумерации сегментов)."""
+    ct = pd.crosstab(a, b).to_numpy()
+    return float(ct.max(axis=1).sum() / len(a))
+
+
+def detect_segments(ctx: dict) -> list[dict]:
+    """Сегмент, внутри которого связи признаков другие, чем в целом (смена знака
+    корреляций), и остатки модели смещены: кандидат на отдельные модели."""
+    df = ctx["df"]
+    t_end = time.time() + DETECTOR_SEC
+    num = [c for c in _top_important(ctx, _numeric(ctx), SEG_CORR_COLS + 4) if df[c].nunique() > 2]
+    found = []
+    for col, params, codes in _segment_candidates(ctx):
+        if time.time() > t_end:
+            break
+        cols = [c for c in num if c != col][:SEG_CORR_COLS]
+        if len(cols) < 2:
+            continue
+        R = df[cols].rank().to_numpy(float)
+        R = np.where(np.isnan(R), np.nanmean(R, axis=0), R)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            c_all = np.nan_to_num(np.corrcoef(R, rowvar=False))
+        iu = np.triu_indices(len(cols), 1)
+        shift, flips = 0.0, []
+        shares = np.bincount(codes) / len(codes)
+        if (shares[shares > 0] >= 1 - SEG_MIN_SHARE).any():
+            continue
+        for code in np.unique(codes):
+            m = codes == code
+            if m.sum() < 300:
+                continue
+            with np.errstate(invalid="ignore", divide="ignore"):
+                c_seg = np.nan_to_num(np.corrcoef(R[m], rowvar=False))
+            d = np.abs(c_seg - c_all)[iu]
+            shift += m.mean() * float(d.mean())
+            k = int(np.argmax(d))
+            a, b = cols[iu[0][k]], cols[iu[1][k]]
+            flips.append({"segment": int(code), "share": round(float(m.mean()), 3), "pair": [a, b],
+                          "corr_all": round(float(c_all[iu][k]), 2), "corr_seg": round(float(c_seg[iu][k]), 2)})
+        w = omega2(ctx["resid"], codes)
+        balance = min(1.0, 4 * float(shares[shares > 0].min()))
+        found.append({"col": col, **params, "corr_shift": round(shift, 4), "resid_omega2": round(w, 4),
+                      "score": (shift + w) * balance, "_codes": codes,
+                      "flip": max(flips, key=lambda f: abs(f["corr_all"] - f["corr_seg"]), default=None)})
+    found.sort(key=lambda r: -r["score"])
+    # Одинаковое разбиение разными колонками (dbytes==0 ⇔ dpkts==0) — один сегмент.
+    uniq = []
+    for r in found:
+        if all(_agreement(r["_codes"], u["_codes"]) < 0.98 for u in uniq):
+            uniq.append(r)
+        else:
+            next(u for u in uniq if _agreement(r["_codes"], u["_codes"]) >= 0.98).setdefault("same_as", []).append(r["col"])
+    found = uniq
+    ctx["facts"]["segments"] = [{k: v for k, v in r.items() if k not in ("score", "_codes")} for r in found[:8]]
+    out = []
+    for r in found[:4]:
+        params = {"rule": r["rule"]}
+        why = f"сегмент {r['col']}:{r['rule']}, сдвиг корреляций {r['corr_shift']}"
+        if r["flip"]:
+            f = r["flip"]
+            why += f"; {f['pair'][0]}–{f['pair'][1]}: {f['corr_all']:+.2f} в целом, {f['corr_seg']:+.2f} в сегменте"
+        out.append(_spec("segment_model", [r["col"]], params, "segments", r["score"], why))
+        out.append(_spec("flag", [r["col"]], params, "segments", r["score"] * 0.3, "индикатор сегмента " + r["col"]))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 11. Хвост ошибок: какие строки определяют метрику.
+# ---------------------------------------------------------------------------
+
+def detect_tail(ctx: dict) -> list[dict]:
+    df, r = ctx["df"], ctx["resid"]
+    out = []
+    if ctx["classes"] is None:
+        e = r ** 2
+        order = np.sort(e)[::-1]
+        total = max(float(order.sum()), 1e-12)
+        n1, n5 = max(1, len(e) // 100), max(1, len(e) // 20)
+        tail = e >= order[n5 - 1]
+        facts = {"sse_share_top1pct": round(float(order[:n1].sum() / total), 3),
+                 "sse_share_top5pct": round(float(order[:n5].sum() / total), 3)}
+    else:
+        # Классификация: доля ошибок по истинному классу и «хвост» самых уверенных ошибок.
+        pred = np.argmax(ctx["oof"], axis=1)
+        wrong = pred != ctx["y_idx"]
+        per = pd.Series(wrong).groupby(pd.Series(ctx["y"])).mean().sort_values(ascending=False)
+        facts = {"error_rate_by_class": {str(k): round(float(v), 3) for k, v in per.head(10).items()}}
+        tail = wrong & (r >= np.quantile(r, 0.95))
+    # Что объединяет хвост: колонки, где индикатор хвоста объяснён лучше всего.
+    ind = tail.astype(float)
+    scored = sorted(((omega2(ind, _codes(df[c])), c) for c in ctx["features"]), reverse=True)[:5]
+    facts["tail_characterized_by"] = [{"col": c, "omega2": round(w, 4)} for w, c in scored if w > 0]
+    ctx["facts"]["tail"] = facts
+    log(f"AutoEDA tail: {facts}")
+    if ctx["classes"] is None:
+        share = facts["sse_share_top1pct"]
+        alpha = float(np.quantile(np.abs(r), 0.9))
+        for name in ("huber", "fair"):
+            out.append(_spec("objective", [], {"name": name, "alpha": alpha}, "tail", share * 0.05,
+                             f"1% строк дают {share:.0%} SSE — устойчивая функция потерь"))
+    for w, c in scored[:2]:
+        if w > 0 and (_is_cat(df[c]) or df[c].nunique() <= fe_dsl.SEGMENT_MAX_LEVELS + 1):
+            out.append(_spec("segment_model", [c], {"rule": "level"}, "tail", w,
+                             f"хвост ошибок сосредоточен по {c}"))
+    return out
+
+
+def label_conflicts(prof: dict, target: str, features: list[str]) -> dict:
+    """Неоднозначность меток: доля строк каждого класса в группах одинаковых признаков с разными классами."""
+    lab = _sample(prof["train"].loc[prof["train"][target].notna()], 300_000)
+    k = row_keys(lab, features)
+    y = lab[target].astype(str).to_numpy()
+    df = pd.DataFrame({"k": k, "y": y})
+    nlab = df.groupby("k")["y"].transform("nunique").to_numpy()
+    conflict = nlab > 1
+    per = pd.Series(conflict).groupby(pd.Series(y)).mean().sort_values(ascending=False)
+    return {"conflict_rows": int(conflict.sum()),
+            "by_class": {str(c): round(float(v), 3) for c, v in per.items() if v > 0}}
+
+
 DETECTORS = [
     ("entities", detect_entities),
     ("temporal", detect_temporal),
@@ -433,6 +587,8 @@ DETECTORS = [
     ("categoricals", detect_categoricals),
     ("homogeneous", detect_homogeneous),
     ("neighbors", detect_neighbors),
+    ("segments", detect_segments),
+    ("tail", detect_tail),
     ("missingness", detect_missingness),
     ("transforms", detect_transforms),
     ("shift", detect_shift),
@@ -472,14 +628,20 @@ def run_all(ctx: dict, deadline: float) -> list[dict]:
 
 
 def summary(ctx: dict, specs: list[dict], top: int = 25) -> dict:
-    """Сводка для LLM: схема валидации, сущность и лучшие спеки детекторов."""
+    """Сводка фактов для LLM: каждая тема промпта берёт свои ключи."""
+    f = ctx["facts"]
+    ranked = sorted(specs, key=lambda s: -s["prior"])
+
+    def brief(rows):
+        return [{"spec": fe_dsl.describe(s), "source": s["source"], "prior": round(s["prior"], 4)} for s in rows]
+
     return {
-        "problem_type": ctx["ptype"], "metric": ctx["metric"],
+        "problem_type": ctx["ptype"], "metric": ctx["metric"], "scheme": ctx.get("fold_scheme"),
         "period": ctx["period"], "entity": ctx["entity"],
-        "duplicates": ctx["facts"].get("duplicates"), "adversarial": ctx["facts"].get("adversarial"),
-        "top_importances": dict(sorted(ctx["importances"].items(), key=lambda kv: -kv[1])[:15]),
-        "detector_specs": [
-            {"spec": fe_dsl.describe(s), "source": s["source"], "prior": round(s["prior"], 4)}
-            for s in sorted(specs, key=lambda s: -s["prior"])[:top]
-        ],
+        "duplicates": f.get("duplicates"), "adversarial": f.get("adversarial"),
+        "segments": f.get("segments"), "tail": f.get("tail"), "label_conflicts": f.get("label_conflicts"),
+        "perm_importance": f.get("perm_importance"),
+        "top_importances": {k: round(v, 4) for k, v in sorted(ctx["importances"].items(), key=lambda kv: -kv[1])[:15]},
+        "residual_specs": brief([s for s in ranked if s["source"].startswith("residuals")][:10]),
+        "detector_specs": brief(ranked[:top]),
     }

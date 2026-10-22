@@ -181,10 +181,70 @@ def quick_model(prof: dict, target: str, max_rows: int = 300_000) -> dict:
     return result
 
 
+SEG_MIN_ROWS = 300
+
+
+def _segment_codes(prof: dict, target: str):
+    """Коды сегментов train (размеченные строки) и test по принятой segment_model, иначе None."""
+    import fe_dsl
+
+    seg = (prof.get("model_ops") or {}).get("segment_model")
+    if seg is None:
+        return None, None, None
+    train = prof["train"]
+    lab = train.loc[train[target].notna()]
+    ctr, cte = fe_dsl.segment_codes(seg, lab, prof["test"])
+    return seg, ctr, cte
+
+
+def _fit_fold(make, X, y, tr_i, va_i, Xte, ctr, cte, classes=None):
+    """Модель фолда (по сегментам, если заданы коды): предсказания val и test.
+
+    Регрессия — векторы, классификация — вероятности в порядке classes.
+    Сегмент с малым train предсказывает общая модель.
+    """
+    import lightgbm as lgb
+
+    def fit(rows_tr, code=None):
+        m = make()
+        va_rows = va_i if code is None else va_i[ctr[va_i] == code]
+        if len(va_rows) == 0:
+            va_rows = va_i
+        m.fit(X.iloc[rows_tr], y.iloc[rows_tr], eval_set=[(X.iloc[va_rows], y.iloc[va_rows])],
+              callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)])
+        return m
+
+    def pred(m, Xp):
+        if classes is None:
+            return m.predict(Xp)
+        out = np.zeros((len(Xp), len(classes)))
+        pos = {c: i for i, c in enumerate(classes)}
+        out[:, [pos[c] for c in m.classes_]] = m.predict_proba(Xp)
+        return out
+
+    glob = fit(tr_i)
+    p_va, p_te = pred(glob, X.iloc[va_i]), pred(glob, Xte)
+    if ctr is None:
+        return p_va, p_te
+    for code in np.unique(ctr[tr_i]):
+        rows = tr_i[ctr[tr_i] == code]
+        if len(rows) < SEG_MIN_ROWS or (classes is not None and y.iloc[rows].nunique() < 2):
+            continue
+        m = fit(rows, code)
+        mv, mt = ctr[va_i] == code, cte == code
+        if mv.any():
+            p_va[mv] = pred(m, X.iloc[va_i[mv]])
+        if mt.any():
+            p_te[mt] = pred(m, Xte[mt])
+    return p_va, p_te
+
+
 def quick_oof(prof: dict, target: str, n_splits: int = 5, max_rows: int = 400_000) -> dict | None:
     """K-fold LightGBM: OOF на всём train (выравнен с OOF AutoGluon) + предсказания test.
 
-    Возвращает None, когда датасет слишком велик для честного полнорядного OOF.
+    Учитывает модельные операции AutoEDA (prof["model_ops"]): отдельные модели
+    по сегментам и функцию потерь регрессии. Возвращает None, когда датасет
+    слишком велик для честного полнорядного OOF.
     """
     import lightgbm as lgb
     from sklearn.model_selection import KFold, StratifiedKFold
@@ -197,6 +257,9 @@ def quick_oof(prof: dict, target: str, n_splits: int = 5, max_rows: int = 400_00
     y_orig = y.to_numpy()
     if prof["log_target"]:
         y = np.log1p(y.clip(lower=0))
+    seg, ctr, cte = _segment_codes(prof, target)
+    if seg is not None:
+        log(f"quick_oof: отдельные модели по сегментам {seg['cols'][0]}:{seg['params']['rule']}")
 
     common = dict(
         n_estimators=1500, learning_rate=0.05, num_leaves=127,
@@ -204,16 +267,20 @@ def quick_oof(prof: dict, target: str, n_splits: int = 5, max_rows: int = 400_00
         n_jobs=N_CPUS, random_state=7, verbosity=-1,
     )
     if ptype == "regression":
+        obj = {"objective": "regression"}
+        o = (prof.get("model_ops") or {}).get("objective")
+        if o is not None:
+            p = o["params"]
+            obj = {"objective": p["name"]}
+            if "alpha" in p:
+                obj["alpha" if p["name"] == "huber" else "fair_c"] = p["alpha"]
+            log(f"quick_oof: функция потерь {obj}")
         oof = np.zeros(len(X))
         te = np.zeros(len(Xte))
         for tr_i, va_i in KFold(n_splits, shuffle=True, random_state=7).split(X):
-            m = lgb.LGBMRegressor(objective="regression", **common)
-            m.fit(
-                X.iloc[tr_i], y.iloc[tr_i], eval_set=[(X.iloc[va_i], y.iloc[va_i])],
-                callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
-            )
-            oof[va_i] = m.predict(X.iloc[va_i])
-            te += m.predict(Xte) / n_splits
+            pv, pt = _fit_fold(lambda: lgb.LGBMRegressor(**obj, **common), X, y, tr_i, va_i, Xte, ctr, cte)
+            oof[va_i] = pv
+            te += pt / n_splits
         if prof["log_target"]:
             oof = np.clip(np.expm1(oof), 0, None)
             te = np.clip(np.expm1(te), 0, None)
@@ -222,19 +289,14 @@ def quick_oof(prof: dict, target: str, n_splits: int = 5, max_rows: int = 400_00
         return {"y": y_orig, "oof": oof, "test": te, "classes": None, "score": s}
 
     classes = sorted(pd.Series(y_orig).dropna().unique().tolist())
-    cls_pos = {c: i for i, c in enumerate(classes)}
     oof = np.zeros((len(X), len(classes)))
     te = np.zeros((len(Xte), len(classes)))
     cw = "balanced" if metric in ("f1_macro", "balanced_accuracy", "f1") else None
     for tr_i, va_i in StratifiedKFold(n_splits, shuffle=True, random_state=7).split(X, y):
-        m = lgb.LGBMClassifier(class_weight=cw, **common)
-        m.fit(
-            X.iloc[tr_i], y.iloc[tr_i], eval_set=[(X.iloc[va_i], y.iloc[va_i])],
-            callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
-        )
-        idx = [cls_pos[c] for c in m.classes_]
-        oof[np.ix_(va_i, idx)] = m.predict_proba(X.iloc[va_i])
-        te[:, idx] += m.predict_proba(Xte) / n_splits
+        pv, pt = _fit_fold(lambda: lgb.LGBMClassifier(class_weight=cw, **common), X, y, tr_i, va_i, Xte,
+                           ctr, cte, classes)
+        oof[va_i] = pv
+        te += pt / n_splits
     pred = np.array(classes, dtype=object)[np.argmax(oof, axis=1)]
     s = score(metric, y_orig, pred, proba=oof, labels=classes)
     log(f"quick_oof[{target}]: {metric}={s:.5f}")

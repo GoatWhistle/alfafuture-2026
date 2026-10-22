@@ -79,30 +79,72 @@ def _to_lgb(tr: pd.DataFrame, va: pd.DataFrame):
     return tr, va
 
 
-def fit_eval(ctx: dict, Xtr, ytr, Xva, yva, fast: bool = False):
-    """LightGBM с фиксированными параметрами: (score, pred|proba, importances)."""
+SEG_MIN_ROWS = 300         # сегмент меньше — предсказывает общая модель
+
+
+def fit_predict(ctx: dict, Xtr, ytr, Xva, yva, fast: bool = False, objective: dict | None = None):
+    """LightGBM с фиксированными параметрами: (pred | proba в порядке ctx["classes"], модель)."""
     import lightgbm as lgb
 
     params = _lgb_params(ctx, fast)
     cb = [lgb.early_stopping(40 if fast else 60, verbose=False), lgb.log_evaluation(0)]
-    metric = ctx["metric"]
     if ctx["ptype"] == "regression":
-        m = lgb.LGBMRegressor(objective="regression", **params)
-        m.fit(Xtr, ytr, eval_set=[(Xva, yva)], eval_metric="l1" if metric == "mae" else "rmse", callbacks=cb)
-        pred = m.predict(Xva)
-        return models.score(metric, yva, pred), pred, m.feature_importances_
-    m = lgb.LGBMClassifier(**params)
-    m.fit(Xtr, ytr, eval_set=[(Xva, yva)], callbacks=cb)
+        obj = {"objective": "regression"}
+        if objective:
+            obj = {"objective": objective["name"]}
+            if "alpha" in objective:
+                obj["alpha" if objective["name"] == "huber" else "fair_c"] = objective["alpha"]
+        m = lgb.LGBMRegressor(**obj, **params)
+        m.fit(Xtr, ytr, eval_set=[(Xva, yva)], eval_metric="l1" if ctx["metric"] == "mae" else "rmse", callbacks=cb)
+        return m.predict(Xva), m
     classes = ctx["classes"]
     proba = np.zeros((len(Xva), len(classes)))
     pos = {c: i for i, c in enumerate(classes)}
+    present = pd.unique(np.asarray(ytr))
+    if len(present) == 1:
+        proba[:, pos[present[0]]] = 1.0
+        return proba, None
+    m = lgb.LGBMClassifier(**params)
+    m.fit(Xtr, ytr, eval_set=[(Xva, yva)], callbacks=cb)
     proba[:, [pos[c] for c in m.classes_]] = m.predict_proba(Xva)
-    pred = np.array(classes, dtype=object)[np.argmax(proba, axis=1)]
+    return proba, m
+
+
+def score_pred(ctx: dict, y, pred) -> float:
+    metric = ctx["metric"]
+    if ctx["ptype"] == "regression":
+        return models.score(metric, y, pred)
+    classes = ctx["classes"]
+    lab = np.array(classes, dtype=object)[np.argmax(pred, axis=1)]
     try:
-        s = models.score(metric, yva, pred, proba=proba, labels=classes)
+        return models.score(metric, y, lab, proba=pred, labels=classes)
     except ValueError:
-        s = models.score("accuracy", yva, pred)
-    return s, proba, m.feature_importances_
+        return models.score("accuracy", y, lab)
+
+
+def fit_eval(ctx: dict, Xtr, ytr, Xva, yva, fast: bool = False):
+    """(score, pred|proba, importances) одной модели."""
+    pred, m = fit_predict(ctx, Xtr, ytr, Xva, yva, fast)
+    imp = m.feature_importances_ if m is not None else np.zeros(Xtr.shape[1])
+    return score_pred(ctx, yva, pred), pred, imp
+
+
+def fit_predict_segmented(ctx: dict, Xtr, ytr, Xva, yva, ctr, cva, objective: dict | None = None):
+    """Отдельная модель на каждый сегмент; мелкие сегменты — общей моделью."""
+    ytr, yva = np.asarray(ytr), np.asarray(yva)
+    out = np.zeros((len(Xva), len(ctx["classes"]))) if ctx["classes"] else np.zeros(len(Xva))
+    glob = None
+    for code in np.unique(cva):
+        va = cva == code
+        tr = ctr == code
+        if tr.sum() >= SEG_MIN_ROWS:
+            pred, _ = fit_predict(ctx, Xtr[tr], ytr[tr], Xva[va], yva[va], objective=objective)
+        else:
+            if glob is None:
+                glob, _ = fit_predict(ctx, Xtr, ytr, Xva, yva, objective=objective)
+            pred = glob[va]
+        out[va] = pred
+    return out
 
 
 def _base_oof(ctx: dict, n_splits: int = 3) -> None:
@@ -231,35 +273,52 @@ class Evaluator:
                         pd.DataFrame({f"null__{col}": rng.permutation(Xva[col].to_numpy())})))
         return out
 
-    def run(self, specs: list[dict], extra: list | None = None) -> list[float] | None:
-        """Скоры по фолдам для базы + specs (drop убирает колонку) + extra (готовые признаки по фолдам)."""
-        ctx = self.ctx
-        t0 = time.time()
+    def matrices(self, i: int, specs: list[dict], extra: list | None = None):
+        """Матрицы фолда i: база − drop + признаки спек + extra. None — спека не исполнилась."""
         drops = {s["cols"][0] for s in specs if s["op"] == "drop"}
-        feats_by_spec = []
+        Xtr, Xva = self.base[i]
+        if drops:
+            Xtr, Xva = Xtr.drop(columns=list(drops & set(Xtr.columns))), Xva.drop(columns=list(drops & set(Xva.columns)))
+        parts_tr, parts_va = [Xtr], [Xva]
         for s in specs:
-            if s["op"] == "drop":
+            if s["op"] == "drop" or s["op"] in fe_dsl.MODEL_OPS:
                 continue
             f = self._spec_feats(s)
             if f is None:
                 return None
-            feats_by_spec.append(f)
+            parts_tr.append(f[i][0])
+            parts_va.append(f[i][1])
         if extra is not None:
-            feats_by_spec.append(extra)
+            parts_tr.append(extra[i][0])
+            parts_va.append(extra[i][1])
+        Xtr, Xva = pd.concat(parts_tr, axis=1), pd.concat(parts_va, axis=1)
+        Xtr = Xtr.loc[:, ~Xtr.columns.duplicated()]
+        Xva = Xva.loc[:, ~Xva.columns.duplicated()]
+        return _to_lgb(Xtr, Xva)
+
+    def run(self, specs: list[dict], extra: list | None = None) -> list[float] | None:
+        """Скоры по фолдам для базы + specs: признаки, drop, segment_model, objective."""
+        ctx = self.ctx
+        t0 = time.time()
+        seg = [s for s in specs if s["op"] == "segment_model"]
+        obj = [s for s in specs if s["op"] == "objective"]
+        if len(seg) > 1 or len(obj) > 1 or (obj and ctx["ptype"] != "regression"):
+            return None
+        objective = obj[0]["params"] if obj else None
+        df = ctx["df"]
         scores = []
         for i, (tr, va) in enumerate(ctx["folds"]):
-            Xtr, Xva = self.base[i]
-            if drops:
-                Xtr, Xva = Xtr.drop(columns=list(drops & set(Xtr.columns))), Xva.drop(columns=list(drops & set(Xva.columns)))
-            extra_tr = [f[i][0] for f in feats_by_spec]
-            extra_va = [f[i][1] for f in feats_by_spec]
-            Xtr = pd.concat([Xtr, *extra_tr], axis=1)
-            Xva = pd.concat([Xva, *extra_va], axis=1)
-            Xtr = Xtr.loc[:, ~Xtr.columns.duplicated()]
-            Xva = Xva.loc[:, ~Xva.columns.duplicated()]
-            Xtr, Xva = _to_lgb(Xtr, Xva)
-            s, _, _ = fit_eval(ctx, Xtr, ctx["y"][tr], Xva, ctx["y"][va])
-            scores.append(s)
+            mats = self.matrices(i, specs, extra)
+            if mats is None:
+                return None
+            Xtr, Xva = mats
+            ytr, yva = ctx["y"][tr], ctx["y"][va]
+            if seg:
+                ctr, cva = fe_dsl.segment_codes(seg[0], df.loc[tr], df.loc[va])
+                pred = fit_predict_segmented(ctx, Xtr, ytr, Xva, yva, ctr, cva, objective)
+            else:
+                pred, _ = fit_predict(ctx, Xtr, ytr, Xva, yva, objective=objective)
+            scores.append(score_pred(ctx, yva, pred))
         self.n_evals += 1
         self.spent += time.time() - t0
         return scores
@@ -282,62 +341,155 @@ def _looks_leaky(metric: str, new: list[float], base: list[float]) -> bool:
     return n <= 0.05 * b
 
 
+def perm_importance(ctx: dict, ev: Evaluator, top: int = 15) -> list[dict]:
+    """Перестановочная важность на первом фолде против простой корреляции с таргетом.
+
+    Корреляция ≠ полезность: признак со слабой связью может держать модель
+    через взаимодействия — такие факты идут в промпт Qwen.
+    """
+    tr, va = ctx["folds"][0]
+    Xtr, Xva = ev.matrices(0, [])
+    ytr, yva = ctx["y"][tr], ctx["y"][va]
+    _, model = fit_predict(ctx, Xtr, ytr, Xva, yva)
+    if model is None:
+        return []
+
+    def predict(X):
+        return model.predict(X) if ctx["ptype"] == "regression" else _align(ctx, model, model.predict_proba(X))
+
+    base = score_pred(ctx, yva, predict(Xva))
+    rng = np.random.RandomState(21)
+    sign = 1.0 if models.HIGHER_BETTER[ctx["metric"]] else -1.0
+    out = []
+    cols = sorted(ctx["features"], key=lambda c: -ctx["importances"].get(c, 0))[:top]
+    for c in cols:
+        if c not in Xva.columns:
+            continue
+        Xp = Xva.copy()
+        Xp[c] = Xp[c].to_numpy()[rng.permutation(len(Xp))]
+        drop = sign * (base - score_pred(ctx, yva, predict(Xp))) / max(abs(base), 1e-9)
+        out.append({"col": c, "perm_drop": round(float(drop), 4), "corr": round(_target_corr(ctx, c), 3)})
+    return sorted(out, key=lambda r: -r["perm_drop"])
+
+
+def _align(ctx: dict, model, proba: np.ndarray) -> np.ndarray:
+    out = np.zeros((len(proba), len(ctx["classes"])))
+    pos = {c: i for i, c in enumerate(ctx["classes"])}
+    out[:, [pos[c] for c in model.classes_]] = proba
+    return out
+
+
+def _target_corr(ctx: dict, col: str) -> float:
+    """|Spearman| признака с таргетом (классификация — максимум по индикаторам классов)."""
+    x = ctx["df"][col]
+    if not pd.api.types.is_numeric_dtype(x) or x.dtype == bool:
+        x = pd.Series(pd.factorize(x)[0], index=x.index).where(x.notna())
+    xr = x.rank().to_numpy(float)
+    ok = np.isfinite(xr)
+    if ok.sum() < 50 or np.nanstd(xr) == 0:
+        return 0.0
+    if ctx["classes"] is None:
+        yr = pd.Series(ctx["y"]).rank().to_numpy(float)
+        return abs(float(np.corrcoef(xr[ok], yr[ok])[0, 1]))
+    best = 0.0
+    for c in ctx["classes"]:
+        ind = (ctx["y"] == c).astype(float)[ok]
+        if ind.std() > 0:
+            best = max(best, abs(float(np.corrcoef(xr[ok], ind)[0, 1])))
+    return best
+
+
+class Search:
+    """Валидатор на нескольких раундах гипотез: калибровка, этап A на раунд, общий этап B."""
+
+    def __init__(self, ctx: dict, register=None):
+        self.ctx, self.register = ctx, register
+        self.metric = ctx["metric"]
+        self.ev = Evaluator(ctx)
+        self.passed: list[dict] = []
+        self.results: list[dict] = []
+        self.t0 = time.time()
+
+    def calibrate(self) -> None:
+        """База по фолдам и порог прироста по null-спекам (уровень шума валидатора)."""
+        ev, metric = self.ev, self.metric
+        self.base = ev.run([])
+        log(f"AutoEDA: база по фолдам {metric}={np.round(self.base, 5).tolist()} ({time.time() - self.t0:.1f}s)")
+        noise = []
+        top = sorted(self.ctx["features"], key=lambda c: -self.ctx["importances"].get(c, 0))
+        for i, col in enumerate(top[:N_NULL]):
+            sc = ev.run([], extra=ev.null_feats(col, 100 + i))
+            noise.append(abs(_gain(metric, sc, self.base)[0]))
+        self.rel_min = max(REL_MIN, max(noise, default=0.0))
+        self.ctx["rel_min"] = self.rel_min
+        log(f"AutoEDA: шум null-спек {np.round(noise, 5).tolist()} -> порог прироста {self.rel_min:.4f}")
+
+    def stage_a(self, specs: list[dict], deadline: float) -> list[dict]:
+        """Каждая спека против базы; прошедшие копятся в self.passed. Возвращает оценённые."""
+        metric, rel_min, done = self.metric, self.rel_min, []
+        for spec in sorted(specs, key=lambda s: -s["prior"]):
+            if not self.ev.fits(deadline):
+                log(f"AutoEDA: этап A остановлен по времени, оценено {len(done)}/{len(specs)}")
+                break
+            scores = self.ev.run([spec])
+            if scores is None:
+                continue
+            mean, lcb = _gain(metric, scores, self.base)
+            leaky = _looks_leaky(metric, scores, self.base)
+            ok = mean > rel_min and lcb > 0 and not leaky
+            spec["delta"], spec["lcb"], spec["accepted_a"] = round(mean, 5), round(lcb, 5), ok
+            done.append(spec)
+            if self.register:
+                self.register(f"fe_A:{spec['source']}", f"{fe_dsl.describe(spec)} prior={spec['prior']:.4f}"
+                              + (" [утечка?]" if leaky else ""), round(float(np.mean(scores)), 5), ok)
+            if ok:
+                self.passed.append(spec)
+        self.results += done
+        return done
+
+    def stage_b(self, deadline: float) -> list[dict]:
+        """Жадный forward-отбор прошедших; база сдвигается после каждого принятого."""
+        metric, rel_min = self.metric, self.rel_min
+        accepted: list[dict] = []
+        cur = self.base
+        for spec in sorted(self.passed, key=lambda s: -s["delta"]):
+            if not self.ev.fits(deadline):
+                log("AutoEDA: этап B остановлен по времени")
+                break
+            if spec["op"] in fe_dsl.MODEL_OPS and any(a["op"] == spec["op"] for a in accepted):
+                continue
+            scores = self.ev.run(accepted + [spec])
+            if scores is None:
+                continue
+            mean, lcb = _gain(metric, scores, cur)
+            ok = mean > rel_min / 2 and lcb > -rel_min
+            spec["accepted_b"] = ok
+            if self.register:
+                self.register(f"fe_B:{spec['source']}", fe_dsl.describe(spec), round(float(np.mean(scores)), 5), ok)
+            if ok:
+                accepted.append(spec)
+                cur = scores
+        total, _ = _gain(metric, cur, self.base)
+        log(f"AutoEDA: принято {len(accepted)} спек, прирост {total:+.2%} "
+            f"({metric} {np.mean(self.base):.5f} -> {np.mean(cur):.5f}), оценок {self.ev.n_evals}, "
+            f"{time.time() - self.t0:.0f}s")
+        self.ctx["search_base"], self.ctx["search_final"] = float(np.mean(self.base)), float(np.mean(cur))
+        return accepted
+
+    def feedback(self, top: int = 30) -> dict:
+        """Итоги этапа A для второго раунда LLM: что прошло, что нет, с дельтами."""
+        rows = sorted(self.results, key=lambda s: -s.get("delta", -1))
+        return {
+            "metric": self.metric, "base": round(float(np.mean(self.base)), 5),
+            "threshold_rel": round(self.rel_min, 4), "scheme": self.ctx.get("fold_scheme"),
+            "tested": [{"spec": fe_dsl.describe(s), "source": s["source"], "delta_rel": s.get("delta"),
+                        "passed": s.get("accepted_a")} for s in rows[:top]],
+        }
+
+
 def search(ctx: dict, specs: list[dict], deadline: float, register=None) -> list[dict]:
-    """Этап A + этап B. Возвращает принятые спеки в порядке добавления."""
-    metric = ctx["metric"]
-    ev = Evaluator(ctx)
-    t0 = time.time()
-    base = ev.run([])
-    log(f"AutoEDA: база по фолдам {metric}={np.round(base, 5).tolist()} ({time.time() - t0:.1f}s)")
-    # Калибровка порога: «прирост» от признаков-пустышек — уровень шума валидатора.
-    noise = []
-    top = sorted(ctx["features"], key=lambda c: -ctx["importances"].get(c, 0))
-    for i, col in enumerate(top[:N_NULL]):
-        sc = ev.run([], extra=ev.null_feats(col, 100 + i))
-        noise.append(abs(_gain(metric, sc, base)[0]))
-    rel_min = max(REL_MIN, max(noise, default=0.0))
-    ctx["rel_min"] = rel_min
-    log(f"AutoEDA: шум null-спек {np.round(noise, 5).tolist()} -> порог прироста {rel_min:.4f}")
-    budget_a = (deadline - time.time()) * 0.7
-    deadline_a = time.time() + budget_a
-
-    passed = []
-    for spec in sorted(specs, key=lambda s: -s["prior"]):
-        if not ev.fits(deadline_a):
-            log(f"AutoEDA: этап A остановлен по времени, оценено {ev.n_evals - 1 - N_NULL}/{len(specs)}")
-            break
-        scores = ev.run([spec])
-        if scores is None:
-            continue
-        mean, lcb = _gain(metric, scores, base)
-        leaky = _looks_leaky(metric, scores, base)
-        ok = mean > rel_min and lcb > 0 and not leaky
-        spec["delta"], spec["lcb"] = round(mean, 5), round(lcb, 5)
-        if register:
-            register(f"fe_A:{spec['source']}", f"{fe_dsl.describe(spec)} prior={spec['prior']:.4f}"
-                     + (" [утечка?]" if leaky else ""), round(float(np.mean(scores)), 5), ok)
-        if ok:
-            passed.append(spec)
-
-    # Этап B: жадный forward-отбор; база сдвигается после каждого принятого.
-    accepted: list[dict] = []
-    cur = base
-    for spec in sorted(passed, key=lambda s: -s["delta"]):
-        if not ev.fits(deadline):
-            log("AutoEDA: этап B остановлен по времени")
-            break
-        scores = ev.run(accepted + [spec])
-        if scores is None:
-            continue
-        mean, lcb = _gain(metric, scores, cur)
-        ok = mean > rel_min / 2 and lcb > -rel_min
-        if register:
-            register(f"fe_B:{spec['source']}", fe_dsl.describe(spec), round(float(np.mean(scores)), 5), ok)
-        if ok:
-            accepted.append(spec)
-            cur = scores
-    total, _ = _gain(metric, cur, base)
-    log(f"AutoEDA: принято {len(accepted)} спек, прирост {total:+.2%} "
-        f"({metric} {np.mean(base):.5f} -> {np.mean(cur):.5f}), оценок {ev.n_evals}, {time.time() - t0:.0f}s")
-    ctx["search_base"], ctx["search_final"] = float(np.mean(base)), float(np.mean(cur))
-    return accepted
+    """Один раунд: калибровка, этап A (70% времени), этап B."""
+    s = Search(ctx, register)
+    s.calibrate()
+    s.stage_a(specs, time.time() + (deadline - time.time()) * 0.7)
+    return s.stage_b(deadline)

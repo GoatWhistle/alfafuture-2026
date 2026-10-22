@@ -44,7 +44,7 @@ from models import (
     tune_class_weights_stable,
     write_submission,
 )
-from task_profile import build_profile, llm_propose_specs
+from task_profile import build_profile, llm_propose_specs, llm_refine_specs
 
 PREDICT_RESERVE_SEC = float(os.environ.get("AGENT_PREDICT_RESERVE_SEC", 900))
 KFOLD_RESERVE_SEC = float(os.environ.get("AGENT_KFOLD_RESERVE_SEC", 600))
@@ -92,64 +92,108 @@ def tune_quick_weights(prof: dict, quick: dict | None, target: str, current: dic
     return pred
 
 
-def _llm_specs(prof: dict, ctx: dict, specs: list[dict]) -> list[dict]:
-    """Семантические спеки Qwen по сводке детекторов; prior — медиана детекторов."""
-    if time_left() < 1800:
-        return []
+def _validate_llm(raw: list, ctx: dict, known: set[str], source: str) -> list[dict]:
+    """Валидация и дедупликация сырых спек LLM; prior — медиана детекторов (середина очереди)."""
     columns = list(ctx["features"])
-    proposal = llm_propose_specs(prof["task_text"], eda_detectors.summary(ctx, specs),
-                                 prof.get("data_dictionary"), columns)
-    if not proposal:
-        return []
-    prior = float(np.median([s["prior"] for s in specs])) if specs else 0.0
     numeric = set(eda_detectors._numeric(ctx))
-    raw = list(proposal["specs"])
-    entity = proposal.get("entity")
-    if entity and ctx["entity"] is None:
-        raw.append({"op": "group_stat", "cols": [], "params": {"keys": entity, "src": "target",
-                    "aggs": list(fe_dsl.TARGET_AGGS)}, "why": "ключ объекта по мнению LLM"})
-    seen = {fe_dsl.spec_key(s) for s in specs}
     out = []
     for r in raw:
-        if isinstance(r, dict):
-            r = {**r, "source": "qwen", "prior": prior}
-        v = fe_dsl.validate(r, columns, numeric)
+        if not isinstance(r, dict):
+            continue
+        theme = r.get("theme")
+        v = fe_dsl.validate({**r, "source": f"{source}:{theme}" if theme else source, "prior": ctx["llm_prior"]},
+                            columns, numeric)
         if v is None:
             log(f"LLM-спека отброшена: {r}")
             continue
-        if fe_dsl.spec_key(v) not in seen:
-            seen.add(fe_dsl.spec_key(v))
+        k = fe_dsl.spec_key(v)
+        if k not in known:
+            known.add(k)
             out.append(v)
-    log(f"LLM предложила {len(raw)} спек, валидных новых {len(out)}; period-подсказка={proposal.get('period')}")
+    log(f"LLM[{source}]: предложено {len(raw)}, валидных новых {len(out)}")
     return out
 
 
+def _llm_round1(prof: dict, ctx: dict, summary: dict, known: set[str]) -> list[dict]:
+    proposal = llm_propose_specs(prof["task_text"], summary, prof.get("data_dictionary"), list(ctx["features"]))
+    if not proposal:
+        return []
+    raw = list(proposal["specs"])
+    if proposal.get("entity") and ctx["entity"] is None:
+        raw.append({"op": "group_stat", "cols": [], "params": {"keys": proposal["entity"], "src": "target",
+                    "aggs": list(fe_dsl.TARGET_AGGS)}, "why": "ключ объекта по мнению LLM"})
+    log(f"LLM: подсказка периода {proposal.get('period')!r}, схема валидации {ctx['fold_scheme']}")
+    return _validate_llm(raw, ctx, known, "qwen")
+
+
 def run_autoeda(prof: dict, target: str, budget: float) -> dict:
-    """Детекторы -> спеки (+Qwen) -> валидатор -> принятые признаки в prof.
+    """Детекторы -> валидатор; Qwen: раунд 1 (темы параллельно, в фоне) -> раунд 2 по итогам.
 
     Возвращает {"period", "label_copy", "accepted"}: схему валидации для
-    финального выбора и флаг постпроцессинга.
+    финального выбора и флаг постпроцессинга. Принятые признаки дописываются
+    в prof, модельные операции — в prof["model_ops"].
     """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+
     t0 = time.time()
     deadline = t0 + budget
     ctx = fe_search.build_context(prof, target, deadline)
-    specs = eda_detectors.run_all(ctx, t0 + 0.35 * budget)
-    try:
-        specs += _llm_specs(prof, ctx, specs)
-    except Exception:  # noqa: BLE001
-        log("LLM-спеки упали:\n" + traceback.format_exc())
-    register("autoeda_specs", f"{len(specs)} гипотез: " + "; ".join(
-        f"{s['source']}:{fe_dsl.describe(s)}" for s in sorted(specs, key=lambda s: -s["prior"])[:12]), None, True)
+    specs = eda_detectors.run_all(ctx, t0 + 0.25 * budget)
     fe_search.build_folds(ctx)
-    accepted = fe_search.search(ctx, specs, deadline, register=register)
+    srch = fe_search.Search(ctx, register)
+    srch.calibrate()
+    try:
+        ctx["facts"]["perm_importance"] = fe_search.perm_importance(ctx, srch.ev)
+    except Exception:  # noqa: BLE001
+        log("perm_importance упал:\n" + traceback.format_exc())
+    ctx["llm_prior"] = float(np.median([s["prior"] for s in specs])) if specs else 0.0
+    known = {fe_dsl.spec_key(s) for s in specs}
+    summary = eda_detectors.summary(ctx, specs)
+    register("autoeda_specs", f"{len(specs)} гипотез детекторов: " + "; ".join(
+        f"{s['source']}:{fe_dsl.describe(s)}" for s in sorted(specs, key=lambda s: -s["prior"])[:12]), None, True)
+
+    use_llm = time_left() > 1800
+    pool = ThreadPoolExecutor(1)
+    fut = pool.submit(_llm_round1, prof, ctx, summary, known) if use_llm else None
+    srch.stage_a(specs, t0 + 0.5 * budget)
+    if fut is not None:
+        try:
+            qwen = fut.result(timeout=max(5.0, t0 + 0.6 * budget - time.time()))
+        except FutTimeout:
+            log("LLM раунд 1 не успел — продолжаю без него")
+            qwen = []
+        except Exception:  # noqa: BLE001
+            log("LLM раунд 1 упал:\n" + traceback.format_exc())
+            qwen = []
+        srch.stage_a(qwen, t0 + 0.65 * budget)
+        if qwen and time.time() < t0 + 0.65 * budget:
+            try:
+                ref = llm_refine_specs(prof["task_text"], summary, srch.feedback(), list(ctx["features"]))
+                qwen2 = _validate_llm(ref["specs"], ctx, known, "qwen2") if ref else []
+            except Exception:  # noqa: BLE001
+                log("LLM раунд 2 упал:\n" + traceback.format_exc())
+                qwen2 = []
+            srch.stage_a(qwen2, t0 + 0.8 * budget)
+    pool.shutdown(wait=False)
+    accepted = srch.stage_b(deadline)
 
     added = []
+    model_ops = {}
     for spec in accepted:
         if spec["op"] == "drop":
             col = spec["cols"][0]
             prof["features"] = [c for c in prof["features"] if c != col]
             added.append(f"-{col}")
             continue
+        if spec["op"] in fe_dsl.MODEL_OPS:
+            model_ops[spec["op"]] = spec
+            added.append(fe_dsl.describe(spec))
+            if spec["op"] != "segment_model":
+                continue
+            # Режим сегмента — ещё и признак для AutoGluon.
+            spec = fe_dsl.validate({**spec, "op": "flag"}, prof["train"].columns)
+            if spec is None:
+                continue
         res = fe_dsl.materialize(prof, spec, target, ctx["classes"])
         if res is None:
             continue
@@ -159,6 +203,7 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
         prof["test"] = pd.concat([prof["test"], te_new[new_cols]], axis=1)
         prof["features"] = list(prof["features"]) + new_cols
         added += new_cols
+    prof["model_ops"] = model_ops
     register("autoeda", f"схема {ctx['fold_scheme']}; принято {len(accepted)} спек -> {added}",
              ctx.get("search_final"), bool(accepted))
     log(f"AutoEDA: {time.time() - t0:.0f}s, признаков {len(prof['features'])}")
