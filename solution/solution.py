@@ -48,7 +48,7 @@ from task_profile import build_profile, llm_propose_specs, llm_refine_specs
 
 PREDICT_RESERVE_SEC = float(os.environ.get("AGENT_PREDICT_RESERVE_SEC", 900))
 KFOLD_RESERVE_SEC = float(os.environ.get("AGENT_KFOLD_RESERVE_SEC", 600))
-AUTOEDA_SEC = float(os.environ.get("AGENT_AUTOEDA_SEC", 900))
+AUTOEDA_SEC = float(os.environ.get("AGENT_AUTOEDA_SEC", 1200))
 MACRO_METRICS = ("f1_macro", "f1_weighted", "f1", "balanced_accuracy")
 EXPERIMENTS: list[dict] = []
 
@@ -114,8 +114,9 @@ def _validate_llm(raw: list, ctx: dict, known: set[str], source: str) -> list[di
     return out
 
 
-def _llm_round1(prof: dict, ctx: dict, summary: dict, known: set[str]) -> list[dict]:
-    proposal = llm_propose_specs(prof["task_text"], summary, prof.get("data_dictionary"), list(ctx["features"]))
+def _llm_round1(prof: dict, ctx: dict, summary: dict, known: set[str], planned: list[str]) -> list[dict]:
+    proposal = llm_propose_specs(prof["task_text"], summary, prof.get("data_dictionary"), list(ctx["features"]),
+                                 planned)
     if not proposal:
         return []
     raw = list(proposal["specs"])
@@ -154,7 +155,8 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
 
     use_llm = time_left() > 1800
     pool = ThreadPoolExecutor(1)
-    fut = pool.submit(_llm_round1, prof, ctx, summary, known) if use_llm else None
+    planned = [fe_dsl.describe(s) for s in sorted(specs, key=lambda s: -s["prior"])]
+    fut = pool.submit(_llm_round1, prof, ctx, summary, known, planned) if use_llm else None
     srch.stage_a(specs, t0 + 0.5 * budget)
     if fut is not None:
         try:
@@ -168,7 +170,8 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
         srch.stage_a(qwen, t0 + 0.65 * budget)
         if qwen and time.time() < t0 + 0.65 * budget:
             try:
-                ref = llm_refine_specs(prof["task_text"], summary, srch.feedback(), list(ctx["features"]))
+                planned = [fe_dsl.describe(s) for s in sorted(specs + qwen, key=lambda s: -s["prior"])]
+                ref = llm_refine_specs(prof["task_text"], summary, srch.feedback(), list(ctx["features"]), planned)
                 qwen2 = _validate_llm(ref["specs"], ctx, known, "qwen2") if ref else []
             except Exception:  # noqa: BLE001
                 log("LLM раунд 2 упал:\n" + traceback.format_exc())
