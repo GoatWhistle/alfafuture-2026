@@ -57,7 +57,7 @@ def _lgb_params(ctx: dict, fast: bool = False) -> dict:
     # Валидатор детерминирован (без бэггинга и сэмплинга колонок): иначе новая
     # колонка меняет случайные подвыборки, и шум сравнимых моделей растёт.
     p = dict(
-        n_estimators=300 if fast else 800, learning_rate=0.1 if fast else 0.06, num_leaves=63,
+        n_estimators=300 if fast else 500, learning_rate=0.1, num_leaves=63,
         colsample_bytree=0.8 if fast else 1.0, subsample=0.8 if fast else 1.0, subsample_freq=1,
         min_child_samples=20, n_jobs=models.N_CPUS, random_state=3, verbosity=-1,
     )
@@ -87,7 +87,7 @@ def fit_predict(ctx: dict, Xtr, ytr, Xva, yva, fast: bool = False, objective: di
     import lightgbm as lgb
 
     params = _lgb_params(ctx, fast)
-    cb = [lgb.early_stopping(40 if fast else 60, verbose=False), lgb.log_evaluation(0)]
+    cb = [lgb.early_stopping(40, verbose=False), lgb.log_evaluation(0)]
     if ctx["ptype"] == "regression":
         obj = {"objective": "regression"}
         if objective:
@@ -341,6 +341,25 @@ def _looks_leaky(metric: str, new: list[float], base: list[float]) -> bool:
     return n <= 0.05 * b
 
 
+def interleave(specs: list[dict]) -> list[dict]:
+    """Очередь этапа A: по кругу между источниками, внутри источника — по prior.
+
+    prior разных детекторов несравнимы по шкале; без чередования бюджет
+    съедает один источник с крупными prior, а сегменты и гипотезы LLM не
+    доходят до проверки.
+    """
+    groups: dict[str, list[dict]] = {}
+    for s in sorted(specs, key=lambda s: -s["prior"]):
+        groups.setdefault(s["source"].split(":")[0] if not s["source"].startswith("qwen") else s["source"], []).append(s)
+    order = sorted(groups, key=lambda g: -groups[g][0]["prior"])
+    out = []
+    while any(groups.values()):
+        for g in order:
+            if groups[g]:
+                out.append(groups[g].pop(0))
+    return out
+
+
 def perm_importance(ctx: dict, ev: Evaluator, top: int = 15) -> list[dict]:
     """Перестановочная важность на первом фолде против простой корреляции с таргетом.
 
@@ -428,7 +447,7 @@ class Search:
     def stage_a(self, specs: list[dict], deadline: float) -> list[dict]:
         """Каждая спека против базы; прошедшие копятся в self.passed. Возвращает оценённые."""
         metric, rel_min, done = self.metric, self.rel_min, []
-        for spec in sorted(specs, key=lambda s: -s["prior"]):
+        for spec in interleave(specs):
             if not self.ev.fits(deadline):
                 log(f"AutoEDA: этап A остановлен по времени, оценено {len(done)}/{len(specs)}")
                 break
