@@ -40,8 +40,16 @@ OPS = {
     "bin": (1, 1, False),
     "interaction": (2, 2, False),
     "knn_target": (1, 20, True),
+    "flag": (1, 1, False),         # индикатор сегмента: params.rule
     "drop": (1, 1, False),
+    # Модельные операции: меняют обучение, а не признаки.
+    "segment_model": (1, 1, False),  # отдельные модели по сегментам col (params.rule)
+    "objective": (0, 0, False),      # функция потерь регрессии: params.name
 }
+MODEL_OPS = ("segment_model", "objective")
+SEGMENT_RULES = ("zero", "nan", "level", "threshold")
+OBJECTIVES = ("huber", "l1", "fair")
+SEGMENT_MAX_LEVELS = 5
 TARGET_AGGS = ("mean", "median", "std", "count")
 LAG_AGGS = ("last", "mean", "count", "gap")
 COL_AGGS = ("mean", "std", "min", "max", "sum", "range")
@@ -112,6 +120,26 @@ def validate(spec, columns, numeric: set[str] | None = None) -> dict | None:
     if op == "knn_target":
         k = raw.get("k", 10)
         params["k"] = int(k) if isinstance(k, (int, float)) and 1 <= int(k) <= 50 else 10
+    if op in ("flag", "segment_model"):
+        rule = raw.get("rule")
+        if rule not in SEGMENT_RULES:
+            return None
+        params["rule"] = rule
+        if rule in ("zero", "threshold") and numeric is not None and not set(cols) <= numeric:
+            return None
+        if rule == "threshold":
+            v = raw.get("value")
+            if not isinstance(v, (int, float)) or not np.isfinite(v):
+                return None
+            params["value"] = float(v)
+    if op == "objective":
+        name = raw.get("name")
+        if name not in OBJECTIVES:
+            return None
+        params["name"] = name
+        a = raw.get("alpha")
+        if isinstance(a, (int, float)) and a > 0 and np.isfinite(a):
+            params["alpha"] = float(a)
     if src_target and op in ("group_stat", "lag"):
         params["src"] = "target"
     prior = spec.get("prior")
@@ -135,7 +163,31 @@ def spec_key(spec: dict) -> str:
 
 def describe(spec: dict) -> str:
     p = {k: v for k, v in spec["params"].items()}
-    return f"{spec['op']}({', '.join(spec['cols']) or 'target'}{', ' if p else ''}{p if p else ''})"
+    who = ', '.join(spec['cols']) or ('target' if spec['op'] in ('group_stat', 'lag') else '')
+    return f"{spec['op']}({who}{', ' if p else ''}{p if p else ''})"
+
+
+def segment_codes(spec: dict, fit: pd.DataFrame, app: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Коды сегментов (int) для fit и apply по правилу спеки; уровни берутся из fit."""
+    col, p = spec["cols"][0], spec["params"]
+    rule = p["rule"]
+
+    def code(df):
+        s = df[col]
+        if rule == "nan":
+            return s.isna().to_numpy(np.int64)
+        if rule == "zero":
+            return (pd.to_numeric(s, errors="coerce") == 0).to_numpy(np.int64)
+        if rule == "threshold":
+            return (pd.to_numeric(s, errors="coerce") > p["value"]).to_numpy(np.int64)
+        st = s.astype(str)
+        return st.map(levels).fillna(len(levels)).to_numpy(np.int64)
+
+    levels = {}
+    if rule == "level":
+        top = fit[col].astype(str).value_counts().index[:SEGMENT_MAX_LEVELS]
+        levels = {v: i for i, v in enumerate(top)}
+    return code(fit), code(app)
 
 
 def _name(spec: dict, suffix: str) -> str:
@@ -443,7 +495,7 @@ def apply(spec: dict, fit: pd.DataFrame, fit_y, app: pd.DataFrame, classes: list
     classes — список классов (классификация) или None (регрессия).
     """
     op = spec["op"]
-    if op == "drop":
+    if op == "drop" or op in MODEL_OPS:
         return None
     fit = fit.reset_index(drop=True)
     app = app.reset_index(drop=True)
@@ -458,6 +510,10 @@ def apply(spec: dict, fit: pd.DataFrame, fit_y, app: pd.DataFrame, classes: list
         return _lag(spec, fit, fit_y, app, classes)
     if op == "knn_target":
         return _knn_target(spec, fit, fit_y, app, classes)
+    if op == "flag":
+        cf, ca = segment_codes(spec, fit, app)
+        name = _name(spec, spec["params"]["rule"])
+        return pd.DataFrame({name: cf.astype(float)}), pd.DataFrame({name: ca.astype(float)})
     both = pd.concat([fit, app], ignore_index=True)
     out = _unsupervised(spec, both)
     return out.iloc[: len(fit)].reset_index(drop=True), out.iloc[len(fit):].reset_index(drop=True)

@@ -196,7 +196,38 @@ DSL_HELP = """Операции DSL (cols — колонки train; target — т
 - log | rank | count_enc | missing_ind: cols=[col]
 - bin: cols=[col], params {"bins": q}; interaction: cols=[a, b], params {"bins": q} — код пары
 - knn_target: cols=[числовые], params {"k": 10} — таргет ближайших соседей
-- drop: cols=[col] — удалить признак (утечка/дрейф)"""
+- flag: cols=[col], params {"rule": "zero|nan|level|threshold", "value": <порог для threshold>} — индикатор сегмента
+- drop: cols=[col] — удалить признак (утечка/дрейф)
+Модельные операции (меняют обучение, а не признаки):
+- segment_model: cols=[col], params {"rule": "zero|nan|level|threshold", "value": ...} — отдельные модели
+  на каждый сегмент (режим поведения), вместо одной общей
+- objective: cols=[], params {"name": "huber|l1|fair"} — функция потерь регрессии (тяжёлый хвост ошибок)"""
+
+# Тема -> (вопрос аналитику, ключи фактов из сводки).
+LLM_THEMES = {
+    "time_objects": (
+        "Разные периоды train/test и повторные наблюдения объектов: какой ключ объекта устойчив между "
+        "периодами, какая история объекта (лаги таргета и признаков, статистики по объекту) поможет, "
+        "какие признаки дрейфуют и мешают переносу на test.",
+        ["period", "entity", "adversarial", "duplicates"],
+    ),
+    "segments": (
+        "Смешанные режимы поведения: по найденным сегментам (смена знака корреляций, смещённые остатки) "
+        "реши, что лучше — индикатор сегмента, взаимодействия с ним или отдельные модели на сегменты.",
+        ["segments", "top_importances"],
+    ),
+    "errors": (
+        "Ошибки модели: что объединяет худшие строки и путаемые классы, какие признаки полезны несмотря "
+        "на слабую корреляцию (перестановочная важность), где метки неоднозначны. Предложи признаки и "
+        "изменения обучения против этих ошибок.",
+        ["tail", "perm_importance", "label_conflicts", "residual_specs"],
+    ),
+    "semantics": (
+        "Смысл колонок по словарю данных: физические величины (например, полное потребление = площадь × "
+        "удельное), амплитуды, суммы и агрегаты однородных показателей, отношения.",
+        ["top_importances"],
+    ),
+}
 
 
 def _dictionary_text(dd: pd.DataFrame | None, columns: list[str], limit: int = 6000) -> str:
@@ -212,33 +243,74 @@ def _dictionary_text(dd: pd.DataFrame | None, columns: list[str], limit: int = 6
     return "\n".join(rows)[:limit]
 
 
-def llm_propose_specs(task_text: str, summary: dict, dd: pd.DataFrame | None, columns: list[str]) -> dict | None:
-    """Qwen по сводке детекторов и словарю данных предлагает семантические признаки.
-
-    Возвращает {"specs": [сырые спеки], "entity": [...]|None, "period": str|None}
-    или None. Спеки валидирует fe_dsl.validate на стороне вызывающего.
-    """
-    prompt = (
-        "Ты — опытный дата-сайентист. AutoML-агент автоматически нашёл зависимости в табличных данных "
-        "(сводка ниже). Предложи до 15 НОВЫХ признаков, опираясь на смысл колонок из словаря данных: "
-        "физические величины (например, полное потребление = площадь × удельное), амплитуды, суммы "
-        "однородных показателей, отношения, история объекта. Не повторяй спеки детекторов. "
-        "Каждая гипотеза проверяется на валидации, бесполезные отбрасываются. "
+def _specs_prompt(question: str, facts: dict, dd_text: str, columns: list[str], task_text: str, n: int) -> str:
+    return (
+        "Ты — опытный дата-сайентист в команде AutoML-агента. Детекторы агента посчитали факты о данных "
+        f"(ниже). Вопрос: {question}\n"
+        f"Предложи до {n} гипотез в виде спек DSL. Каждая проверяется переобучением на валидации, "
+        "похожей на test; бесполезные отбрасываются, так что предлагай смело, но по фактам. "
         "Используй ТОЛЬКО операции DSL и ТОЛЬКО колонки из списка; таргет в признаки не подставляй.\n\n"
         f"{DSL_HELP}\n\n"
         'Верни СТРОГО один JSON: {"specs": [{"op": "...", "cols": [...], "params": {...}, "why": "..."}], '
         '"entity": [колонки ключа объекта или пусто], "period": "<колонка периода или null>"}.\n\n'
         f"Колонки: {columns[:200]}\n\n"
-        f"Словарь данных:\n{_dictionary_text(dd, columns)}\n\n"
-        f"Сводка детекторов (JSON):\n{json.dumps(summary, ensure_ascii=False, default=str)[:6000]}\n\n"
-        "Описание задачи:\n" + task_text[:3000]
+        f"Словарь данных:\n{dd_text}\n\n"
+        f"Факты (JSON):\n{json.dumps(facts, ensure_ascii=False, default=str)[:6000]}\n\n"
+        "Описание задачи:\n" + task_text[:2500]
     )
-    data = _llm_json(prompt, "fe_specs", timeout=120)
+
+
+def _parse_specs(data: dict | None, limit: int) -> dict | None:
     if not data or not isinstance(data.get("specs"), list):
         return None
     entity = data.get("entity") if isinstance(data.get("entity"), list) else None
     period = data.get("period") if isinstance(data.get("period"), str) else None
-    return {"specs": data["specs"][:20], "entity": entity, "period": period}
+    return {"specs": data["specs"][:limit], "entity": entity, "period": period}
+
+
+def llm_propose_specs(task_text: str, summary: dict, dd: pd.DataFrame | None, columns: list[str]) -> dict | None:
+    """Раунд 1: тематические промпты Qwen параллельно, у каждого только свои факты.
+
+    Возвращает {"specs": [сырые спеки с полем theme], "entity", "period"} или None.
+    Спеки валидирует fe_dsl.validate на стороне вызывающего.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    dd_text = _dictionary_text(dd, columns)
+    base = {k: summary.get(k) for k in ("problem_type", "metric", "scheme")}
+
+    def ask(theme: str):
+        question, keys = LLM_THEMES[theme]
+        facts = {**base, **{k: summary.get(k) for k in keys if summary.get(k) is not None}}
+        prompt = _specs_prompt(question, facts, dd_text if theme in ("semantics", "time_objects") else "см. колонки",
+                               columns, task_text, 8)
+        return theme, _parse_specs(_llm_json(prompt, f"fe_{theme}", timeout=150), 12)
+
+    with ThreadPoolExecutor(len(LLM_THEMES)) as pool:
+        answers = list(pool.map(ask, LLM_THEMES))
+    specs, entity, period = [], None, None
+    for theme, ans in answers:
+        if not ans:
+            continue
+        specs += [{**s, "theme": theme} for s in ans["specs"] if isinstance(s, dict)]
+        entity = entity or ans["entity"]
+        period = period or ans["period"]
+    return {"specs": specs, "entity": entity, "period": period} if specs else None
+
+
+def llm_refine_specs(task_text: str, summary: dict, feedback: dict, columns: list[str]) -> dict | None:
+    """Раунд 2: Qwen видит, какие гипотезы прошли валидатор, и развивает стратегию."""
+    question = (
+        "Ниже итоги проверки гипотез (delta_rel — относительный прирост метрики, passed — прошла ли порог "
+        f"threshold_rel={feedback.get('threshold_rel')}). Сформулируй общую стратегию: какие направления "
+        "работают, какие нет. Предложи уточнения прошедших (другие ключи, агрегаты, сочетания, сегменты) "
+        "и новые гипотезы в работающих направлениях; не повторяй отклонённые."
+    )
+    facts = {"results": feedback, **{k: summary.get(k) for k in ("period", "entity", "segments", "tail",
+                                                                  "perm_importance")}}
+    data = _llm_json(_specs_prompt(question, facts, "см. колонки", columns, task_text, 10), "fe_refine",
+                     timeout=150)
+    return _parse_specs(data, 12)
 
 
 def build_profile(task_path: Path) -> dict:
