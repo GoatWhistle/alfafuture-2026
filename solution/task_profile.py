@@ -148,6 +148,8 @@ def _llm_json(prompt: str, tag: str, timeout: float = 60, retries: int = 1) -> d
     if not os.environ.get("OPENAI_API_KEY"):
         log(f"LLM[{tag}]: OPENAI_API_KEY не задан, работаю на дефолтах")
         return None
+    if os.environ.get("AGENT_LLM_REQUEST_SEC"):
+        timeout = min(timeout, max(1., float(os.environ["AGENT_LLM_REQUEST_SEC"])))
     limit = min(2 * (retries + 1) * timeout + 10, max(5.0, time_left()))
     done, data = run_with_timeout(_llm_json_call, limit, prompt, tag, timeout, retries)
     if not done:
@@ -167,11 +169,26 @@ def _llm_json_call(prompt: str, tag: str, timeout: float, retries: int) -> dict 
         # Прокси платформы подставляет модель задачи по любому имени.
         model = os.environ.get("OPENAI_MODEL", "qwen/qwen3.8-27b")
         for attempt in (1, 2):
+            options = {}
+            if os.environ.get("AGENT_LLM_MAX_TOKENS"):
+                options["max_tokens"] = max(128, int(os.environ["AGENT_LLM_MAX_TOKENS"]))
+            reasoning = {}
+            if os.environ.get("AGENT_LLM_REASONING_EFFORT"):
+                reasoning["effort"] = os.environ["AGENT_LLM_REASONING_EFFORT"]
+            if os.environ.get("AGENT_LLM_REASONING_TOKENS"):
+                # Providers may reject effort + token budget together; explicit tokens win.
+                reasoning = {"max_tokens": max(128, int(os.environ["AGENT_LLM_REASONING_TOKENS"]))}
+            if reasoning:
+                options["extra_body"] = {"reasoning": reasoning}
             resp = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
+                **options,
             )
+            if resp.usage is not None:
+                log(f"LLM[{tag}] usage: {resp.usage.model_dump()}")
+            log(f"LLM[{tag}] finish_reason={resp.choices[0].finish_reason}")
             data = _extract_json(resp.choices[0].message.content or "")
             if data:
                 log(f"LLM[{tag}] (попытка {attempt}): {data}")
@@ -180,7 +197,8 @@ def _llm_json_call(prompt: str, tag: str, timeout: float, retries: int) -> dict 
         log(f"LLM[{tag}]: не удалось получить JSON за 2 попытки")
         return None
     except Exception as exc:  # noqa: BLE001 — решение обязано работать и без LLM
-        log(f"LLM[{tag}] недоступна, работаю на дефолтах: {exc}")
+        message = str(exc).replace(os.environ.get("OPENAI_API_KEY") or "\0", "[redacted]")
+        log(f"LLM[{tag}] недоступна, работаю на дефолтах: {message}")
         return None
 
 
@@ -338,6 +356,29 @@ def llm_refine_specs(task_text: str, summary: dict, feedback: dict, columns: lis
     data = _llm_json(_specs_prompt(question, facts, "см. колонки", columns, task_text, 10, planned), "fe_refine",
                      timeout=240, retries=0)
     return _parse_specs(data, 12)
+
+
+def llm_research_specs(task_text: str, summary: dict, feedback: dict, columns: list[str],
+                       planned: list[str], seconds: float) -> dict | None:
+    """Fresh recipe errors plus prior failures; bounded call within the research budget."""
+    question = (
+        "Продолжи исследование текущего рецепта. Ошибки и диагностика пересчитаны именно для него. "
+        "Предложи следующий эксперимент по остаточным ошибкам; объясни основание в why. "
+        "Если направление не работает, смени его. Можно развить сохранённый вариант, уступающий "
+        "лидеру: отдельный признак может стать полезным в сочетании. Не повторяй уже проверенные "
+        "на этом рецепте наборы. Не используй недоступную историю и метки test."
+    )
+    # Fresh errors precede the potentially long trial history in the bounded prompt.
+    facts = {"current": summary.get("current_recipe"), "tail": summary.get("tail"),
+             "segments": summary.get("segments"), "period": summary.get("period"),
+             "entity": summary.get("entity"), "feedback": feedback}
+    # _llm_json allows two attempts: 2*timeout + 10 <= caller's budget.
+    if seconds <= 12:
+        return None
+    timeout = min(90, (seconds - 10) / 2)
+    data = _llm_json(_specs_prompt(question, facts, "см. колонки", columns, task_text, 6, planned),
+                     "research", timeout=timeout, retries=0)
+    return _parse_specs(data, 8)
 
 
 # Упоминание метрики в тексте задачи: запасной источник, когда LLM недоступна.

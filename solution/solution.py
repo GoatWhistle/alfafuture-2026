@@ -148,7 +148,7 @@ def _llm_round1(prof: dict, ctx: dict, summary: dict, known: set[str], planned: 
     return _validate_llm(raw, ctx, known, "qwen")
 
 
-def run_autoeda(prof: dict, target: str, budget: float) -> dict:
+def run_autoeda(prof: dict, target: str, budget: float, use_llm: bool | None = None) -> dict:
     """Детекторы -> валидатор; Qwen: раунд 1 (темы параллельно, в фоне) -> раунд 2 по итогам.
 
     Возвращает {"period", "label_copy", "accepted"}: схему валидации для
@@ -160,6 +160,27 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
     ctx = fe_search.build_context(prof, target, deadline)
     specs = eda_detectors.run_all(ctx, t0 + 0.25 * budget)
     fe_search.build_folds(ctx)
+    if os.environ.get("AGENT_RESEARCH_MODE", "legacy") == "iterative":
+        from research_search import Research
+        from task_profile import llm_research_specs
+
+        def ask(diag, feedback, planned, seconds):
+            summary = eda_detectors.summary(diag, [])
+            summary["current_recipe"] = diag["facts"]["current_recipe"]
+            proposal = llm_research_specs(prof["task_text"], summary, feedback,
+                                          list(ctx["features"]), planned, seconds)
+            raw = proposal["specs"] if proposal else []
+            diag["llm_prior"] = float(np.median([s["prior"] for s in specs])) if specs else 0
+            # A feature tried against another parent is a different recipe experiment.
+            return _validate_llm(raw, diag, set(), "qwen_research")
+
+        research = Research(ctx, register, llm=ask if use_llm is not False and os.environ.get("OPENAI_API_KEY") else None)
+        accepted = research.run(specs, deadline)
+        added = apply_recipe(prof, target, accepted, ctx)
+        register("autoeda", f"research: {research.stop_reason}; {len(accepted)} спек -> {added}",
+                 ctx.get("search_final"), bool(accepted))
+        log(f"AutoEDA: {time.time() - t0:.0f}s, признаков {len(prof['features'])}")
+        return {"period": ctx["period"], "label_copy": ctx["label_copy"], "accepted": accepted}
     srch = fe_search.Search(ctx, register)
     srch.calibrate()
     try:
@@ -172,8 +193,9 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
     register("autoeda_specs", f"{len(specs)} гипотез детекторов: " + "; ".join(
         f"{s['source']}:{fe_dsl.describe(s)}" for s in sorted(specs, key=lambda s: -s["prior"])[:12]), None, True)
 
-    use_llm = time_left() > 1800
     planned = [fe_dsl.describe(s) for s in sorted(specs, key=lambda s: -s["prior"])]
+    if use_llm is None:
+        use_llm = time_left() > 1800
     fut = Background(_llm_round1, prof, ctx, summary, known, planned) if use_llm else None
     srch.stage_a(specs, t0 + 0.5 * budget)
     if fut is not None:
@@ -197,6 +219,15 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
             srch.stage_a(qwen2, t0 + 0.8 * budget)
     accepted = srch.stage_b(deadline)
 
+    added = apply_recipe(prof, target, accepted, ctx)
+    register("autoeda", f"схема {ctx['fold_scheme']}; принято {len(accepted)} спек -> {added}",
+             ctx.get("search_final"), bool(accepted))
+    log(f"AutoEDA: {time.time() - t0:.0f}s, признаков {len(prof['features'])}")
+    return {"period": ctx["period"], "label_copy": ctx["label_copy"], "accepted": accepted}
+
+
+def apply_recipe(prof: dict, target: str, accepted: list[dict], ctx: dict) -> list[str]:
+    """Materialize a selected, replayable recipe on a fresh base profile."""
     added = []
     model_ops = {}
     target_specs = []
@@ -240,10 +271,7 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
     prof["model_ops"] = model_ops
     prof["target_specs"] = target_specs
     prof["cv"] = ctx["cv"]
-    register("autoeda", f"схема {ctx['fold_scheme']}; принято {len(accepted)} спек -> {added}",
-             ctx.get("search_final"), bool(accepted))
-    log(f"AutoEDA: {time.time() - t0:.0f}s, признаков {len(prof['features'])}")
-    return {"period": ctx["period"], "label_copy": ctx["label_copy"], "accepted": accepted}
+    return added
 
 
 def _scored(cands: list[dict]) -> list[dict]:
@@ -479,7 +507,10 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     prof.setdefault("base_features", list(prof["features"]))
     eda = {"period": None, "label_copy": False, "accepted": []}
     spare = remaining() - PREDICT_RESERVE_SEC - kfold_reserve
-    eda_budget = min(AUTOEDA_SEC, 0.3 * spare)
+    research_share = 0.3
+    if os.environ.get("AGENT_RESEARCH_MODE") == "iterative":
+        research_share = float(np.clip(float(os.environ.get("AGENT_RESEARCH_SHARE", .75)), .1, .9))
+    eda_budget = min(AUTOEDA_SEC, research_share * spare)
     if eda_budget >= MIN_AUTOEDA_SEC:
         # AutoEDA работает на копии профиля под лимитом времени: зависшее построение признаков
         # прерывается, а прерванный этап не оставляет профиль наполовину изменённым.
