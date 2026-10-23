@@ -18,6 +18,11 @@ import time
 from compare import dataset
 
 
+def research_hard_limit(budget):
+    # Match solve_target's completion allowance; search still sees the nominal cap.
+    return budget * 1.25 + 60
+
+
 def worker(source, task, budget, final_fit_seconds=180):
     sys.path.insert(0, str(Path(source).resolve()))
     import models
@@ -42,7 +47,7 @@ def worker(source, task, budget, final_fit_seconds=180):
         begin = time.monotonic()
         research_status = "complete"
         try:
-            with time_limit(budget):
+            with time_limit(research_hard_limit(budget)):
                 research = solution.run_autoeda(work, target, budget, use_llm=bool(os.environ.get("OPENAI_API_KEY")))
         except StageTimeout:
             work = {**prof, "features": list(prof["features"])}
@@ -122,7 +127,7 @@ def run_one(args, name, seed, mode, budget, credentials):
     env.update(AGENT_N_CPUS="2", OMP_NUM_THREADS="2", OPENBLAS_NUM_THREADS="2",
                AGENT_RESEARCH_MODE=mode, AGENT_LLM_MAX_TOKENS=str(args.max_tokens), AGENT_LLM_REQUEST_SEC="90",
                AGENT_LLM_REASONING_TOKENS="1024",
-               AGENT_TIME_LIMIT_SEC=str(budget + args.final_fit_seconds + 120),
+               AGENT_TIME_LIMIT_SEC=str(research_hard_limit(budget) + args.final_fit_seconds + 120),
                AGENT_SAFETY_SEC="10", AGENT_HARD_MARGIN_SEC="10")
     peak, started = 0, time.monotonic()
     with (root / "log.txt").open("w") as stream:
@@ -135,7 +140,7 @@ def run_one(args, name, seed, mode, budget, credentials):
                 peak = max(peak, monitor.memory_info().rss)
             except psutil.NoSuchProcess:
                 pass
-            if time.monotonic() - started > budget + args.final_fit_seconds + 150:
+            if time.monotonic() - started > research_hard_limit(budget) + args.final_fit_seconds + 150:
                 for child in monitor.children(recursive=True):
                     child.kill()
                 proc.kill()
@@ -196,6 +201,7 @@ def main():
     protocol = {k: v for k, v in vars(args).items() if k != "credentials_file"}
     protocol.update(llm=bool(credentials.get("OPENAI_API_KEY")), model=credentials.get("OPENAI_MODEL"),
                     cpus_per_worker=2, autogluon=False, llm_request_seconds=90,
+                    research_hard_limit="budget * 1.25 + 60 seconds, matching production solve_target",
                     llm_reasoning=dict(max_tokens=1024),
                     source_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in args.source.glob('*.py')},
                     note="Budgets are research caps. Early stopping on exhausted search is recorded, not counted as full wall time. "
