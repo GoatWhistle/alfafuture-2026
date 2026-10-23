@@ -495,6 +495,12 @@ def _fit_segmented(make, Xf, yf, Xes, yes, cf=None, ces=None, classes=None, n_it
                 continue
             er = None if ces is None else ces == code
             Xe, ye = (Xes[er], yes[er]) if er is not None and er.sum() > 0 else (Xes, yes)
+            if classes is not None and ye is not None:
+                # Ранняя остановка — по классам, которые есть в train сегмента.
+                seen = np.isin(ye, np.unique(yf[rows]))
+                if seen.sum() == 0:
+                    continue
+                Xe, ye = Xe[seen], ye[seen]
             segs[code] = fit(Xf[rows], yf[rows], Xe, ye)
     return glob, segs
 
@@ -763,12 +769,14 @@ def cleanup_autogluon() -> None:
         shutil.rmtree(AG_PATHS.pop(), ignore_errors=True)
 
 
-def fit_autogluon(prof: dict, target: str, time_budget: float, rows=None, folds=None):
-    """AutoGluon на признаках prof["features"] (без target-признаков AutoEDA).
+def fit_autogluon(prof: dict, target: str, time_budget: float, rows=None, folds=None, extra=None):
+    """AutoGluon на признаках prof["features"].
 
     rows — индексы train для обучения (temporal holdout-fit), иначе весь
     размеченный train. folds — номера фолдов строк: бэггинг AutoGluon
     идёт по тем же фолдам, что и остальные модели (параметр groups).
+    extra — дополнительные признаки строк обучения (RangeIndex в порядке rows),
+    например target-признаки, построенные только по прошлому.
     """
     from autogluon.tabular import TabularPredictor
 
@@ -777,6 +785,9 @@ def fit_autogluon(prof: dict, target: str, time_budget: float, rows=None, folds=
     if rows is not None:
         lab = lab.loc[rows]
     df = lab[features + [target]].copy()
+    if extra is not None:
+        df = pd.concat([df, extra.set_axis(df.index)], axis=1, verify_integrity=True)
+        features = features + list(extra.columns)
     if prof["log_target"]:
         df[target] = np.log1p(df[target].clip(lower=0))
     extra: dict = {}
@@ -827,13 +838,15 @@ def fit_autogluon(prof: dict, target: str, time_budget: float, rows=None, folds=
     return predictor
 
 
-def ag_predict(prof: dict, predictor, target: str, frame: pd.DataFrame | None = None):
-    """Предсказания AutoGluon (по умолчанию на test).
+def ag_predict(prof: dict, predictor, target: str, frame: pd.DataFrame | None = None, extra=None):
+    """Предсказания AutoGluon (по умолчанию на test); extra — те же доп. признаки, что при fit.
 
     Регрессия: (значения, None, None); классификация: (вектор для сабмита,
     матрица вероятностей, классы).
     """
     X = (prof["test"] if frame is None else frame)[prof["features"]]
+    if extra is not None:
+        X = pd.concat([X, extra.set_axis(X.index)], axis=1, verify_integrity=True)
     if prof["problem_type"] == "regression":
         pred = predictor.predict(X).to_numpy()
         if prof["log_target"]:
