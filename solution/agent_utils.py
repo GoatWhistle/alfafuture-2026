@@ -92,6 +92,12 @@ def shutdown(code: int = 0, workdir: Path | None = None) -> None:
     submission.csv пишется атомарно, поэтому на диске остаётся последний валидный файл.
     """
     kill_children()
+    try:
+        import models
+
+        models.cleanup_autogluon()
+    except Exception:  # noqa: BLE001
+        pass
     if workdir is not None:
         for tmp in Path(workdir).glob(".submission.*.tmp"):
             tmp.unlink(missing_ok=True)

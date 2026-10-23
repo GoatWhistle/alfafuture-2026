@@ -53,3 +53,9 @@ def test_autogluon_classification_strings(monkeypatch):
     kq = models.quick_oof(prof, "y")
     out = solution.align_candidates([cand, {"name": "quick_kfold", **kq}])
     assert out[0]["classes"] == out[1]["classes"]
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_ag():
+    yield
+    models.cleanup_autogluon()

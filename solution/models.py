@@ -752,6 +752,14 @@ def copy_duplicate_labels(prof: dict, target: str, y_oof, oof_pred, test_pred, m
 # ---------------------------------------------------------------------------
 
 FOLD_COL = "__cv_fold__"
+AG_PATHS: list[str] = []  # каталоги моделей AutoGluon этого запуска — удаляются после таргета и при выходе
+
+
+def cleanup_autogluon() -> None:
+    import shutil
+
+    while AG_PATHS:
+        shutil.rmtree(AG_PATHS.pop(), ignore_errors=True)
 
 
 def fit_autogluon(prof: dict, target: str, time_budget: float, rows=None, folds=None):
@@ -784,6 +792,7 @@ def fit_autogluon(prof: dict, target: str, time_budget: float, rows=None, folds=
         presets = "good_quality"
 
     path = tempfile.mkdtemp(prefix="ag_", dir="/tmp")
+    AG_PATHS.append(path)
     # Macro-метрики требуют баланса классов, иначе редкие классы тонут
     # (на UNSW-NB15 AG без взвешивания проигрывает балансированному LightGBM).
     if prof["problem_type"] != "regression" and prof["metric"] in (
