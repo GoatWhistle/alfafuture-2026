@@ -36,6 +36,7 @@ from models import (
     copy_duplicate_labels,
     fit_autogluon,
     is_better,
+    output_from_proba,
     quick_model,
     quick_oof,
     tune_blend,
@@ -249,6 +250,17 @@ def _apply_mask(metric: str, cands: list[dict], mask: np.ndarray | None) -> np.n
     return mask
 
 
+def _scored(cands: list[dict]) -> list[dict]:
+    """Только оценённые кандидаты: неоценённый не побеждает по несопоставимой оценке."""
+    out = []
+    for c in cands:
+        if c["score"] is None or not np.isfinite(c["score"]):
+            log(f"{c['name']}: оценка недоступна — кандидат не участвует в выборе")
+            continue
+        out.append(c)
+    return out
+
+
 def _select_final_regression(prof, target, current, ag, kq, fallback, eval_mask=None):
     metric = prof["metric"]
     ag_score, ag_test_pred, _, ag_y, ag_oof_pred, _, _ = ag
@@ -272,6 +284,7 @@ def _select_final_regression(prof, target, current, ag, kq, fallback, eval_mask=
             "oof": alpha * cands[0]["oof"] + (1 - alpha) * cands[1]["oof"],
             "test": alpha * cands[0]["test"] + (1 - alpha) * cands[1]["test"],
         })
+    cands = _scored(cands)
     if not cands:
         return fallback
     win = cands[0]
@@ -315,6 +328,7 @@ def _select_final_classification(prof, target, current, quick, ag, kq, fallback,
             "oof": alpha * cands[0]["oof"] + (1 - alpha) * cands[1]["oof"],
             "test": alpha * cands[0]["test"] + (1 - alpha) * cands[1]["test"],
         })
+    cands = _scored(cands)
     if not cands:
         return _tuned_or(tune_quick_weights(prof, quick, target, current), fallback)
     win = cands[0]
@@ -326,11 +340,10 @@ def _select_final_classification(prof, target, current, quick, ag, kq, fallback,
     classes = win["classes"]
     classes_arr = np.array(classes, dtype=object)
     if prof["output_proba"]:
-        pos = sorted(classes)[-1]
-        vals = win["test"][:, classes.index(pos)]
+        vals = output_from_proba(prof, target, win["test"], classes)
         current[target] = vals
         write_submission(prof, current)
-        return vals
+        return current[target]
 
     proba_test, proba_oof = win["test"], win["oof"]
     if metric in MACRO_METRICS:
@@ -369,9 +382,9 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     # Ступень 1: быстрый LightGBM — ранний валидный сабмит.
     try:
         quick = quick_model(prof, target)
-        best_pred = quick["test_pred"]
-        current[target] = best_pred
+        current[target] = quick["test_pred"]
         write_submission(prof, current)
+        best_pred = current[target]
         register("quick_lgbm", "градиентный бустинг с дефолтами как опорная точка", quick["val_score"], True)
     except Exception:  # noqa: BLE001
         log("quick_lgbm упал:\n" + traceback.format_exc())
@@ -393,11 +406,11 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
             q2 = quick_model(prof, target)
             better = is_better(metric, q2["val_score"], quick["val_score"])
             register("quick_lgbm_fe", "quick-модель на признаках AutoEDA", q2["val_score"], better)
-            quick = q2
             if better:
-                best_pred = quick["test_pred"]
-                current[target] = best_pred
+                quick = q2
+                current[target] = quick["test_pred"]
                 write_submission(prof, current)
+                best_pred = current[target]
         except Exception:  # noqa: BLE001
             log("quick_lgbm на признаках AutoEDA упал:\n" + traceback.format_exc())
 
@@ -426,13 +439,17 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
                 ag_y, ag_oof_pred, ag_oof_proba, ag_classes = oof
                 try:
                     ag_score = models.score(metric, ag_y, ag_oof_pred, proba=ag_oof_proba, labels=ag_classes)
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    log(f"AutoGluon: {metric} по OOF не посчитан ({exc})")
                     ag_score = None
             # Немедленная перезапись сабмита: OOF AutoGluon надёжнее одного
             # 15%-сплита quick, поэтому AG отбрасываем только при явном (>2%)
             # преимуществе quick. Финальный выбор ниже — по единой OOF-базе.
-            if ag_score is None or quick is None:
+            if quick is None:
                 take_ag = True
+            elif ag_score is None:
+                log("AutoGluon: OOF-оценка недоступна, сабмит quick остаётся")
+                take_ag = False
             else:
                 qs = quick["val_score"]
                 margin = 0.02 * abs(qs) if qs else 1e-9
@@ -440,9 +457,9 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
                 take_ag = not is_better(metric, shifted, ag_score)
             register("autogluon", "ансамбль AutoGluon против опорного бустинга", ag_score, take_ag)
             if take_ag:
-                best_pred = ag_test_pred
-                current[target] = best_pred
+                current[target] = ag_test_pred
                 write_submission(prof, current)
+                best_pred = current[target]
 
     # Ступень 3: k-fold OOF quick-модели — честная база сравнения и материал для бленда.
     kq = None
@@ -485,14 +502,16 @@ def main() -> None:
     write_submission(prof, current)
     register("constant", "медиана/мода как страховка формата", None, True)
 
-    per_target_budget = time_left() / len(targets)
-    for t in targets:
-        if len(targets) > 1:
-            # Профиль одноколоночных функций указывает на prof["target"].
-            prof["target"] = t
-            prof["log_target"] = prof["metric"] == "rmsle"
+    # Признаки AutoEDA и модельные операции одного таргета не переносятся на другой.
+    base_state = {"train": prof["train"], "test": prof["test"], "features": list(prof["features"])}
+    for i, t in enumerate(targets):
+        prof.update(base_state, features=list(base_state["features"]), target=t, **prof["per_target"][t])
+        prof.pop("base_features", None)
+        prof.pop("model_ops", None)
+        # Бюджет — от фактически оставшегося времени на оставшиеся таргеты.
+        budget = time_left() / (len(targets) - i)
         try:
-            solve_target(prof, t, current, per_target_budget)
+            solve_target(prof, t, current, budget)
         except Exception:  # noqa: BLE001
             log(f"solve_target({t}) упал:\n" + traceback.format_exc())
 
