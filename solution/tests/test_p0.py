@@ -215,13 +215,14 @@ def test_losing_quick_with_new_features_keeps_original(tmp_path, monkeypatch):
     prof = _binary_prof(tmp_path)
     n = len(prof["test"])
     q1 = {"val_score": 0.9, "test_pred": np.ones(n, dtype=object), "proba": None}
+    qb = {"val_score": 0.85, "test_pred": np.ones(n, dtype=object), "proba": None}
     q2 = {"val_score": 0.7, "test_pred": np.zeros(n, dtype=object), "proba": None}
-    calls = iter([q1, q2])
-    monkeypatch.setattr(solution, "quick_model", lambda p, t: next(calls))
+    calls = iter([q1, qb, q2])
+    monkeypatch.setattr(solution, "quick_model", lambda p, t, **kw: next(calls))
     monkeypatch.setattr(solution, "run_autoeda", lambda p, t, b: {"period": None, "label_copy": False,
                                                                    "accepted": [{"op": "drop"}]})
     monkeypatch.setattr(solution, "fit_autogluon", lambda *a: (_ for _ in ()).throw(RuntimeError("off")))
-    monkeypatch.setattr(solution, "quick_oof", lambda p, t: None)
+    monkeypatch.setattr(solution, "quick_oof", lambda p, t, **kw: None)
 
     current = {"target": models.constant_predictions(prof, "target")}
     solution.solve_target(prof, "target", current, budget=5000)

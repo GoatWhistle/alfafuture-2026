@@ -22,7 +22,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from agent_utils import TOTAL_BUDGET_SEC, log, time_left
+from agent_utils import (
+    TOTAL_BUDGET_SEC,
+    Background,
+    StageTimeout,
+    deadline,
+    log,
+    shutdown,
+    start_watchdog,
+    time_left,
+    time_limit,
+)
 import eda_detectors
 import fe_dsl
 import fe_search
@@ -53,7 +63,12 @@ from task_profile import build_profile, llm_propose_specs, llm_refine_specs
 PREDICT_RESERVE_SEC = float(os.environ.get("AGENT_PREDICT_RESERVE_SEC", 900))
 KFOLD_RESERVE_SEC = float(os.environ.get("AGENT_KFOLD_RESERVE_SEC", 600))
 AUTOEDA_SEC = float(os.environ.get("AGENT_AUTOEDA_SEC", 1200))
+MIN_AUTOEDA_SEC = 120
+# Сверх бюджета AutoEDA: после этого этап бросается (зависшее построение признаков).
+AUTOEDA_SLACK_SEC = 60
 MACRO_METRICS = ("f1_macro", "f1_weighted", "f1", "balanced_accuracy")
+# Что AutoEDA меняет в профиле (переносится из рабочей копии только при успехе).
+EDA_KEYS = ("train", "test", "features", "model_ops", "target_specs", "cv")
 EXPERIMENTS: list[dict] = []
 
 
@@ -138,8 +153,6 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
     финального выбора и флаг постпроцессинга. Принятые признаки дописываются
     в prof, модельные операции — в prof["model_ops"].
     """
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
-
     t0 = time.time()
     deadline = t0 + budget
     ctx = fe_search.build_context(prof, target, deadline)
@@ -158,14 +171,13 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
         f"{s['source']}:{fe_dsl.describe(s)}" for s in sorted(specs, key=lambda s: -s["prior"])[:12]), None, True)
 
     use_llm = time_left() > 1800
-    pool = ThreadPoolExecutor(1)
     planned = [fe_dsl.describe(s) for s in sorted(specs, key=lambda s: -s["prior"])]
-    fut = pool.submit(_llm_round1, prof, ctx, summary, known, planned) if use_llm else None
+    fut = Background(_llm_round1, prof, ctx, summary, known, planned) if use_llm else None
     srch.stage_a(specs, t0 + 0.5 * budget)
     if fut is not None:
         try:
             qwen = fut.result(timeout=max(5.0, t0 + 0.6 * budget - time.time()))
-        except FutTimeout:
+        except TimeoutError:
             log("LLM раунд 1 не успел — продолжаю без него")
             qwen = []
         except Exception:  # noqa: BLE001
@@ -181,7 +193,6 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
                 log("LLM раунд 2 упал:\n" + traceback.format_exc())
                 qwen2 = []
             srch.stage_a(qwen2, t0 + 0.8 * budget)
-    pool.shutdown(wait=False)
     accepted = srch.stage_b(deadline)
 
     added = []
@@ -404,14 +415,22 @@ def run_autogluon(prof: dict, target: str, budget: float) -> dict | None:
 
 
 def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget: float) -> np.ndarray:
-    """Решает одну целевую колонку, по ходу обновляя submission.csv."""
+    """Решает одну целевую колонку, по ходу обновляя submission.csv.
+
+    budget — секунды на таргет; этапы считают остаток от абсолютного
+    времени окончания, поэтому потраченное на ранние этапы учитывается.
+    """
     metric = prof["metric"]
     best_pred = current[target]
     quick = None
+    t_end = min(time.time() + budget, deadline())
+
+    def remaining() -> float:
+        return t_end - time.time()
 
     # Ступень 1: быстрый LightGBM — ранний валидный сабмит.
     try:
-        quick = quick_model(prof, target)
+        quick = quick_model(prof, target, deadline_ts=t_end)
         current[target] = quick["test_pred"]
         write_submission(prof, current)
         best_pred = current[target]
@@ -422,11 +441,22 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     # Ступень 1.5: AutoEDA — детекторы, гипотезы Qwen, валидатор на фолдах под тест.
     prof.setdefault("base_features", list(prof["features"]))
     eda = {"period": None, "label_copy": False, "accepted": []}
-    spare = min(budget, time_left()) - PREDICT_RESERVE_SEC - KFOLD_RESERVE_SEC
+    spare = remaining() - PREDICT_RESERVE_SEC - KFOLD_RESERVE_SEC
     eda_budget = min(AUTOEDA_SEC, 0.3 * spare)
-    if eda_budget >= 120:
+    if eda_budget >= MIN_AUTOEDA_SEC:
+        # AutoEDA работает на копии профиля под лимитом времени: зависшее построение признаков
+        # прерывается, а прерванный этап не оставляет профиль наполовину изменённым.
+        work = {**prof, "features": list(prof["features"])}
+        eda_limit = eda_budget * 1.25 + AUTOEDA_SLACK_SEC
         try:
-            eda = run_autoeda(prof, target, eda_budget)
+            with time_limit(eda_limit):
+                res = run_autoeda(work, target, eda_budget)
+            eda = res
+            for k in EDA_KEYS:
+                if k in work:
+                    prof[k] = work[k]
+        except StageTimeout:
+            log(f"AutoEDA не уложился в {eda_limit:.0f}s — продолжаю на исходных признаках")
         except Exception:  # noqa: BLE001
             log("AutoEDA упал, работаю на исходных признаках:\n" + traceback.format_exc())
     else:
@@ -435,8 +465,8 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
         # Сравнение на одном фолде схемы cv: база — исходные признаки без target-спек и модельных операций.
         try:
             base_view = {**prof, "features": prof["base_features"], "target_specs": [], "model_ops": {}}
-            qb = quick_model(base_view, target, use_cv=True)
-            q2 = quick_model(prof, target, use_cv=True)
+            qb = quick_model(base_view, target, use_cv=True, deadline_ts=t_end)
+            q2 = quick_model(prof, target, use_cv=True, deadline_ts=t_end)
             better = is_better(metric, q2["val_score"], qb["val_score"])
             register("quick_lgbm_fe", f"quick-модель на признаках AutoEDA (база {qb['val_score']:.5f})",
                      q2["val_score"], better)
@@ -450,7 +480,7 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
 
     # Ступень 2: AutoGluon на фолдах схемы cv.
     ag = None
-    ag_budget = min(budget, time_left()) - PREDICT_RESERVE_SEC - KFOLD_RESERVE_SEC
+    ag_budget = remaining() - PREDICT_RESERVE_SEC - KFOLD_RESERVE_SEC
     if ag_budget >= 300:
         try:
             ag = run_autogluon(prof, target, ag_budget)
@@ -481,9 +511,9 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
 
     # Ступень 3: k-fold LightGBM на тех же фолдах — база сравнения и материал для бленда.
     cands = [ag] if ag is not None and ag.get("rows") is not None else []
-    if time_left() > PREDICT_RESERVE_SEC * 0.5:
+    if remaining() > PREDICT_RESERVE_SEC * 0.5:
         try:
-            kq = quick_oof(prof, target)
+            kq = quick_oof(prof, target, deadline_ts=t_end)
             if kq is not None:
                 register("quick_oof", "k-fold LightGBM: OOF-база для бленда", kq["score"], True)
                 cands.append({"name": "quick_kfold", **kq})
@@ -500,7 +530,8 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
 
 def main() -> None:
     task_path = Path(sys.argv[1] if len(sys.argv) > 1 else "task.md").resolve()
-    log(f"Старт. task={task_path}, бюджет={TOTAL_BUDGET_SEC:.0f}s")
+    log(f"Старт. task={task_path}, бюджет={TOTAL_BUDGET_SEC:.0f}s, CPU={models.N_CPUS}")
+    start_watchdog(task_path.parent)
 
     prof = build_profile(task_path)
     targets = prof["target_cols"]
@@ -530,9 +561,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    workdir = Path(sys.argv[1] if len(sys.argv) > 1 else "task.md").resolve().parent
     try:
         main()
     except Exception:  # noqa: BLE001
         # Последний рубеж: любая ошибка не должна оставить нас без файла.
         log("Фатальная ошибка:\n" + traceback.format_exc())
-        sys.exit(1)
+        shutdown(0 if (workdir / "submission.csv").exists() else 1, workdir)
+    # Фоновые потоки (LLM, брошенные по таймауту этапы) и дочерние процессы не удерживают процесс.
+    shutdown(0, workdir)
