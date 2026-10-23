@@ -87,7 +87,7 @@ def fit_predict(ctx: dict, Xtr, ytr, Xva, yva, fast: bool = False, objective: di
     import lightgbm as lgb
 
     params = _lgb_params(ctx, fast)
-    cb = [lgb.early_stopping(40, verbose=False), lgb.log_evaluation(0)]
+    cb = [lgb.early_stopping(40, verbose=False), lgb.log_evaluation(0), models.time_guard(ctx["deadline"])]
     if ctx["ptype"] == "regression":
         obj = {"objective": "regression"}
         if objective:

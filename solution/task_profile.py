@@ -138,7 +138,25 @@ def _extract_json(text: str) -> dict | None:
 
 
 def _llm_json(prompt: str, tag: str, timeout: float = 60, retries: int = 1) -> dict | None:
-    """Один JSON-ответ LLM: до 2 попыток, любая ошибка -> None."""
+    """Один JSON-ответ LLM: до 2 попыток, любая ошибка -> None.
+
+    Весь вызов ограничен по времени (зависший сокет/прокси не держит агента):
+    по истечении лимита поток бросается, ответ — None.
+    """
+    from agent_utils import run_with_timeout, time_left
+
+    if not os.environ.get("OPENAI_API_KEY"):
+        log(f"LLM[{tag}]: OPENAI_API_KEY не задан, работаю на дефолтах")
+        return None
+    limit = min(2 * (retries + 1) * timeout + 10, max(5.0, time_left()))
+    done, data = run_with_timeout(_llm_json_call, limit, prompt, tag, timeout, retries)
+    if not done:
+        log(f"LLM[{tag}]: нет ответа за {limit:.0f}s, работаю без него")
+        return None
+    return data
+
+
+def _llm_json_call(prompt: str, tag: str, timeout: float, retries: int) -> dict | None:
     if not os.environ.get("OPENAI_API_KEY"):
         log(f"LLM[{tag}]: OPENAI_API_KEY не задан, работаю на дефолтах")
         return None

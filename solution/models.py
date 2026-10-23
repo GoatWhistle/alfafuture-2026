@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 
 import numpy as np
 import pandas as pd
 
-from agent_utils import log
+from agent_utils import available_cpus, deadline, log
 from eda_probe import row_keys
 
-N_CPUS = os.cpu_count() or 8
+N_CPUS = available_cpus()
 
 HIGHER_BETTER = {
     "rmse": False, "rmsle": False, "mae": False, "mape": False, "log_loss": False,
@@ -443,6 +444,18 @@ def _lgb_model(prof: dict, n_estimators: int, seed: int, objective: dict | None 
     return lgb.LGBMClassifier(class_weight=cw, **common)
 
 
+def time_guard(deadline_ts: float):
+    """Callback LightGBM: остановка обучения по абсолютному дедлайну (модель на текущей итерации)."""
+    import lightgbm as lgb
+
+    def cb(env):
+        if time.time() > deadline_ts:
+            raise lgb.callback.EarlyStopException(env.iteration, env.evaluation_result_list)
+
+    cb.order = 40
+    return cb
+
+
 def _pred(m, X, classes):
     if classes is None:
         return m.predict(X)
@@ -452,20 +465,24 @@ def _pred(m, X, classes):
     return out
 
 
-def _fit_segmented(make, Xf, yf, Xes, yes, cf=None, ces=None, classes=None, n_iter=None):
-    """Общая модель + модели сегментов (коды cf). n_iter задан — без ранней остановки (финальный fit)."""
+def _fit_segmented(make, Xf, yf, Xes, yes, cf=None, ces=None, classes=None, n_iter=None, deadline_ts=None):
+    """Общая модель + модели сегментов (коды cf). n_iter задан — без ранней остановки (финальный fit).
+
+    deadline_ts — абсолютный дедлайн: обучение обрывается на текущей итерации.
+    """
     import lightgbm as lgb
 
     yf, yes = np.asarray(yf), (None if yes is None else np.asarray(yes))
+    guard = time_guard(deadline() if deadline_ts is None else deadline_ts)
 
     def fit(X, y, Xe, ye):
         m = make()
         if n_iter is not None:
             m.set_params(n_estimators=max(int(n_iter), 20))
-            m.fit(X, y)
+            m.fit(X, y, callbacks=[guard])
         else:
             m.fit(X, y, eval_set=[(Xe, ye)],
-                  callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)])
+                  callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0), guard])
         return m
 
     glob = fit(Xf, yf, Xes, yes)
@@ -491,7 +508,8 @@ def _predict_segmented(glob, segs, X, codes, classes):
     return p
 
 
-def quick_model(prof: dict, target: str, max_rows: int = 300_000, use_cv: bool = False) -> dict:
+def quick_model(prof: dict, target: str, max_rows: int = 300_000, use_cv: bool = False,
+                deadline_ts: float | None = None) -> dict:
     """LightGBM на одном разбиении: быстрый ориентир качества + ранние предсказания.
 
     use_cv=False — случайные 15% (до AutoEDA схема ещё неизвестна);
@@ -525,7 +543,7 @@ def quick_model(prof: dict, target: str, max_rows: int = 300_000, use_cv: bool =
     yv = y.iloc[va].to_numpy()
     classes = None if ptype == "regression" else sorted(pd.unique(y_orig).tolist(), key=str)
     glob, _ = _fit_segmented(lambda: _lgb_model(prof, 3000, 42), Xf, y.iloc[fit_i], Xes, y.iloc[es_i],
-                             classes=classes)
+                             classes=classes, deadline_ts=deadline_ts)
 
     result = {"name": "quick_lgbm", "rows": lab.index.to_numpy()[va]}
     if ptype == "regression":
@@ -562,7 +580,7 @@ def _segment_codes(prof: dict, target: str):
     return seg, ctr, cte
 
 
-def quick_oof(prof: dict, target: str, max_rows: int = 400_000) -> dict | None:
+def quick_oof(prof: dict, target: str, max_rows: int = 400_000, deadline_ts: float | None = None) -> dict | None:
     """K-fold LightGBM по схеме prof["cv"]: OOF на валидационных строках + предсказания test.
 
     На каждом фолде target-признаки строятся по train фолда, ранняя
@@ -570,8 +588,11 @@ def quick_oof(prof: dict, target: str, max_rows: int = 400_000) -> dict | None:
     переобученная на всём размеченном train (число деревьев — медиана по
     фолдам). Учитывает модельные операции AutoEDA (сегменты, функция
     потерь). Возвращает {"rows" — индексы train с OOF, "y", "oof", "test",
-    "classes", "score"} или None, когда датасет слишком велик.
+    "classes", "score"} или None, когда датасет слишком велик или ни один
+    фолд не успел до deadline_ts (оставшиеся фолды пропускаются, финальный
+    fit обрывается по дедлайну).
     """
+    dl = deadline() if deadline_ts is None else deadline_ts
     metric, ptype = prof["metric"], prof["problem_type"]
     X, y, Xte = _prep_matrices(prof, target)
     if len(X) > max_rows:
@@ -599,19 +620,25 @@ def quick_oof(prof: dict, target: str, max_rows: int = 400_000) -> dict | None:
     folds = outer_folds(prof, lab, y_orig)
     oof = np.full(len(X), np.nan) if classes is None else np.full((len(X), len(classes)), np.nan)
     iters = []
-    for tr, va in folds:
+    for i, (tr, va) in enumerate(folds):
+        if time.time() > dl:
+            log(f"quick_oof: дедлайн — оценено {i}/{len(folds)} фолдов")
+            break
         fit_i, es_i = es_split(prof, lab, tr)
         app = np.concatenate([es_i, va])
         Xf, Xa = with_target_features(prof, target, lab.iloc[fit_i], X.iloc[fit_i], lab.iloc[app], X.iloc[app])
         cf = None if ctr is None else ctr[fit_i]
         glob, segs = _fit_segmented(make, Xf, y.iloc[fit_i], Xa.iloc[:len(es_i)], y.iloc[es_i],
-                                    cf, None if ctr is None else ctr[es_i], classes)
+                                    cf, None if ctr is None else ctr[es_i], classes, deadline_ts=dl)
         oof[va] = _predict_segmented(glob, segs, Xa.iloc[len(es_i):], None if ctr is None else ctr[va], classes)
         iters.append(glob.best_iteration_ or 1500)
 
+    if not iters:
+        return None
     n_iter = int(np.median(iters) * 1.1)
     Xall, Xt = with_target_features(prof, target, lab, X, prof["test"], Xte)
-    glob, segs = _fit_segmented(make, Xall, y, None, None, ctr, None, classes, n_iter=n_iter)
+    glob, segs = _fit_segmented(make, Xall, y, None, None, ctr, None, classes, n_iter=n_iter,
+                                deadline_ts=max(dl, time.time() + 60))
     te = _predict_segmented(glob, segs, Xt, cte, classes)
 
     cov = np.isfinite(oof if oof.ndim == 1 else oof[:, 0])
