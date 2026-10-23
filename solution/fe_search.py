@@ -249,6 +249,7 @@ class Evaluator:
     def __init__(self, ctx: dict):
         self.ctx = ctx
         self.cache: dict[str, list] = {}
+        self.score_cache: dict[tuple[str, ...], list[float]] = {}
         df, feats = ctx["df"], ctx["features"]
         self.base = [(df.loc[tr, feats].reset_index(drop=True), df.loc[va, feats].reset_index(drop=True))
                      for tr, va in ctx["folds"]]
@@ -290,7 +291,7 @@ class Evaluator:
         if drops:
             Xtr, Xva = Xtr.drop(columns=list(drops & set(Xtr.columns))), Xva.drop(columns=list(drops & set(Xva.columns)))
         parts_tr, parts_va = [Xtr], [Xva]
-        for s in specs:
+        for s in fe_dsl.unique_specs(specs):
             if s["op"] == "drop" or s["op"] in fe_dsl.MODEL_OPS:
                 continue
             f = self._spec_feats(s)
@@ -301,13 +302,17 @@ class Evaluator:
         if extra is not None:
             parts_tr.append(extra[i][0])
             parts_va.append(extra[i][1])
-        Xtr, Xva = pd.concat(parts_tr, axis=1), pd.concat(parts_va, axis=1)
-        Xtr = Xtr.loc[:, ~Xtr.columns.duplicated()]
-        Xva = Xva.loc[:, ~Xva.columns.duplicated()]
+        # Коллизия имени — явная ошибка, а не молчаливая потеря признака.
+        Xtr = pd.concat(parts_tr, axis=1, verify_integrity=True)
+        Xva = pd.concat(parts_va, axis=1, verify_integrity=True)
         return _to_lgb(Xtr, Xva)
 
     def run(self, specs: list[dict], extra: list | None = None) -> list[float] | None:
         """Скоры по фолдам для базы + specs: признаки, drop, segment_model, objective."""
+        specs = sorted(fe_dsl.unique_specs(specs), key=fe_dsl.spec_key)
+        key = tuple(sorted(fe_dsl.spec_key(s) for s in specs))
+        if extra is None and key in self.score_cache:
+            return list(self.score_cache[key])
         ctx = self.ctx
         t0 = time.time()
         seg = [s for s in specs if s["op"] == "segment_model"]
@@ -331,6 +336,8 @@ class Evaluator:
             scores.append(score_pred(ctx, yva, pred))
         self.n_evals += 1
         self.spent += time.time() - t0
+        if extra is None:
+            self.score_cache[key] = list(scores)
         return scores
 
 
@@ -438,6 +445,7 @@ class Search:
         self.ev = Evaluator(ctx)
         self.passed: list[dict] = []
         self.results: list[dict] = []
+        self.seen: set[str] = set()
         self.t0 = time.time()
 
     def calibrate(self) -> None:
@@ -458,9 +466,13 @@ class Search:
         """Каждая спека против базы; прошедшие копятся в self.passed. Возвращает оценённые."""
         metric, rel_min, done = self.metric, self.rel_min, []
         for spec in interleave(specs):
+            key = fe_dsl.spec_key(spec)
+            if key in self.seen:
+                continue
             if not self.ev.fits(deadline):
                 log(f"AutoEDA: этап A остановлен по времени, оценено {len(done)}/{len(specs)}")
                 break
+            self.seen.add(key)
             try:
                 scores = self.ev.run([spec])
             except Exception as exc:  # noqa: BLE001 — одна кривая спека не роняет поиск

@@ -81,6 +81,12 @@ def score(metric: str, y_true, y_pred, proba=None, labels=None) -> float:
         return float(sm.mean_absolute_percentage_error(y_true, y_pred))
     if metric == "r2":
         return float(sm.r2_score(y_true, y_pred))
+    if metric in ("f1_macro", "f1_weighted", "balanced_accuracy", "accuracy"):
+        # sklearn treats object arrays of numeric labels as an unknown target.
+        # Encode the union consistently without changing class equality or weights.
+        yt, yp = np.asarray(y_true), np.asarray(y_pred)
+        codes, _ = pd.factorize(pd.Series([*yt, *yp], dtype=object), sort=False)
+        y_true, y_pred = codes[:len(yt)], codes[len(yt):]
     if metric == "f1_macro":
         return float(sm.f1_score(y_true, y_pred, average="macro"))
     if metric == "f1_weighted":
@@ -336,7 +342,8 @@ def outer_folds(prof: dict, lab: pd.DataFrame, y, n_splits: int = N_FOLDS) -> li
         log("outer_folds: групп меньше двух, беру KFold")
     ys = pd.Series(np.asarray(y, dtype=object))
     if prof["problem_type"] != "regression" and ys.value_counts().min() >= n_splits:
-        return list(StratifiedKFold(n_splits, shuffle=True, random_state=7).split(np.arange(n), ys))
+        codes, _ = pd.factorize(ys, sort=False)
+        return list(StratifiedKFold(n_splits, shuffle=True, random_state=7).split(np.arange(n), codes))
     return list(KFold(n_splits, shuffle=True, random_state=7).split(np.arange(n)))
 
 
@@ -388,16 +395,16 @@ def target_features(prof: dict, target: str, fit: pd.DataFrame, app: pd.DataFram
     if prof["problem_type"] != "regression":
         classes = sorted(fit[target].astype(str).unique().tolist())
     fparts, aparts = [], []
-    for spec in specs:
+    for spec in fe_dsl.unique_specs(specs):
         res = fe_dsl.safe_apply(spec, fit, fit[target].to_numpy(), app, classes, prof.get("cv"))
         if res is not None:
             fparts.append(res[0])
             aparts.append(res[1])
     if not fparts:
         return None, None
-    f, a = pd.concat(fparts, axis=1), pd.concat(aparts, axis=1)
-    keep = ~f.columns.duplicated()
-    return f.loc[:, keep], a.loc[:, keep].reindex(columns=f.columns[keep])
+    f = pd.concat(fparts, axis=1, verify_integrity=True)
+    a = pd.concat(aparts, axis=1, verify_integrity=True)
+    return f, a.reindex(columns=f.columns)
 
 
 def with_target_features(prof: dict, target: str, fit_df: pd.DataFrame, Xfit: pd.DataFrame,
@@ -407,7 +414,8 @@ def with_target_features(prof: dict, target: str, fit_df: pd.DataFrame, Xfit: pd
     Xfit, Xapp = Xfit.reset_index(drop=True), Xapp.reset_index(drop=True)
     if F is None:
         return Xfit, Xapp
-    return pd.concat([Xfit, F], axis=1), pd.concat([Xapp, A], axis=1)
+    return (pd.concat([Xfit, F], axis=1, verify_integrity=True),
+            pd.concat([Xapp, A], axis=1, verify_integrity=True))
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +793,7 @@ def fit_autogluon(prof: dict, target: str, time_budget: float, rows=None, folds=
         lab = lab.loc[rows]
     df = lab[features + [target]].copy()
     if extra is not None:
-        df = pd.concat([df, extra.set_axis(df.index)], axis=1)
+        df = pd.concat([df, extra.set_axis(df.index)], axis=1, verify_integrity=True)
         features = features + list(extra.columns)
     if prof["log_target"]:
         df[target] = np.log1p(df[target].clip(lower=0))
@@ -845,7 +853,7 @@ def ag_predict(prof: dict, predictor, target: str, frame: pd.DataFrame | None = 
     """
     X = (prof["test"] if frame is None else frame)[prof["features"]]
     if extra is not None:
-        X = pd.concat([X, extra.set_axis(X.index)], axis=1)
+        X = pd.concat([X, extra.set_axis(X.index)], axis=1, verify_integrity=True)
     if prof["problem_type"] == "regression":
         pred = predictor.predict(X).to_numpy()
         if prof["log_target"]:
