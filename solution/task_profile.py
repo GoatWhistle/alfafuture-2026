@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -321,6 +322,144 @@ def llm_refine_specs(task_text: str, summary: dict, feedback: dict, columns: lis
     return _parse_specs(data, 12)
 
 
+# Упоминание метрики в тексте задачи: запасной источник, когда LLM недоступна.
+METRIC_PATTERNS = {
+    "rmsle": r"\brmsle\b",
+    "rmse": r"\brmse\b",
+    "mape": r"\bmape\b",
+    "mae": r"\bmae\b",
+    "r2": r"\br2\b|\br\^2|r²",
+    "log_loss": r"log[\s_-]?loss|logloss|кросс-энтропи",
+    "roc_auc": r"roc[\s_-]?auc|\bauc\b",
+    "f1_macro": r"macro[\s_-]?f1|f1[\s_-]?macro|макро[\s-]?f1",
+    "f1_weighted": r"weighted[\s_-]?f1|f1[\s_-]?weighted",
+    "balanced_accuracy": r"balanced[\s_-]?accuracy",
+    "f1": r"\bf1\b",
+    "accuracy": r"\baccuracy\b",
+}
+
+
+def _metric_from_text(task_text: str) -> str | None:
+    """Первая по тексту метрика; при равной позиции — более длинное совпадение."""
+    best = None
+    for name, pat in METRIC_PATTERNS.items():
+        m = re.search(pat, task_text, re.IGNORECASE)
+        if m and (best is None or (m.start(), -len(m.group())) < best[0]):
+            best = ((m.start(), -len(m.group())), name)
+    return best[1] if best else None
+
+
+def _declares_regression(task_text: str) -> bool:
+    return bool(re.search(r"регресс|regression", task_text, re.IGNORECASE)) and not re.search(
+        r"классификац|classif", task_text, re.IGNORECASE)
+
+
+def _target_profile(task_text: str, train: pd.DataFrame, sample: pd.DataFrame | None, target: str,
+                    n_targets: int, multi_proba: bool) -> dict:
+    """Тип задачи, метрика и формат вывода одного таргета.
+
+    LLM читает task.md, данные ограничивают, текст и дефолты страхуют.
+    """
+    from models import positive_label
+
+    facts = _hard_facts(train[target])
+    problem_type = metric = None
+    llm = _llm_parse(task_text, list(train.columns), target, facts)
+    if llm:
+        problem_type = _validate_problem_type(llm.get("task_type"), facts)
+        if llm.get("metric") in AG_METRIC:
+            metric = llm["metric"]
+    if metric is None:
+        metric = _metric_from_text(task_text)
+        if metric:
+            log(f"[{target}] метрика из текста задачи: {metric}")
+    if problem_type is None:
+        numeric_many = not facts["is_text"] and facts["nunique"] > 2
+        if numeric_many and (_declares_regression(task_text) or metric in REGRESSION_METRICS):
+            problem_type = "regression"
+            log(f"[{target}] регрессия задана текстом задачи/метрикой")
+        else:
+            problem_type = _default_problem_type(facts)
+            log(f"[{target}] тип задачи взят из свойств данных: {problem_type}")
+    if multi_proba and problem_type == "regression":
+        problem_type = "binary" if facts["nunique"] <= 2 else "multiclass"
+
+    if metric is not None and (metric in REGRESSION_METRICS) != (problem_type == "regression"):
+        log(f"[{target}] метрика {metric!r} несовместима с типом {problem_type!r}, беру дефолт")
+        metric = None
+    if metric is None:
+        metric = _default_metric(problem_type, train[target])
+
+    # Формат вывода: вероятности требует метрика или шаблон, а не значения заглушек.
+    output_proba = multi_proba
+    if problem_type == "binary" and metric in ("log_loss", "roc_auc"):
+        output_proba = True
+    if not output_proba and sample is not None and problem_type == "binary" and target in sample.columns:
+        sv = sample[target].dropna()
+        if len(sv) and pd.api.types.is_float_dtype(sv):
+            labels = set(train[target].dropna().unique().tolist())
+            if not set(sv.unique().tolist()) <= labels:
+                output_proba = True
+    pos_label = positive_label(train[target].dropna().unique()) if problem_type == "binary" else None
+    return {
+        "problem_type": problem_type,
+        "metric": metric,
+        "ag_metric": AG_METRIC[metric],
+        "log_target": metric == "rmsle",
+        "output_proba": output_proba,
+        "pos_label": pos_label,
+    }
+
+
+def _match_class_columns(cols: list[str], classes: list, target: str) -> list[tuple[str, object]] | None:
+    """Сопоставление колонок sample классам: имя = класс, либо класс — отделённый суффикс/префикс."""
+    by_str = {str(v).lower(): v for v in classes}
+    out = []
+    for col in cols:
+        name = col.lower()
+        if name.startswith(target.lower()) and len(name) > len(target):
+            stripped = name[len(target):].lstrip("_-.: =")
+        else:
+            stripped = name
+        hit = by_str.get(name, by_str.get(stripped))
+        if hit is None:
+            cands = [
+                k for k in by_str
+                if re.search(rf"(^|[_\-\s.:=]){re.escape(k)}$", name) or re.search(rf"^{re.escape(k)}([_\-\s.:=]|$)", name)
+            ]
+            if cands:
+                hit = by_str[max(cands, key=len)]
+        if hit is None:
+            return None
+        out.append((col, hit))
+    if len({str(c) for _, c in out}) != len(out):
+        return None
+    return out
+
+
+def _match_proba_columns(cols: list[str], train: pd.DataFrame, test: pd.DataFrame, id_col: str,
+                         dd_targets: list[str]) -> tuple[str | None, list]:
+    """Таргет train, классам которого соответствуют колонки вероятностей sample."""
+    cands = [t for t in dd_targets if t in train.columns] or [
+        c for c in train.columns if c not in test.columns and c != id_col
+    ]
+    for t in cands:
+        classes = train[t].dropna().unique().tolist()
+        if not 2 <= len(classes) <= 200:
+            continue
+        mapping = _match_class_columns(cols, classes, t)
+        if mapping is not None:
+            return t, mapping
+    # Имена не совпали: при равном числе колонок и классов — порядок sample = сортировка классов.
+    for t in cands:
+        classes = train[t].dropna().unique().tolist()
+        if len(classes) == len(cols):
+            ordered = sorted(classes, key=lambda v: (isinstance(v, str), v))
+            log(f"Колонки {cols} не совпали по именам с классами {t!r}; сопоставляю по порядку {ordered}")
+            return t, list(zip(cols, ordered))
+    return None, []
+
+
 def build_profile(task_path: Path) -> dict:
     workdir = task_path.parent
     task_text = task_path.read_text(encoding="utf-8", errors="ignore") if task_path.exists() else ""
@@ -351,6 +490,7 @@ def build_profile(task_path: Path) -> dict:
     sample = _read_csv(sample_p) if sample_p else None
 
     # id и целевые колонки.
+    proba_cols: dict[str, list[tuple[str, object]]] = {}
     if sample is not None and len(sample.columns) >= 2:
         id_col = sample.columns[0]
         target_cols = [c for c in sample.columns[1:]]
@@ -360,6 +500,7 @@ def build_profile(task_path: Path) -> dict:
 
     # Кросс-чек по data_dictionary (role: id/target).
     dd = None
+    dd_targets: list[str] = []
     if dict_p is not None:
         try:
             dd = _read_csv(dict_p)
@@ -374,47 +515,23 @@ def build_profile(task_path: Path) -> dict:
         except Exception as exc:  # noqa: BLE001
             log(f"Не удалось разобрать data_dictionary: {exc}")
 
+    # Колонки sample, которых нет в train, — вероятности классов одного таргета.
+    if sample is not None and target_cols and not any(c in train.columns for c in target_cols):
+        target, mapping = _match_proba_columns(list(sample.columns[1:]), train, test, id_col, dd_targets)
+        if target is not None:
+            proba_cols[target] = mapping
+            target_cols = [target]
+            log(f"Вывод вероятностей классов {target!r}: {mapping}")
+
     target_cols = [c for c in target_cols if c in train.columns]
     if not target_cols:
         raise ValueError("Не удалось определить целевую колонку")
     target = target_cols[0]
 
     features = [c for c in train.columns if c != id_col and c not in target_cols and c in test.columns]
-
-    # Тип задачи и метрика: LLM читает task.md, данные ограничивают, дефолты страхуют.
-    facts = _hard_facts(train[target])
-    problem_type = None
-    metric = None
-    llm = _llm_parse(task_text, list(train.columns), target, facts)
-    if llm:
-        problem_type = _validate_problem_type(llm.get("task_type"), facts)
-        llm_metric = llm.get("metric")
-        if llm_metric in AG_METRIC:
-            metric = llm_metric
-    if problem_type is None:
-        problem_type = _default_problem_type(facts)
-        log(f"Тип задачи взят из свойств данных: {problem_type}")
-
-    # Согласованность метрики и типа задачи + дефолты.
-    if metric is not None:
-        if (metric in REGRESSION_METRICS) != (problem_type == "regression"):
-            log(f"Метрика {metric!r} несовместима с типом {problem_type!r}, беру дефолт")
-            metric = None
-    if metric is None:
-        metric = _default_metric(problem_type, train[target])
-
-    # Формат вывода: метки или вероятности (только для бинарной задачи).
-    output_proba = False
-    if sample is not None and problem_type == "binary" and len(target_cols) == 1:
-        sv = sample[target].dropna()
-        if len(sv) and pd.api.types.is_float_dtype(sv):
-            labels = set(train[target].dropna().unique().tolist())
-            if not set(sv.unique().tolist()) <= labels:
-                output_proba = True
-    if metric == "roc_auc" and problem_type == "binary" and sample is not None:
-        sv = sample[target].dropna()
-        if len(sv) and pd.api.types.is_numeric_dtype(sv):
-            output_proba = True
+    per_target = {
+        t: _target_profile(task_text, train, sample, t, len(target_cols), t in proba_cols) for t in target_cols
+    }
 
     profile = {
         "workdir": workdir,
@@ -427,14 +544,14 @@ def build_profile(task_path: Path) -> dict:
         "target_cols": target_cols,
         "target": target,
         "features": features,
-        "problem_type": problem_type,
-        "metric": metric,
-        "ag_metric": AG_METRIC[metric],
-        "log_target": metric == "rmsle",
-        "output_proba": output_proba,
+        "proba_cols": proba_cols,
+        "per_target": per_target,
+        **per_target[target],
     }
-    log(
-        f"Профиль: target={target!r}, id={id_col!r}, type={problem_type}, metric={metric}, "
-        f"features={len(features)}, train={train.shape}, test={test.shape}, proba={output_proba}"
-    )
+    for t, tp in per_target.items():
+        log(
+            f"Профиль: target={t!r}, id={id_col!r}, type={tp['problem_type']}, metric={tp['metric']}, "
+            f"features={len(features)}, train={train.shape}, test={test.shape}, proba={tp['output_proba']}, "
+            f"pos_label={tp['pos_label']!r}"
+        )
     return profile

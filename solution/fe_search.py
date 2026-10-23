@@ -118,8 +118,10 @@ def score_pred(ctx: dict, y, pred) -> float:
     lab = np.array(classes, dtype=object)[np.argmax(pred, axis=1)]
     try:
         return models.score(metric, y, lab, proba=pred, labels=classes)
-    except ValueError:
-        return models.score("accuracy", y, lab)
+    except ValueError as exc:
+        # Целевая метрика не подменяется другой: фолд остаётся неоценённым.
+        log(f"{metric} не посчитан на фолде ({exc}) — оценка NaN")
+        return float("nan")
 
 
 def fit_eval(ctx: dict, Xtr, ytr, Xva, yva, fast: bool = False):

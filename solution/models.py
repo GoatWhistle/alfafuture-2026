@@ -20,12 +20,60 @@ HIGHER_BETTER = {
 }
 
 
+POSITIVE_TOKENS = ("1", "1.0", "true", "yes", "y", "да", "positive", "pos", "fraud", "default", "churn",
+                   "spam", "malignant", "bad", "fail", "failure", "anomaly", "attack", "abnormal")
+NEGATIVE_TOKENS = ("0", "0.0", "false", "no", "n", "нет", "negative", "neg", "normal", "benign", "good",
+                   "ok", "legit", "legitimate", "pass")
+
+
+def positive_label(labels):
+    """Положительный класс бинарной задачи — одно правило для метрик, весов и вывода.
+
+    Числовые/булевы метки -> максимум (1, True); строки -> словарь
+    положительных/отрицательных токенов; иначе последняя метка по str-сортировке.
+    """
+    vals = list(pd.unique(pd.Series(list(labels), dtype=object).dropna()))
+    if not vals:
+        return None
+    if all(isinstance(v, (bool, np.bool_, int, float, np.integer, np.floating)) for v in vals):
+        return max(vals)
+    low = {str(v).strip().lower(): v for v in vals}
+    for tok in POSITIVE_TOKENS:
+        if tok in low:
+            return low[tok]
+    if len(vals) == 2:
+        for tok in NEGATIVE_TOKENS:
+            if tok in low:
+                return next(v for v in vals if v is not low[tok])
+    return sorted(vals, key=str)[-1]
+
+
+def _positive_column(proba, labels, y_true):
+    """Вероятность положительного класса и сам класс (proba-матрица требует labels)."""
+    proba = np.asarray(proba, dtype=float)
+    pool = list(labels) if labels is not None else list(pd.unique(np.asarray(y_true, dtype=object)))
+    pos = positive_label(pool)
+    if proba.ndim == 1:
+        return proba, pos
+    if labels is None:
+        raise ValueError("матрица вероятностей без порядка классов")
+    return proba[:, list(labels).index(pos)], pos
+
+
 def score(metric: str, y_true, y_pred, proba=None, labels=None) -> float:
-    """Единый расчёт метрики. y_pred — метки/значения, proba — матрица вероятностей."""
+    """Единый расчёт метрики. y_pred — метки/значения, proba — матрица вероятностей.
+
+    labels — порядок классов в колонках proba. Положительный класс бинарных
+    метрик — positive_label(labels). Неизвестная метрика — ValueError.
+    """
     from sklearn import metrics as sm
 
-    if metric in ("rmse", "rmsle"):
+    if metric == "rmse":
         return float(np.sqrt(sm.mean_squared_error(y_true, y_pred)))
+    if metric == "rmsle":
+        yt = np.log1p(np.clip(np.asarray(y_true, dtype=float), 0, None))
+        yp = np.log1p(np.clip(np.asarray(y_pred, dtype=float), 0, None))
+        return float(np.sqrt(np.mean((yt - yp) ** 2)))
     if metric == "mae":
         return float(sm.mean_absolute_error(y_true, y_pred))
     if metric == "mape":
@@ -37,40 +85,179 @@ def score(metric: str, y_true, y_pred, proba=None, labels=None) -> float:
     if metric == "f1_weighted":
         return float(sm.f1_score(y_true, y_pred, average="weighted"))
     if metric == "f1":
-        return float(sm.f1_score(y_true, y_pred))
+        pool = list(labels) if labels is not None else list(pd.unique(np.asarray(y_true, dtype=object)))
+        pos = positive_label(pool)
+        yt = np.asarray(y_true, dtype=object) == pos
+        yp = np.asarray(y_pred, dtype=object) == pos
+        return float(sm.f1_score(yt, yp, zero_division=0))
     if metric == "roc_auc":
-        p = proba[:, 1] if proba is not None and proba.ndim == 2 else proba
-        return float(sm.roc_auc_score(y_true, p))
+        p, pos = _positive_column(proba, labels, y_true)
+        return float(sm.roc_auc_score(np.asarray(y_true, dtype=object) == pos, p))
     if metric == "log_loss":
         return float(sm.log_loss(y_true, proba, labels=labels))
     if metric == "balanced_accuracy":
         return float(sm.balanced_accuracy_score(y_true, y_pred))
-    return float(sm.accuracy_score(y_true, y_pred))
+    if metric == "accuracy":
+        return float(sm.accuracy_score(y_true, y_pred))
+    raise ValueError(f"неизвестная метрика {metric!r}")
 
 
-def is_better(metric: str, new: float, old: float | None) -> bool:
+def _nan(x) -> bool:
+    return x is None or (isinstance(x, float) and np.isnan(x))
+
+
+def is_better(metric: str, new: float | None, old: float | None) -> bool:
+    """new строго лучше old. Неоценённый new (None/NaN) не лучше ничего; old=None — нет опоры."""
+    if _nan(new):
+        return False
     if old is None:
         return True
+    if _nan(old):
+        return False
     return new > old if HIGHER_BETTER[metric] else new < old
 
 
-def write_submission(prof: dict, values_by_target: dict[str, np.ndarray]) -> None:
-    """Пишет submission.csv рядом с task.md строго в формате sample_submission."""
-    workdir, id_col = prof["workdir"], prof["id_col"]
-    test, sample = prof["test"], prof["sample"]
+# ---------------------------------------------------------------------------
+# Формат вывода и запись сабмита.
+# ---------------------------------------------------------------------------
 
-    # Порядок строк — строго как в test.csv (явное требование формата задач).
+def _class_index(classes) -> dict:
+    """Позиция класса по значению и по строке (метки AG и sample могут различаться типом)."""
+    pos = {}
+    for i, c in enumerate(classes):
+        pos.setdefault(c, i)
+        pos.setdefault(str(c), i)
+    return pos
+
+
+def output_from_proba(prof: dict, target: str, proba, classes) -> np.ndarray:
+    """Значения сабмита из вероятностей (колонки в порядке classes).
+
+    Несколько колонок вероятностей -> матрица в порядке prof["proba_cols"][target];
+    одна колонка вероятности -> вероятность positive_label; иначе метки argmax.
+    """
+    proba = np.asarray(proba, dtype=float)
+    classes = list(classes)
+    cols = (prof.get("proba_cols") or {}).get(target)
+    if cols:
+        pos = _class_index(classes)
+        missing = [cls for _, cls in cols if cls not in pos and str(cls) not in pos]
+        if missing:
+            log(f"output_from_proba: у модели нет классов {missing}, их вероятность 0")
+        out = np.column_stack([
+            proba[:, pos[cls] if cls in pos else pos[str(cls)]] if cls not in missing else np.zeros(len(proba))
+            for _, cls in cols
+        ])
+        out = np.clip(out, 0, 1)
+        s = out.sum(axis=1, keepdims=True)
+        return np.where(s > 0, out / np.where(s > 0, s, 1), 1.0 / out.shape[1])
+    if prof["output_proba"]:
+        return np.clip(proba[:, classes.index(positive_label(classes))], 0, 1)
+    return np.array(classes, dtype=object)[np.argmax(proba, axis=1)]
+
+
+def _expand(prof: dict, values_by_target: dict) -> pd.DataFrame:
+    test, id_col = prof["test"], prof["id_col"]
     out = pd.DataFrame({id_col: test[id_col].values})
+    proba_cols = prof.get("proba_cols") or {}
     for tgt, vals in values_by_target.items():
-        out[tgt] = np.asarray(vals)
+        vals = np.asarray(vals)
+        if tgt in proba_cols:
+            for j, (col, _) in enumerate(proba_cols[tgt]):
+                out[col] = vals[:, j].astype(float)
+        else:
+            out[tgt] = vals
+    return out
 
-    if sample is not None:
-        # Имена и порядок колонок — из sample_submission.
-        out = out[[c for c in sample.columns if c in out.columns]]
 
-    # Финальная чистка: пропуски и бесконечности недопустимы.
+def expected_columns(prof: dict) -> list[str]:
+    if prof["sample"] is not None:
+        return list(prof["sample"].columns)
+    cols = [prof["id_col"]]
+    for t in prof["target_cols"]:
+        cols += [c for c, _ in (prof.get("proba_cols") or {}).get(t, [])] or [t]
+    return cols
+
+
+def validate_submission(prof: dict, out: pd.DataFrame) -> str | None:
+    """Проверка контракта: колонки, строки и их порядок, конечность и диапазон вероятностей."""
+    cols = expected_columns(prof)
+    if list(out.columns) != cols:
+        return f"колонки {list(out.columns)} != {cols}"
+    test, id_col = prof["test"], prof["id_col"]
+    if len(out) != len(test):
+        return f"строк {len(out)} != {len(test)}"
+    if not np.array_equal(out[id_col].to_numpy(), test[id_col].to_numpy()):
+        return "id не совпадают с test по значениям или порядку"
+    proba_cols = prof.get("proba_cols") or {}
+    for t in prof["target_cols"]:
+        group = [c for c, _ in proba_cols.get(t, [])]
+        names = group or [t]
+        is_proba = bool(group) or prof.get("per_target", {}).get(t, prof).get("output_proba", False)
+        for c in names:
+            col = out[c]
+            if col.isna().any():
+                return f"пропуски в {c}"
+            if is_proba or pd.api.types.is_numeric_dtype(col):
+                v = pd.to_numeric(col, errors="coerce").to_numpy(dtype=float)
+                if not np.isfinite(v).all():
+                    return f"нечисловые или бесконечные значения в {c}"
+                if is_proba and ((v < 0).any() or (v > 1).any()):
+                    return f"вероятности вне [0, 1] в {c}"
+        if len(group) > 1:
+            sums = out[group].to_numpy(dtype=float).sum(axis=1)
+            if not np.allclose(sums, 1.0, atol=1e-6):
+                return f"сумма вероятностей {t} отличается от 1 (max |d|={np.abs(sums - 1).max():.2e})"
+    return None
+
+
+def write_submission(prof: dict, values_by_target: dict[str, np.ndarray]) -> bool:
+    """Пишет submission.csv рядом с task.md строго в формате sample_submission.
+
+    Файл заменяется атомарно и только после проверки контракта; при
+    отказе остаётся предыдущий валидный файл, а values_by_target
+    откатывается к записанным в нём значениям. Пока валидного файла нет,
+    пропуски и бесконечности заменяются страховочным значением.
+    """
+    workdir = prof["workdir"]
+    last = prof.get("_last_written")
+    err = None
+    try:
+        out = _expand(prof, values_by_target)
+        out = out[[c for c in expected_columns(prof) if c in out.columns]]
+        if last is None:
+            out = _fill_bad(prof, out)
+        err = validate_submission(prof, out)
+    except Exception as exc:  # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"
+    if err is not None:
+        log(f"submission.csv НЕ обновлён: {err}")
+        if last is not None:
+            for t, v in last.items():
+                values_by_target[t] = v.copy() if isinstance(v, np.ndarray) else v
+        return False
+
+    path = workdir / "submission.csv"
+    tmp = workdir / f".submission.{os.getpid()}.tmp"
+    try:
+        out.to_csv(tmp, index=False)
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    prof["_last_written"] = {t: np.array(v, copy=True) for t, v in values_by_target.items()}
+    log(f"submission.csv записан: {path} shape={out.shape}")
+    return True
+
+
+def _fill_bad(prof: dict, out: pd.DataFrame) -> pd.DataFrame:
+    """Страховка первой записи: пропуски и бесконечности -> страховочное значение."""
+    out = out.copy()
+    proba_cols = prof.get("proba_cols") or {}
     for tgt in prof["target_cols"]:
-        if tgt not in out.columns:
+        if tgt in proba_cols or tgt not in out.columns:
             continue
         col = out[tgt]
         if pd.api.types.is_numeric_dtype(col):
@@ -79,24 +266,30 @@ def write_submission(prof: dict, values_by_target: dict[str, np.ndarray]) -> Non
                 out.loc[bad, tgt] = _fallback_value(prof, tgt)
         elif col.isna().any():
             out[tgt] = col.fillna(_fallback_value(prof, tgt))
-
-    path = workdir / "submission.csv"
-    out.to_csv(path, index=False)
-    log(f"submission.csv записан: {path} shape={out.shape}")
+    return out
 
 
 def _fallback_value(prof: dict, target: str):
+    tp = prof.get("per_target", {}).get(target, prof)
     y = prof["train"][target].dropna()
-    if prof["problem_type"] == "regression":
+    if tp["problem_type"] == "regression":
         return float(y.median())
-    if prof["output_proba"]:
-        return 0.5
+    if tp["output_proba"]:
+        pos = positive_label(y.unique())
+        return float((y == pos).mean())
     return y.mode().iloc[0]
 
 
 def constant_predictions(prof: dict, target: str) -> np.ndarray:
     n = len(prof["test"])
-    return np.full(n, _fallback_value(prof, target), dtype=object if prof["problem_type"] != "regression" else float)
+    cols = (prof.get("proba_cols") or {}).get(target)
+    if cols:
+        y = prof["train"][target].dropna()
+        freq = y.astype(str).value_counts(normalize=True)
+        prior = np.array([freq.get(str(cls), 0.0) for _, cls in cols]) + 1e-6
+        return np.tile(prior / prior.sum(), (n, 1))
+    tp = prof.get("per_target", {}).get(target, prof)
+    return np.full(n, _fallback_value(prof, target), dtype=object if tp["problem_type"] != "regression" else float)
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +360,7 @@ def quick_model(prof: dict, target: str, max_rows: int = 300_000) -> dict:
         val_pred = model.classes_[np.argmax(val_proba, axis=1)]
         val_score = score(metric, yval, val_pred, proba=val_proba, labels=list(model.classes_))
         proba_te = model.predict_proba(Xte)
-        test_pred = model.classes_[np.argmax(proba_te, axis=1)]
-        if prof["output_proba"]:
-            test_pred = proba_te[:, list(model.classes_).index(sorted(model.classes_)[-1])]
+        test_pred = output_from_proba(prof, target, proba_te, list(model.classes_))
 
     log(f"quick_lgbm[{target}]: val {metric}={val_score:.5f}, best_iter={model.best_iteration_}")
     result = {
@@ -453,12 +644,7 @@ def ag_predict(prof: dict, predictor, target: str) -> tuple[np.ndarray, np.ndarr
             pred = np.clip(np.expm1(pred), 0, None)
         return pred, None
     proba = predictor.predict_proba(test)
-    classes = list(proba.columns)
-    if prof["output_proba"]:
-        pos = sorted(classes)[-1]
-        return proba[pos].to_numpy(), proba.to_numpy()
-    pred = np.array(classes, dtype=object)[np.argmax(proba.to_numpy(), axis=1)]
-    return pred, proba.to_numpy()
+    return output_from_proba(prof, target, proba.to_numpy(), list(proba.columns)), proba.to_numpy()
 
 
 def ag_oof(predictor, prof: dict, target: str):
@@ -523,7 +709,7 @@ def tune_class_weights(
     k = len(classes)
     pos = {c: i for i, c in enumerate(classes)}
     yi = np.fromiter((pos[v] for v in y_true), dtype=np.int64, count=len(y_true))
-    positive_idx = classes.index(sorted(classes)[-1])
+    positive_idx = classes.index(positive_label(classes))
     fast = metric in ("f1_macro", "f1_weighted", "balanced_accuracy", "accuracy", "f1")
 
     def _score(w):
