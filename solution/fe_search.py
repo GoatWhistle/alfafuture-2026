@@ -203,7 +203,7 @@ def build_folds(ctx: dict) -> None:
                                    random_state=17))
             rows = np.sort(per.to_numpy())
     sub = df.iloc[rows]
-    folds, scheme = [], None
+    folds, scheme, cv = [], None, {"kind": "kfold"}
     if ctx["period"]:
         t = pd.to_numeric(sub[ctx["period"]], errors="coerce").to_numpy(float)
         periods = np.unique(t[~np.isnan(t)])
@@ -213,11 +213,13 @@ def build_folds(ctx: dict) -> None:
                 folds.append((tr_i, va_i))
         if folds:
             scheme = f"temporal({ctx['period']}, {len(folds)} фолд.)"
+            cv = {"kind": "temporal", "period": ctx["period"]}
     if not folds and ctx["entity"] and ctx["entity"].get("coverage", 1) < ENTITY_GROUP_MAX_COVERAGE:
         groups = row_keys(sub, ctx["entity"]["key"])
         if pd.Series(groups).nunique() >= 3:
             folds = [(rows[a], rows[b]) for a, b in GroupKFold(3).split(sub, y[rows], groups)]
             scheme = f"group({ctx['entity']['key']})"
+            cv = {"kind": "group", "keys": list(ctx["entity"]["key"])}
     if not folds:
         ys = y[rows]
         if ctx["classes"] and pd.Series(ys).value_counts().min() >= 3:
@@ -227,7 +229,7 @@ def build_folds(ctx: dict) -> None:
             split = KFold(3, shuffle=True, random_state=13).split(sub)
             scheme = "kfold(3)"
         folds = [(rows[a], rows[b]) for a, b in split]
-    ctx["folds"], ctx["fold_scheme"] = folds, scheme
+    ctx["folds"], ctx["fold_scheme"], ctx["cv"] = folds, scheme, cv
     log(f"AutoEDA: схема валидации {scheme} на {len(rows)} строках")
 
 
@@ -258,7 +260,7 @@ class Evaluator:
             ctx, df = self.ctx, self.ctx["df"]
             out = []
             for tr, va in ctx["folds"]:
-                res = fe_dsl.safe_apply(spec, df.loc[tr], ctx["y"][tr], df.loc[va], ctx["classes"])
+                res = fe_dsl.safe_apply(spec, df.loc[tr], ctx["y"][tr], df.loc[va], ctx["classes"], ctx.get("cv"))
                 if res is None:
                     out = None
                     break
