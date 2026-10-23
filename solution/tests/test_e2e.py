@@ -43,6 +43,22 @@ def frames(n, y_fn, seed=0):
     return train, test, y[:n]
 
 
+def test_iterative_research_reaches_final_csv(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("AGENT_RESEARCH_MODE", "iterative")
+    monkeypatch.setitem(ENV, "AGENT_AUTOEDA_SEC", "120")
+    train, test, y = frames(400, lambda x, r: 3 * x[:, 0] * x[:, 1] + r.randn(len(x)) * .3)
+    train["target"] = y
+    sample = pd.DataFrame({"id": test["id"], "target": 0.})
+    out = run(tmp_path, train, test, sample, "Регрессия. Метрика RMSE.")
+    assert np.isfinite(out.target).all()
+    report = json.loads(next((tmp_path / "research").glob('*.json')).read_text())
+    assert report["champion"] and report["portfolio"]
+    assert any(e["event"] == "round" for e in report["events"])
+    assert "Финальный источник:" in (tmp_path / "log.txt").read_text()
+
+
 def test_binary_logloss_strings(tmp_path):
     train, test, y = frames(1500, lambda x, r: np.where(x[:, 0] + r.randn(len(x)) > 0, "yes", "no"))
     train["target"] = y
