@@ -198,7 +198,8 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
     added = []
     model_ops = {}
     target_specs = []
-    for spec in accepted:
+    materialized = set()
+    for spec in fe_dsl.unique_specs(accepted):
         if spec["op"] == "drop":
             col = spec["cols"][0]
             prof["features"] = [c for c in prof["features"] if c != col]
@@ -219,14 +220,20 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
             target_specs.append(spec)
             added.append(fe_dsl.describe(spec) + " [по фолдам]")
             continue
+        key = fe_dsl.spec_key(spec)
+        if key in materialized:
+            # segment_model тоже добавляет flag; отдельная такая же flag-спека
+            # не должна повторно добавлять этот индикатор.
+            continue
         res = fe_dsl.materialize(prof, spec, target, ctx["classes"])
         if res is None:
             continue
         tr_new, te_new = res
-        new_cols = [c for c in tr_new.columns if c not in prof["train"].columns]
-        prof["train"] = pd.concat([prof["train"], tr_new[new_cols]], axis=1)
-        prof["test"] = pd.concat([prof["test"], te_new[new_cols]], axis=1)
+        new_cols = list(tr_new.columns)
+        prof["train"] = pd.concat([prof["train"], tr_new], axis=1, verify_integrity=True)
+        prof["test"] = pd.concat([prof["test"], te_new], axis=1, verify_integrity=True)
         prof["features"] = list(prof["features"]) + new_cols
+        materialized.add(key)
         added += new_cols
     prof["model_ops"] = model_ops
     prof["target_specs"] = target_specs
