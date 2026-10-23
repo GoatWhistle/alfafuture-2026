@@ -35,7 +35,10 @@ from models import (
     constant_predictions,
     copy_duplicate_labels,
     fit_autogluon,
+    fold_ids,
     is_better,
+    labeled,
+    outer_folds,
     output_from_proba,
     quick_model,
     quick_oof,
@@ -183,6 +186,7 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
 
     added = []
     model_ops = {}
+    target_specs = []
     for spec in accepted:
         if spec["op"] == "drop":
             col = spec["cols"][0]
@@ -198,6 +202,12 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
             spec = fe_dsl.validate({**spec, "op": "flag"}, prof["train"].columns)
             if spec is None:
                 continue
+        if fe_dsl.uses_target(spec):
+            # Признаки из таргета строятся внутри каждого внешнего фолда (models.target_features),
+            # а не один раз на всём train: иначе таргет валидации протекает в признаки обучения.
+            target_specs.append(spec)
+            added.append(fe_dsl.describe(spec) + " [по фолдам]")
+            continue
         res = fe_dsl.materialize(prof, spec, target, ctx["classes"])
         if res is None:
             continue
@@ -208,46 +218,12 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
         prof["features"] = list(prof["features"]) + new_cols
         added += new_cols
     prof["model_ops"] = model_ops
+    prof["target_specs"] = target_specs
+    prof["cv"] = ctx["cv"]
     register("autoeda", f"схема {ctx['fold_scheme']}; принято {len(accepted)} спек -> {added}",
              ctx.get("search_final"), bool(accepted))
     log(f"AutoEDA: {time.time() - t0:.0f}s, признаков {len(prof['features'])}")
     return {"period": ctx["period"], "label_copy": ctx["label_copy"], "accepted": accepted}
-
-
-def temporal_mask(prof: dict, target: str, col: str | None) -> np.ndarray | None:
-    """Маска строк последнего периода train (в порядке OOF) для temporal_holdout."""
-    if col is None:
-        return None
-    train = prof["train"]
-    vals = pd.to_numeric(train.loc[train[target].notna(), col], errors="coerce")
-    if vals.notna().sum() == 0:
-        log(f"temporal_holdout: колонка {col} не числовая, пропускаю")
-        return None
-    mask = (vals == vals.max()).to_numpy()
-    if mask.sum() < 500 or mask.all():
-        log(f"temporal_holdout: в последнем периоде {col}={vals.max()} {mask.sum()} строк, пропускаю")
-        return None
-    log(f"temporal_holdout: оценка на {col}={vals.max()} ({mask.sum()} строк)")
-    return mask
-
-
-def _cand_score(metric: str, c: dict, mask: np.ndarray) -> float:
-    y, oof = c["y"][mask], c["oof"][mask]
-    if c.get("classes") is None:
-        return score(metric, y, oof)
-    pred = np.array(c["classes"], dtype=object)[np.argmax(oof, axis=1)]
-    return score(metric, y, pred, proba=oof, labels=c["classes"])
-
-
-def _apply_mask(metric: str, cands: list[dict], mask: np.ndarray | None) -> np.ndarray | None:
-    """Переводит скоры кандидатов на строки маски (temporal); полный OOF — в лог."""
-    if mask is None or not cands or any(len(c["y"]) != len(mask) for c in cands):
-        return None
-    for c in cands:
-        full = c["score"]
-        c["score"] = _cand_score(metric, c, mask)
-        log(f"{c['name']}: OOF {metric}={full:.5f}, temporal {metric}={c['score']:.5f}")
-    return mask
 
 
 def _scored(cands: list[dict]) -> list[dict]:
@@ -261,87 +237,97 @@ def _scored(cands: list[dict]) -> list[dict]:
     return out
 
 
-def _select_final_regression(prof, target, current, ag, kq, fallback, eval_mask=None):
-    metric = prof["metric"]
-    ag_score, ag_test_pred, _, ag_y, ag_oof_pred, _, _ = ag
-    cands = []
-    if ag_score is not None and ag_test_pred is not None:
-        cands.append({"name": "autogluon", "score": ag_score, "oof": ag_oof_pred, "test": ag_test_pred, "y": ag_y})
-    if kq is not None:
-        cands.append({"name": "quick_kfold", "score": kq["score"], "oof": kq["oof"], "test": kq["test"], "y": kq["y"]})
-    m = _apply_mask(metric, cands, eval_mask)
-    if len(cands) == 2 and len(cands[0]["y"]) == len(cands[1]["y"]):
-        y = cands[0]["y"]
-        if m is None:
-            alpha, s = tune_blend(metric, y, cands[0]["oof"], cands[1]["oof"])
-        else:
-            alpha, s = tune_blend(metric, y[m], cands[0]["oof"][m], cands[1]["oof"][m])
-        accepted = all(is_better(metric, s, c["score"]) or s == c["score"] for c in cands)
-        register("blend", f"смесь AutoGluon и k-fold LGBM, alpha={alpha:.2f}" + (" (temporal)" if m is not None else ""),
-                 s, accepted)
-        cands.append({
-            "name": "blend", "score": s, "y": y,
-            "oof": alpha * cands[0]["oof"] + (1 - alpha) * cands[1]["oof"],
-            "test": alpha * cands[0]["test"] + (1 - alpha) * cands[1]["test"],
-        })
+def align_candidates(cands: list[dict]) -> list[dict]:
+    """Кандидаты на общих строках train: OOF сопоставлены по индексам строк, классы — в одном порядке.
+
+    Строки без OOF у любого кандидата исключаются (а не считаются нулём).
+    Несовпадение таргета на общей строке — ValueError (OOF перепутаны).
+    """
     cands = _scored(cands)
     if not cands:
+        return []
+    common = np.asarray(cands[0]["rows"])
+    for c in cands[1:]:
+        common = np.intersect1d(common, np.asarray(c["rows"]))
+    if len(common) == 0:
+        best = max(cands, key=lambda c: len(c["rows"]))
+        log(f"У кандидатов нет общих OOF-строк — остаётся {best['name']}")
+        cands, common = [best], np.asarray(best["rows"])
+    ref = cands[0].get("classes")
+    out = []
+    for c in cands:
+        index = pd.Index(c["rows"])
+        if not index.is_unique:
+            raise ValueError(f"{c['name']}: повторяющиеся строки OOF")
+        idx = index.get_indexer(common)
+        oof, test = np.asarray(c["oof"])[idx], np.asarray(c["test"])
+        if ref is not None:
+            try:
+                oof = align_classes(oof, c["classes"], ref)
+                test = align_classes(test, c["classes"], ref)
+            except ValueError as exc:
+                log(f"{c['name']}: {exc} — кандидат исключён")
+                continue
+        out.append({**c, "rows": common, "y": np.asarray(c["y"])[idx], "oof": oof, "test": test, "classes": ref})
+    y0 = out[0]["y"].astype(str)
+    for c in out[1:]:
+        if not np.array_equal(c["y"].astype(str), y0):
+            raise ValueError(f"таргет {c['name']} не совпадает с {out[0]['name']} на общих строках")
+    return out
+
+
+def _cand_score(metric: str, c: dict) -> float:
+    if c.get("classes") is None:
+        return score(metric, c["y"], c["oof"])
+    pred = np.array(c["classes"], dtype=object)[np.argmax(c["oof"], axis=1)]
+    return score(metric, c["y"], pred, proba=c["oof"], labels=c["classes"])
+
+
+def select_final(prof, target, current, quick, cands, fallback, label_copy=False):
+    """Выбор источника, бленд и постпроцессинг на общих OOF-строках одной схемы валидации."""
+    metric = prof["metric"]
+    classification = prof["problem_type"] != "regression"
+    try:
+        cands = align_candidates(cands)
+    except ValueError as exc:
+        log(f"OOF кандидатов несопоставимы ({exc}) — остаётся последний сабмит")
+        cands = []
+    if not cands:
+        if classification:
+            return _tuned_or(tune_quick_weights(prof, quick, target, current), fallback)
         return fallback
-    win = cands[0]
-    for c in cands[1:]:
-        if is_better(metric, c["score"], win["score"]):
-            win = c
-    log(f"Финальный источник: {win['name']} ({metric}={win['score']:.5f})")
-    test_final, base, new = clip_to_train_range(win["y"], win["oof"], win["test"], metric, eval_mask=m)
-    register("clip_range", "обрезка предсказаний к диапазону таргета в train", new, new != base)
-    current[target] = test_final
-    write_submission(prof, current)
-    return test_final
-
-
-def _select_final_classification(prof, target, current, quick, ag, kq, fallback, eval_mask=None, label_copy=False):
-    metric = prof["metric"]
-    ag_score, _, ag_test_proba, ag_y, _, ag_oof_proba, ag_classes = ag
-    cands = []
-    if ag_score is not None and ag_oof_proba is not None and ag_test_proba is not None:
-        cands.append({
-            "name": "autogluon", "score": ag_score, "y": ag_y,
-            "oof": ag_oof_proba, "test": ag_test_proba, "classes": list(ag_classes),
-        })
-    if kq is not None:
-        koof, kte, kcls = kq["oof"], kq["test"], list(kq["classes"])
-        if cands and set(kcls) == set(cands[0]["classes"]):
-            koof = align_classes(koof, kcls, cands[0]["classes"])
-            kte = align_classes(kte, kcls, cands[0]["classes"])
-            kcls = cands[0]["classes"]
-        cands.append({"name": "quick_kfold", "score": kq["score"], "y": kq["y"], "oof": koof, "test": kte, "classes": kcls})
-    m = _apply_mask(metric, cands, eval_mask)
-    if len(cands) == 2 and cands[0]["classes"] == cands[1]["classes"] and len(cands[0]["y"]) == len(cands[1]["y"]):
-        y = cands[0]["y"]
-        rows = slice(None) if m is None else m
-        alpha, s = tune_blend(metric, y[rows], cands[0]["oof"][rows], cands[1]["oof"][rows], classes=cands[0]["classes"])
+    for c in cands:
+        c["score"] = _cand_score(metric, c)
+        log(f"{c['name']}: {metric}={c['score']:.5f} на {len(c['rows'])} общих строках")
+    if len(cands) == 2:
+        a, b = cands
+        alpha, s = tune_blend(metric, a["y"], a["oof"], b["oof"], classes=a.get("classes"))
         accepted = all(is_better(metric, s, c["score"]) or s == c["score"] for c in cands)
-        register("blend", f"смесь AutoGluon и k-fold LGBM, alpha={alpha:.2f}" + (" (temporal)" if m is not None else ""),
-                 s, accepted)
+        register("blend", f"смесь {a['name']} и {b['name']}, alpha={alpha:.2f}", s, accepted)
         cands.append({
-            "name": "blend", "score": s, "y": y, "classes": cands[0]["classes"],
-            "oof": alpha * cands[0]["oof"] + (1 - alpha) * cands[1]["oof"],
-            "test": alpha * cands[0]["test"] + (1 - alpha) * cands[1]["test"],
+            "name": "blend", "score": s, "y": a["y"], "rows": a["rows"], "classes": a.get("classes"),
+            "oof": alpha * a["oof"] + (1 - alpha) * b["oof"],
+            "test": alpha * a["test"] + (1 - alpha) * b["test"],
         })
-    cands = _scored(cands)
-    if not cands:
-        return _tuned_or(tune_quick_weights(prof, quick, target, current), fallback)
     win = cands[0]
     for c in cands[1:]:
         if is_better(metric, c["score"], win["score"]):
             win = c
     log(f"Финальный источник: {win['name']} ({metric}={win['score']:.5f})")
+
+    if not classification:
+        y_all = labeled(prof, target)[target].to_numpy(float)
+        test_final, base, new = clip_to_train_range(win["y"], win["oof"], win["test"], metric,
+                                                    y_range=(float(y_all.min()), float(y_all.max())))
+        register("clip_range", "обрезка предсказаний к диапазону таргета в train", new, new != base)
+        current[target] = test_final
+        write_submission(prof, current)
+        return current[target]
 
     classes = win["classes"]
     classes_arr = np.array(classes, dtype=object)
     if prof["output_proba"]:
-        vals = output_from_proba(prof, target, win["test"], classes)
-        current[target] = vals
+        current[target] = output_from_proba(prof, target, win["test"], classes)
         write_submission(prof, current)
         return current[target]
 
@@ -359,18 +345,62 @@ def _select_final_classification(prof, target, current, quick, ag, kq, fallback,
     if label_copy:
         try:
             oof_pred = classes_arr[np.argmax(proba_oof, axis=1)]
-            out, base, new, n = copy_duplicate_labels(prof, target, win["y"], oof_pred, pred, metric)
+            out, base, new, n = copy_duplicate_labels(prof, target, win["y"], oof_pred, pred, metric,
+                                                      rows=win["rows"])
             register("label_copy_dups", f"метки дублей train для {n} строк test (LOO base={base})",
                      new, out is not None)
             if out is not None:
                 changed = int((np.asarray(out, dtype=object) != np.asarray(pred, dtype=object)).sum())
                 log(f"label_copy_dups: изменено {changed} предсказаний test")
-                pred = out
-                current[target] = pred
+                current[target] = out
                 write_submission(prof, current)
         except Exception:  # noqa: BLE001
             log("label_copy_dups упал:\n" + traceback.format_exc())
-    return pred
+    return current[target]
+
+
+def run_autogluon(prof: dict, target: str, budget: float) -> dict | None:
+    """AutoGluon как кандидат на фолдах схемы prof["cv"].
+
+    Фолды покрывают все строки (kfold/group) — бэггинг AutoGluon идёт по ним,
+    OOF сопоставим с k-fold LightGBM. Temporal — holdout-fit на прошлом с
+    оценкой на последнем периоде, затем fit на всём train для test.
+    """
+    lab = labeled(prof, target)
+    y = lab[target].to_numpy()
+    folds = outer_folds(prof, lab, y)
+    ids = fold_ids(len(lab), folds)
+    regression = prof["problem_type"] == "regression"
+    cand = {"name": "autogluon", "score": None}
+    if (ids >= 0).all():
+        predictor = fit_autogluon(prof, target, budget, folds=ids)
+        test_pred, test_proba, classes = ag_predict(prof, predictor, target)
+        cand.update(test_pred=test_pred, test=test_pred if regression else test_proba, classes=classes)
+        oof = ag_oof(predictor, prof, target)
+        if oof is None:
+            return cand
+        rows, y_oof, oof_pred, oof_proba, oof_classes = oof
+        cand.update(rows=rows, y=y_oof, oof=oof_pred if regression else align_classes(oof_proba, oof_classes, classes))
+    else:
+        t0 = time.time()
+        tr, va = folds[-1]
+        holdout = fit_autogluon(prof, target, 0.35 * budget, rows=lab.index[tr])
+        h_pred, h_proba, h_classes = ag_predict(prof, holdout, target, frame=lab.iloc[va])
+        rest = budget - (time.time() - t0)
+        if rest >= 300:
+            predictor = fit_autogluon(prof, target, rest)
+        else:
+            log("AutoGluon: на fit по всему train не осталось времени — test предсказывает holdout-модель")
+            predictor = holdout
+        test_pred, test_proba, classes = ag_predict(prof, predictor, target)
+        oof = h_pred if regression else align_classes(h_proba, h_classes, classes)
+        cand.update(test_pred=test_pred, test=test_pred if regression else test_proba, classes=classes,
+                    rows=lab.index.to_numpy()[va], y=y[va], oof=oof)
+    try:
+        cand["score"] = _cand_score(prof["metric"], cand)
+    except Exception as exc:  # noqa: BLE001
+        log(f"AutoGluon: {prof['metric']} по OOF не посчитан ({exc})")
+    return cand
 
 
 def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget: float) -> np.ndarray:
@@ -402,10 +432,14 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     else:
         log(f"Пропускаю AutoEDA: мало времени ({eda_budget:.0f}s)")
     if eda["accepted"] and quick is not None:
+        # Сравнение на одном фолде схемы cv: база — исходные признаки без target-спек и модельных операций.
         try:
-            q2 = quick_model(prof, target)
-            better = is_better(metric, q2["val_score"], quick["val_score"])
-            register("quick_lgbm_fe", "quick-модель на признаках AutoEDA", q2["val_score"], better)
+            base_view = {**prof, "features": prof["base_features"], "target_specs": [], "model_ops": {}}
+            qb = quick_model(base_view, target, use_cv=True)
+            q2 = quick_model(prof, target, use_cv=True)
+            better = is_better(metric, q2["val_score"], qb["val_score"])
+            register("quick_lgbm_fe", f"quick-модель на признаках AutoEDA (база {qb['val_score']:.5f})",
+                     q2["val_score"], better)
             if better:
                 quick = q2
                 current[target] = quick["test_pred"]
@@ -414,77 +448,51 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
         except Exception:  # noqa: BLE001
             log("quick_lgbm на признаках AutoEDA упал:\n" + traceback.format_exc())
 
-    # Ступень 2: AutoGluon.
-    predictor = None
+    # Ступень 2: AutoGluon на фолдах схемы cv.
+    ag = None
     ag_budget = min(budget, time_left()) - PREDICT_RESERVE_SEC - KFOLD_RESERVE_SEC
     if ag_budget >= 300:
         try:
-            predictor = fit_autogluon(prof, target, ag_budget)
+            ag = run_autogluon(prof, target, ag_budget)
         except Exception:  # noqa: BLE001
-            log("AutoGluon.fit упал:\n" + traceback.format_exc())
+            log("AutoGluon упал:\n" + traceback.format_exc())
     else:
         log(f"Пропускаю AutoGluon: осталось мало времени ({ag_budget:.0f}s)")
+    if ag is not None and ag.get("test_pred") is not None:
+        # Немедленная перезапись сабмита: OOF AutoGluon надёжнее одного
+        # сплита quick, поэтому AG отбрасываем только при явном (>2%)
+        # преимуществе quick. Финальный выбор ниже — на общих OOF-строках.
+        ag_score = ag["score"]
+        if quick is None:
+            take_ag = True
+        elif ag_score is None:
+            log("AutoGluon: OOF-оценка недоступна, сабмит quick остаётся")
+            take_ag = False
+        else:
+            qs = quick["val_score"]
+            margin = 0.02 * abs(qs) if qs else 1e-9
+            shifted = qs - margin if models.HIGHER_BETTER[metric] else qs + margin
+            take_ag = not is_better(metric, shifted, ag_score)
+        register("autogluon", "ансамбль AutoGluon против опорного бустинга", ag_score, take_ag)
+        if take_ag:
+            current[target] = ag["test_pred"]
+            write_submission(prof, current)
+            best_pred = current[target]
 
-    ag_test_pred = ag_test_proba = None
-    ag_y = ag_oof_pred = ag_oof_proba = ag_classes = None
-    ag_score = None
-    if predictor is not None:
-        try:
-            ag_test_pred, ag_test_proba = ag_predict(prof, predictor, target)
-        except Exception:  # noqa: BLE001
-            log("AutoGluon.predict упал:\n" + traceback.format_exc())
-        if ag_test_pred is not None:
-            oof = ag_oof(predictor, prof, target)
-            if oof is not None:
-                ag_y, ag_oof_pred, ag_oof_proba, ag_classes = oof
-                try:
-                    ag_score = models.score(metric, ag_y, ag_oof_pred, proba=ag_oof_proba, labels=ag_classes)
-                except Exception as exc:  # noqa: BLE001
-                    log(f"AutoGluon: {metric} по OOF не посчитан ({exc})")
-                    ag_score = None
-            # Немедленная перезапись сабмита: OOF AutoGluon надёжнее одного
-            # 15%-сплита quick, поэтому AG отбрасываем только при явном (>2%)
-            # преимуществе quick. Финальный выбор ниже — по единой OOF-базе.
-            if quick is None:
-                take_ag = True
-            elif ag_score is None:
-                log("AutoGluon: OOF-оценка недоступна, сабмит quick остаётся")
-                take_ag = False
-            else:
-                qs = quick["val_score"]
-                margin = 0.02 * abs(qs) if qs else 1e-9
-                shifted = qs - margin if models.HIGHER_BETTER[metric] else qs + margin
-                take_ag = not is_better(metric, shifted, ag_score)
-            register("autogluon", "ансамбль AutoGluon против опорного бустинга", ag_score, take_ag)
-            if take_ag:
-                current[target] = ag_test_pred
-                write_submission(prof, current)
-                best_pred = current[target]
-
-    # Ступень 3: k-fold OOF quick-модели — честная база сравнения и материал для бленда.
-    kq = None
+    # Ступень 3: k-fold LightGBM на тех же фолдах — база сравнения и материал для бленда.
+    cands = [ag] if ag is not None and ag.get("rows") is not None else []
     if time_left() > PREDICT_RESERVE_SEC * 0.5:
         try:
             kq = quick_oof(prof, target)
             if kq is not None:
                 register("quick_oof", "k-fold LightGBM: OOF-база для бленда", kq["score"], True)
+                cands.append({"name": "quick_kfold", **kq})
         except Exception:  # noqa: BLE001
             log("quick_oof упал:\n" + traceback.format_exc())
 
     # Ступень 4: бленд, выбор финального источника и постпроцессинг.
-    ag_pack = (ag_score, ag_test_pred, ag_test_proba, ag_y, ag_oof_pred, ag_oof_proba, ag_classes)
-    mask = None
     try:
-        mask = temporal_mask(prof, target, eda["period"])
-    except Exception:  # noqa: BLE001
-        log("temporal_holdout упал:\n" + traceback.format_exc())
-    try:
-        if prof["problem_type"] == "regression":
-            return _select_final_regression(prof, target, current, ag_pack, kq, best_pred, eval_mask=mask)
-        return _select_final_classification(
-            prof, target, current, quick, ag_pack, kq, best_pred,
-            eval_mask=mask, label_copy=eda["label_copy"],
-        )
+        return select_final(prof, target, current, quick, cands, best_pred, label_copy=eda["label_copy"])
     except Exception:  # noqa: BLE001
         log("Финальный выбор упал, остаётся последний записанный сабмит:\n" + traceback.format_exc())
         return best_pred
@@ -506,8 +514,8 @@ def main() -> None:
     base_state = {"train": prof["train"], "test": prof["test"], "features": list(prof["features"])}
     for i, t in enumerate(targets):
         prof.update(base_state, features=list(base_state["features"]), target=t, **prof["per_target"][t])
-        prof.pop("base_features", None)
-        prof.pop("model_ops", None)
+        for k in ("base_features", "model_ops", "target_specs", "cv"):
+            prof.pop(k, None)
         # Бюджет — от фактически оставшегося времени на оставшиеся таргеты.
         budget = time_left() / (len(targets) - i)
         try:

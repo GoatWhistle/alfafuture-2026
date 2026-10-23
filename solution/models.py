@@ -293,6 +293,123 @@ def constant_predictions(prof: dict, target: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Схема независимой валидации.
+# ---------------------------------------------------------------------------
+
+N_FOLDS = 5
+SEG_MIN_ROWS = 300
+
+
+def labeled(prof: dict, target: str) -> pd.DataFrame:
+    train = prof["train"]
+    return train.loc[train[target].notna()]
+
+
+def outer_folds(prof: dict, lab: pd.DataFrame, y, n_splits: int = N_FOLDS) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Внешние фолды (позиции в lab) по prof["cv"] — та же схема, что у валидатора AutoEDA.
+
+    temporal: train — периоды раньше валидационного (последний, при ≥4
+    периодах ещё предпоследний); group: GroupKFold по ключу объекта;
+    иначе (Stratified)KFold. Детерминированы: все модели видят одни фолды.
+    """
+    from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
+
+    cv = prof.get("cv") or {"kind": "kfold"}
+    n = len(lab)
+    if cv["kind"] == "temporal" and cv.get("period") in lab.columns:
+        t = pd.to_numeric(lab[cv["period"]], errors="coerce").to_numpy(float)
+        periods = np.unique(t[~np.isnan(t)])
+        folds = []
+        for last in (periods[-2:] if len(periods) >= 4 else periods[-1:]):
+            tr, va = np.flatnonzero(t < last), np.flatnonzero(t == last)
+            if len(tr) >= 200 and len(va) >= 50:
+                folds.append((tr, va))
+        if folds:
+            return folds
+        log("outer_folds: temporal-фолды не собрались, беру KFold")
+    if cv["kind"] == "group" and set(cv.get("keys") or []) <= set(lab.columns):
+        g = row_keys(lab, cv["keys"])
+        ng = int(pd.Series(g).nunique())
+        if ng >= 2:
+            return list(GroupKFold(min(n_splits, ng)).split(np.arange(n), groups=g))
+        log("outer_folds: групп меньше двух, беру KFold")
+    ys = pd.Series(np.asarray(y, dtype=object))
+    if prof["problem_type"] != "regression" and ys.value_counts().min() >= n_splits:
+        return list(StratifiedKFold(n_splits, shuffle=True, random_state=7).split(np.arange(n), ys))
+    return list(KFold(n_splits, shuffle=True, random_state=7).split(np.arange(n)))
+
+
+def fold_ids(n: int, folds) -> np.ndarray:
+    """Номер валидационного фолда каждой строки (-1 — строка ни в одном val)."""
+    out = np.full(n, -1, dtype=np.int64)
+    for i, (_, va) in enumerate(folds):
+        out[va] = i
+    return out
+
+
+def es_split(prof: dict, lab: pd.DataFrame, tr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Строки tr для обучения и для ранней остановки: оцениваемый фолд её не видит.
+
+    temporal — последний период tr; group — 10% групп; иначе — 10% строк.
+    """
+    cv = prof.get("cv") or {}
+    sub = lab.iloc[tr]
+    rng = np.random.RandomState(3)
+    if cv.get("kind") == "temporal" and cv.get("period") in sub.columns:
+        t = pd.to_numeric(sub[cv["period"]], errors="coerce").to_numpy(float)
+        if np.isfinite(t).any():
+            es = t == np.nanmax(t)
+            if 50 <= es.sum() <= 0.5 * len(t):
+                return tr[~es], tr[es]
+    if cv.get("kind") == "group" and set(cv.get("keys") or []) <= set(sub.columns):
+        g = row_keys(sub, cv["keys"])
+        ug = np.unique(g)
+        if len(ug) >= 5:
+            es = np.isin(g, rng.choice(ug, max(1, len(ug) // 10), replace=False))
+            if 0 < es.sum() < len(tr):
+                return tr[~es], tr[es]
+    es = rng.rand(len(tr)) < 0.1
+    return tr[~es], tr[es]
+
+
+def target_features(prof: dict, target: str, fit: pd.DataFrame, app: pd.DataFrame):
+    """Признаки target-спек AutoEDA: fit — cross-fit по схеме cv, app — по всему fit.
+
+    Строятся заново для каждого разбиения, поэтому таргет строк app на
+    признаки не влияет. Возвращает (fit_df, app_df) с RangeIndex или (None, None).
+    """
+    import fe_dsl
+
+    specs = prof.get("target_specs") or []
+    if not specs:
+        return None, None
+    classes = None
+    if prof["problem_type"] != "regression":
+        classes = sorted(fit[target].astype(str).unique().tolist())
+    fparts, aparts = [], []
+    for spec in specs:
+        res = fe_dsl.safe_apply(spec, fit, fit[target].to_numpy(), app, classes, prof.get("cv"))
+        if res is not None:
+            fparts.append(res[0])
+            aparts.append(res[1])
+    if not fparts:
+        return None, None
+    f, a = pd.concat(fparts, axis=1), pd.concat(aparts, axis=1)
+    keep = ~f.columns.duplicated()
+    return f.loc[:, keep], a.loc[:, keep].reindex(columns=f.columns[keep])
+
+
+def with_target_features(prof: dict, target: str, fit_df: pd.DataFrame, Xfit: pd.DataFrame,
+                         app_df: pd.DataFrame, Xapp: pd.DataFrame):
+    """Матрицы с target-признаками (RangeIndex); без target-спек — как есть."""
+    F, A = target_features(prof, target, fit_df, app_df)
+    Xfit, Xapp = Xfit.reset_index(drop=True), Xapp.reset_index(drop=True)
+    if F is None:
+        return Xfit, Xapp
+    return pd.concat([Xfit, F], axis=1), pd.concat([Xapp, A], axis=1)
+
+
+# ---------------------------------------------------------------------------
 # Быстрый LightGBM — страховочная модель и ранний сабмит.
 # ---------------------------------------------------------------------------
 
@@ -312,67 +429,125 @@ def _prep_matrices(prof: dict, target: str):
     return X, y, Xte
 
 
-def quick_model(prof: dict, target: str, max_rows: int = 300_000) -> dict:
-    """LightGBM на одном сплите: быстрый ориентир качества + ранние предсказания."""
+def _lgb_model(prof: dict, n_estimators: int, seed: int, objective: dict | None = None):
     import lightgbm as lgb
+
+    common = dict(
+        n_estimators=n_estimators, learning_rate=0.05, num_leaves=127,
+        colsample_bytree=0.8, subsample=0.8, subsample_freq=1,
+        n_jobs=N_CPUS, random_state=seed, verbosity=-1,
+    )
+    if prof["problem_type"] == "regression":
+        return lgb.LGBMRegressor(**(objective or {"objective": "regression"}), **common)
+    cw = "balanced" if prof["metric"] in ("f1_macro", "balanced_accuracy", "f1") else None
+    return lgb.LGBMClassifier(class_weight=cw, **common)
+
+
+def _pred(m, X, classes):
+    if classes is None:
+        return m.predict(X)
+    out = np.zeros((len(X), len(classes)))
+    pos = {c: i for i, c in enumerate(classes)}
+    out[:, [pos[c] for c in m.classes_]] = m.predict_proba(X)
+    return out
+
+
+def _fit_segmented(make, Xf, yf, Xes, yes, cf=None, ces=None, classes=None, n_iter=None):
+    """Общая модель + модели сегментов (коды cf). n_iter задан — без ранней остановки (финальный fit)."""
+    import lightgbm as lgb
+
+    yf, yes = np.asarray(yf), (None if yes is None else np.asarray(yes))
+
+    def fit(X, y, Xe, ye):
+        m = make()
+        if n_iter is not None:
+            m.set_params(n_estimators=max(int(n_iter), 20))
+            m.fit(X, y)
+        else:
+            m.fit(X, y, eval_set=[(Xe, ye)],
+                  callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)])
+        return m
+
+    glob = fit(Xf, yf, Xes, yes)
+    segs = {}
+    if cf is not None:
+        for code in np.unique(cf):
+            rows = cf == code
+            if rows.sum() < SEG_MIN_ROWS or (classes is not None and pd.Series(yf[rows]).nunique() < 2):
+                continue
+            er = None if ces is None else ces == code
+            Xe, ye = (Xes[er], yes[er]) if er is not None and er.sum() > 0 else (Xes, yes)
+            segs[code] = fit(Xf[rows], yf[rows], Xe, ye)
+    return glob, segs
+
+
+def _predict_segmented(glob, segs, X, codes, classes):
+    p = _pred(glob, X, classes)
+    if codes is not None:
+        for code, m in segs.items():
+            r = codes == code
+            if r.any():
+                p[r] = _pred(m, X[r], classes)
+    return p
+
+
+def quick_model(prof: dict, target: str, max_rows: int = 300_000, use_cv: bool = False) -> dict:
+    """LightGBM на одном разбиении: быстрый ориентир качества + ранние предсказания.
+
+    use_cv=False — случайные 15% (до AutoEDA схема ещё неизвестна);
+    use_cv=True — валидационный фолд схемы prof["cv"], target-признаки
+    строятся по train фолда. Ранняя остановка — на отдельных строках train.
+    """
     from sklearn.model_selection import train_test_split
 
     metric, ptype = prof["metric"], prof["problem_type"]
     X, y, Xte = _prep_matrices(prof, target)
+    lab = labeled(prof, target)
     if len(X) > max_rows:
-        idx = np.random.RandomState(0).choice(len(X), max_rows, replace=False)
-        X, y = X.iloc[idx], y.iloc[idx]
-
+        idx = np.sort(np.random.RandomState(0).choice(len(X), max_rows, replace=False))
+        X, y, lab = X.iloc[idx], y.iloc[idx], lab.iloc[idx]
+    y_orig = y.to_numpy()
     if prof["log_target"]:
         y = np.log1p(y.clip(lower=0))
 
-    stratify = y if ptype != "regression" else None
-    Xtr, Xval, ytr, yval = train_test_split(X, y, test_size=0.15, random_state=42, stratify=stratify)
-
-    common = dict(
-        n_estimators=3000, learning_rate=0.05, num_leaves=127,
-        colsample_bytree=0.8, subsample=0.8, subsample_freq=1,
-        n_jobs=N_CPUS, random_state=42, verbosity=-1,
-    )
-    if ptype == "regression":
-        model = lgb.LGBMRegressor(objective="regression", **common)
-        eval_metric = "l1" if metric == "mae" else "rmse"
+    pos = np.arange(len(X))
+    if use_cv:
+        folds = outer_folds(prof, lab, y_orig)
+        tr, va = folds[-1] if (prof.get("cv") or {}).get("kind") == "temporal" else folds[0]
     else:
-        cw = "balanced" if metric in ("f1_macro", "balanced_accuracy", "f1") else None
-        model = lgb.LGBMClassifier(class_weight=cw, **common)
-        eval_metric = None
-    model.fit(
-        Xtr, ytr, eval_set=[(Xval, yval)], eval_metric=eval_metric,
-        callbacks=[lgb.early_stopping(150, verbose=False), lgb.log_evaluation(0)],
-    )
+        strat = y_orig if ptype != "regression" and pd.Series(y_orig).value_counts().min() >= 2 else None
+        tr, va = train_test_split(pos, test_size=0.15, random_state=42, stratify=strat)
+    fit_i, es_i = es_split(prof, lab, np.sort(tr))
+    app = np.concatenate([es_i, va])
+    Xf, Xa = with_target_features(prof, target, lab.iloc[fit_i], X.iloc[fit_i],
+                                  pd.concat([lab.iloc[app], prof["test"]]), pd.concat([X.iloc[app], Xte]))
+    Xes, Xval, Xt = Xa.iloc[:len(es_i)], Xa.iloc[len(es_i):len(app)], Xa.iloc[len(app):]
+    yv = y.iloc[va].to_numpy()
+    classes = None if ptype == "regression" else sorted(pd.unique(y_orig).tolist(), key=str)
+    glob, _ = _fit_segmented(lambda: _lgb_model(prof, 3000, 42), Xf, y.iloc[fit_i], Xes, y.iloc[es_i],
+                             classes=classes)
 
+    result = {"name": "quick_lgbm", "rows": lab.index.to_numpy()[va]}
     if ptype == "regression":
-        val_pred = model.predict(Xval)
-        test_pred = model.predict(Xte)
+        val_pred, test_pred = glob.predict(Xval), glob.predict(Xt)
         if prof["log_target"]:
-            yval, val_pred = np.expm1(yval), np.expm1(val_pred)
-            test_pred = np.expm1(test_pred)
-            test_pred = np.clip(test_pred, 0, None)
-        val_score = score(metric, yval, val_pred)
+            val_pred, test_pred = np.expm1(val_pred), np.clip(np.expm1(test_pred), 0, None)
+            yv = np.expm1(yv)
+        val_score = score(metric, yv, val_pred)
         proba_te = None
     else:
-        val_proba = model.predict_proba(Xval)
-        val_pred = model.classes_[np.argmax(val_proba, axis=1)]
-        val_score = score(metric, yval, val_pred, proba=val_proba, labels=list(model.classes_))
-        proba_te = model.predict_proba(Xte)
-        test_pred = output_from_proba(prof, target, proba_te, list(model.classes_))
+        val_proba = _pred(glob, Xval, classes)
+        val_pred = np.array(classes, dtype=object)[np.argmax(val_proba, axis=1)]
+        val_score = score(metric, yv, val_pred, proba=val_proba, labels=classes)
+        proba_te = _pred(glob, Xt, classes)
+        test_pred = output_from_proba(prof, target, proba_te, classes)
+        result.update(val_proba=val_proba, y_val=yv, classes=classes)
 
-    log(f"quick_lgbm[{target}]: val {metric}={val_score:.5f}, best_iter={model.best_iteration_}")
-    result = {
-        "name": "quick_lgbm", "val_score": val_score, "test_pred": test_pred, "proba": proba_te,
-        "importances": dict(zip(list(X.columns), model.feature_importances_.tolist())),
-    }
-    if ptype != "regression":
-        result.update(val_proba=val_proba, y_val=np.asarray(yval), classes=list(model.classes_))
+    log(f"quick_lgbm[{target}]: val {metric}={val_score:.5f}, best_iter={glob.best_iteration_}"
+        + (" (схема cv)" if use_cv else ""))
+    result.update(val_score=val_score, test_pred=test_pred, proba=proba_te,
+                  importances=dict(zip(list(Xf.columns), glob.feature_importances_.tolist())))
     return result
-
-
-SEG_MIN_ROWS = 300
 
 
 def _segment_codes(prof: dict, target: str):
@@ -382,83 +557,35 @@ def _segment_codes(prof: dict, target: str):
     seg = (prof.get("model_ops") or {}).get("segment_model")
     if seg is None:
         return None, None, None
-    train = prof["train"]
-    lab = train.loc[train[target].notna()]
+    lab = labeled(prof, target)
     ctr, cte = fe_dsl.segment_codes(seg, lab, prof["test"])
     return seg, ctr, cte
 
 
-def _fit_fold(make, X, y, tr_i, va_i, Xte, ctr, cte, classes=None):
-    """Модель фолда (по сегментам, если заданы коды): предсказания val и test.
+def quick_oof(prof: dict, target: str, max_rows: int = 400_000) -> dict | None:
+    """K-fold LightGBM по схеме prof["cv"]: OOF на валидационных строках + предсказания test.
 
-    Регрессия — векторы, классификация — вероятности в порядке classes.
-    Сегмент с малым train предсказывает общая модель.
+    На каждом фолде target-признаки строятся по train фолда, ранняя
+    остановка — на части train фолда. Test предсказывает модель,
+    переобученная на всём размеченном train (число деревьев — медиана по
+    фолдам). Учитывает модельные операции AutoEDA (сегменты, функция
+    потерь). Возвращает {"rows" — индексы train с OOF, "y", "oof", "test",
+    "classes", "score"} или None, когда датасет слишком велик.
     """
-    import lightgbm as lgb
-
-    def fit(rows_tr, code=None):
-        m = make()
-        va_rows = va_i if code is None else va_i[ctr[va_i] == code]
-        if len(va_rows) == 0:
-            va_rows = va_i
-        m.fit(X.iloc[rows_tr], y.iloc[rows_tr], eval_set=[(X.iloc[va_rows], y.iloc[va_rows])],
-              callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)])
-        return m
-
-    def pred(m, Xp):
-        if classes is None:
-            return m.predict(Xp)
-        out = np.zeros((len(Xp), len(classes)))
-        pos = {c: i for i, c in enumerate(classes)}
-        out[:, [pos[c] for c in m.classes_]] = m.predict_proba(Xp)
-        return out
-
-    glob = fit(tr_i)
-    p_va, p_te = pred(glob, X.iloc[va_i]), pred(glob, Xte)
-    if ctr is None:
-        return p_va, p_te
-    for code in np.unique(ctr[tr_i]):
-        rows = tr_i[ctr[tr_i] == code]
-        if len(rows) < SEG_MIN_ROWS or (classes is not None and y.iloc[rows].nunique() < 2):
-            continue
-        m = fit(rows, code)
-        mv, mt = ctr[va_i] == code, cte == code
-        if mv.any():
-            p_va[mv] = pred(m, X.iloc[va_i[mv]])
-        if mt.any():
-            p_te[mt] = pred(m, Xte[mt])
-    return p_va, p_te
-
-
-def quick_oof(prof: dict, target: str, n_splits: int = 5, max_rows: int = 400_000) -> dict | None:
-    """K-fold LightGBM: OOF на всём train (выравнен с OOF AutoGluon) + предсказания test.
-
-    Учитывает модельные операции AutoEDA (prof["model_ops"]): отдельные модели
-    по сегментам и функцию потерь регрессии. Возвращает None, когда датасет
-    слишком велик для честного полнорядного OOF.
-    """
-    import lightgbm as lgb
-    from sklearn.model_selection import KFold, StratifiedKFold
-
     metric, ptype = prof["metric"], prof["problem_type"]
     X, y, Xte = _prep_matrices(prof, target)
     if len(X) > max_rows:
         log(f"quick_oof: {len(X)} строк > {max_rows}, пропускаю бленд")
         return None
+    lab = labeled(prof, target)
     y_orig = y.to_numpy()
     if prof["log_target"]:
         y = np.log1p(y.clip(lower=0))
     seg, ctr, cte = _segment_codes(prof, target)
     if seg is not None:
         log(f"quick_oof: отдельные модели по сегментам {seg['cols'][0]}:{seg['params']['rule']}")
-
-    common = dict(
-        n_estimators=1500, learning_rate=0.05, num_leaves=127,
-        colsample_bytree=0.8, subsample=0.8, subsample_freq=1,
-        n_jobs=N_CPUS, random_state=7, verbosity=-1,
-    )
+    obj = None
     if ptype == "regression":
-        obj = {"objective": "regression"}
         o = (prof.get("model_ops") or {}).get("objective")
         if o is not None:
             p = o["params"]
@@ -466,38 +593,49 @@ def quick_oof(prof: dict, target: str, n_splits: int = 5, max_rows: int = 400_00
             if "alpha" in p:
                 obj["alpha" if p["name"] == "huber" else "fair_c"] = p["alpha"]
             log(f"quick_oof: функция потерь {obj}")
-        oof = np.zeros(len(X))
-        te = np.zeros(len(Xte))
-        for tr_i, va_i in KFold(n_splits, shuffle=True, random_state=7).split(X):
-            pv, pt = _fit_fold(lambda: lgb.LGBMRegressor(**obj, **common), X, y, tr_i, va_i, Xte, ctr, cte)
-            oof[va_i] = pv
-            te += pt / n_splits
+    classes = None if ptype == "regression" else sorted(pd.unique(y_orig).tolist(), key=str)
+    make = lambda: _lgb_model(prof, 1500, 7, obj)  # noqa: E731
+
+    folds = outer_folds(prof, lab, y_orig)
+    oof = np.full(len(X), np.nan) if classes is None else np.full((len(X), len(classes)), np.nan)
+    iters = []
+    for tr, va in folds:
+        fit_i, es_i = es_split(prof, lab, tr)
+        app = np.concatenate([es_i, va])
+        Xf, Xa = with_target_features(prof, target, lab.iloc[fit_i], X.iloc[fit_i], lab.iloc[app], X.iloc[app])
+        cf = None if ctr is None else ctr[fit_i]
+        glob, segs = _fit_segmented(make, Xf, y.iloc[fit_i], Xa.iloc[:len(es_i)], y.iloc[es_i],
+                                    cf, None if ctr is None else ctr[es_i], classes)
+        oof[va] = _predict_segmented(glob, segs, Xa.iloc[len(es_i):], None if ctr is None else ctr[va], classes)
+        iters.append(glob.best_iteration_ or 1500)
+
+    n_iter = int(np.median(iters) * 1.1)
+    Xall, Xt = with_target_features(prof, target, lab, X, prof["test"], Xte)
+    glob, segs = _fit_segmented(make, Xall, y, None, None, ctr, None, classes, n_iter=n_iter)
+    te = _predict_segmented(glob, segs, Xt, cte, classes)
+
+    cov = np.isfinite(oof if oof.ndim == 1 else oof[:, 0])
+    oof, y_cov = oof[cov], y_orig[cov]
+    if classes is None:
         if prof["log_target"]:
             oof = np.clip(np.expm1(oof), 0, None)
             te = np.clip(np.expm1(te), 0, None)
-        s = score(metric, y_orig, oof)
-        log(f"quick_oof[{target}]: {metric}={s:.5f}")
-        return {"y": y_orig, "oof": oof, "test": te, "classes": None, "score": s}
-
-    classes = sorted(pd.Series(y_orig).dropna().unique().tolist())
-    oof = np.zeros((len(X), len(classes)))
-    te = np.zeros((len(Xte), len(classes)))
-    cw = "balanced" if metric in ("f1_macro", "balanced_accuracy", "f1") else None
-    for tr_i, va_i in StratifiedKFold(n_splits, shuffle=True, random_state=7).split(X, y):
-        pv, pt = _fit_fold(lambda: lgb.LGBMClassifier(class_weight=cw, **common), X, y, tr_i, va_i, Xte,
-                           ctr, cte, classes)
-        oof[va_i] = pv
-        te += pt / n_splits
-    pred = np.array(classes, dtype=object)[np.argmax(oof, axis=1)]
-    s = score(metric, y_orig, pred, proba=oof, labels=classes)
-    log(f"quick_oof[{target}]: {metric}={s:.5f}")
-    return {"y": y_orig, "oof": oof, "test": te, "classes": classes, "score": s}
+        s = score(metric, y_cov, oof)
+    else:
+        pred = np.array(classes, dtype=object)[np.argmax(oof, axis=1)]
+        s = score(metric, y_cov, pred, proba=oof, labels=classes)
+    log(f"quick_oof[{target}]: {metric}={s:.5f} на {int(cov.sum())} строках ({len(folds)} фолд.), "
+        f"финальный fit {n_iter} деревьев")
+    return {"rows": lab.index.to_numpy()[cov], "y": y_cov, "oof": oof, "test": te, "classes": classes, "score": s}
 
 
 def align_classes(mat: np.ndarray, src: list, dst: list) -> np.ndarray:
-    """Переставляет колонки матрицы вероятностей из порядка src в порядок dst."""
-    pos = {c: i for i, c in enumerate(src)}
-    return mat[:, [pos[c] for c in dst]]
+    """Переставляет колонки матрицы вероятностей из порядка src в порядок dst (сверка и по str)."""
+    pos = _class_index(src)
+    missing = [c for c in dst if c not in pos and str(c) not in pos]
+    if missing or len(src) != len(dst):
+        raise ValueError(f"классы не совпадают: {list(src)} vs {list(dst)}")
+    return mat[:, [pos[c] if c in pos else pos[str(c)] for c in dst]]
 
 
 def tune_blend(metric: str, y, a, b, classes: list | None = None):
@@ -515,18 +653,19 @@ def tune_blend(metric: str, y, a, b, classes: list | None = None):
     return best_alpha, best
 
 
-def copy_duplicate_labels(prof: dict, target: str, y_oof, oof_pred, test_pred, metric: str):
+def copy_duplicate_labels(prof: dict, target: str, y_oof, oof_pred, test_pred, metric: str, rows=None):
     """Копирование меток точных дублей признаков (классификация).
 
     Правило: строка получает метку, если все остальные строки train с тем же
     ключом признаков (≥1) несут одну и ту же метку. На train проверяется
     leave-one-out тем же правилом: копия должна быть не хуже модели (OOF) и
     по точности на затронутых строках, и по метрике в целом.
-    Возвращает (test_pred | None, base, new, n_test_copied).
+    rows — индексы train, которым соответствуют y_oof/oof_pred (по умолчанию
+    все размеченные). Возвращает (test_pred | None, base, new, n_test_copied).
     """
     train, test = prof["train"], prof["test"]
     feats = list(prof.get("base_features") or prof["features"])
-    lab = train.loc[train[target].notna()]
+    lab = train.loc[train[target].notna()] if rows is None else train.loc[rows]
     y = np.asarray(y_oof, dtype=object)
     ktr = row_keys(lab, feats)
     kte = row_keys(test, feats)
@@ -585,13 +724,29 @@ def copy_duplicate_labels(prof: dict, target: str, y_oof, oof_pred, test_pred, m
 # AutoGluon — основной движок.
 # ---------------------------------------------------------------------------
 
-def fit_autogluon(prof: dict, target: str, time_budget: float):
+FOLD_COL = "__cv_fold__"
+
+
+def fit_autogluon(prof: dict, target: str, time_budget: float, rows=None, folds=None):
+    """AutoGluon на признаках prof["features"] (без target-признаков AutoEDA).
+
+    rows — индексы train для обучения (temporal holdout-fit), иначе весь
+    размеченный train. folds — номера фолдов строк: бэггинг AutoGluon
+    идёт по тем же фолдам, что и остальные модели (параметр groups).
+    """
     from autogluon.tabular import TabularPredictor
 
-    train, features = prof["train"], prof["features"]
-    df = train.loc[train[target].notna(), features + [target]].copy()
+    features = prof["features"]
+    lab = labeled(prof, target)
+    if rows is not None:
+        lab = lab.loc[rows]
+    df = lab[features + [target]].copy()
     if prof["log_target"]:
         df[target] = np.log1p(df[target].clip(lower=0))
+    extra: dict = {}
+    if folds is not None and rows is None and len(np.unique(folds)) >= 2 and (np.asarray(folds) >= 0).all():
+        df[FOLD_COL] = np.asarray(folds)
+        extra["groups"] = FOLD_COL
 
     n_cells = len(df) * max(len(features), 1)
     if time_budget > 2700 and n_cells <= 60_000_000:
@@ -602,7 +757,6 @@ def fit_autogluon(prof: dict, target: str, time_budget: float):
         presets = "good_quality"
 
     path = tempfile.mkdtemp(prefix="ag_", dir="/tmp")
-    extra: dict = {}
     # Macro-метрики требуют баланса классов, иначе редкие классы тонут
     # (на UNSW-NB15 AG без взвешивания проигрывает балансированному LightGBM).
     if prof["problem_type"] != "regression" and prof["metric"] in (
@@ -617,7 +771,8 @@ def fit_autogluon(prof: dict, target: str, time_budget: float):
         verbosity=2,
         **extra,
     )
-    log(f"AutoGluon[{target}]: presets={presets}, time_limit={time_budget:.0f}s, rows={len(df)}")
+    log(f"AutoGluon[{target}]: presets={presets}, time_limit={time_budget:.0f}s, rows={len(df)}"
+        + (f", фолды схемы cv ({len(np.unique(folds))})" if "groups" in extra else ""))
     predictor.fit(
         train_data=df,
         time_limit=max(int(time_budget), 120),
@@ -635,43 +790,42 @@ def fit_autogluon(prof: dict, target: str, time_budget: float):
     return predictor
 
 
-def ag_predict(prof: dict, predictor, target: str) -> tuple[np.ndarray, np.ndarray | None]:
-    """Предсказания AutoGluon на test: (вектор для сабмита, матрица вероятностей)."""
-    test = prof["test"][prof["features"]]
+def ag_predict(prof: dict, predictor, target: str, frame: pd.DataFrame | None = None):
+    """Предсказания AutoGluon (по умолчанию на test).
+
+    Регрессия: (значения, None, None); классификация: (вектор для сабмита,
+    матрица вероятностей, классы).
+    """
+    X = (prof["test"] if frame is None else frame)[prof["features"]]
     if prof["problem_type"] == "regression":
-        pred = predictor.predict(test).to_numpy()
+        pred = predictor.predict(X).to_numpy()
         if prof["log_target"]:
             pred = np.clip(np.expm1(pred), 0, None)
-        return pred, None
-    proba = predictor.predict_proba(test)
-    return output_from_proba(prof, target, proba.to_numpy(), list(proba.columns)), proba.to_numpy()
+        return pred, None, None
+    proba = predictor.predict_proba(X)
+    classes = list(proba.columns)
+    return output_from_proba(prof, target, proba.to_numpy(), classes), proba.to_numpy(), classes
 
 
 def ag_oof(predictor, prof: dict, target: str):
-    """OOF-предсказания (есть при бэггинге). Возвращает (y_true, oof_pred, oof_proba, classes) или None."""
+    """OOF бэггинга: (rows — индексы train, y_true, oof_pred, oof_proba, classes) или None."""
     try:
         train = prof["train"]
-        y_true = train.loc[train[target].notna(), target].reset_index(drop=True)
         if prof["problem_type"] == "regression":
-            for name in ("predict_oof", "get_oof_pred"):
-                fn = getattr(predictor, name, None)
-                if fn is not None:
-                    oof = np.asarray(fn())
-                    if prof["log_target"]:
-                        oof = np.clip(np.expm1(oof), 0, None)
-                    return y_true.to_numpy(), oof, None, None
-            return None
-        for name in ("predict_proba_oof", "get_oof_pred_proba"):
-            fn = getattr(predictor, name, None)
-            if fn is not None:
-                proba = fn()
-                classes = list(proba.columns)
-                arr = proba.to_numpy()
-                pred = np.array(classes, dtype=object)[np.argmax(arr, axis=1)]
-                return y_true.to_numpy(), pred, arr, classes
-        return None
+            oof = predictor.predict_oof()
+            rows = oof.index.to_numpy()
+            vals = oof.to_numpy()
+            if prof["log_target"]:
+                vals = np.clip(np.expm1(vals), 0, None)
+            return rows, train.loc[rows, target].to_numpy(), vals, None, None
+        proba = predictor.predict_proba_oof()
+        rows = proba.index.to_numpy()
+        classes = list(proba.columns)
+        arr = proba.to_numpy()
+        pred = np.array(classes, dtype=object)[np.argmax(arr, axis=1)]
+        return rows, train.loc[rows, target].to_numpy(), pred, arr, classes
     except Exception as exc:  # noqa: BLE001
-        log(f"OOF недоступен: {exc}")
+        log(f"OOF AutoGluon недоступен: {exc}")
         return None
 
 
@@ -789,14 +943,12 @@ def tune_class_weights_stable(
     return None, base, base
 
 
-def clip_to_train_range(y_true, oof_pred, test_pred, metric: str, eval_mask=None):
+def clip_to_train_range(y_true, oof_pred, test_pred, metric: str, y_range=None):
     """Клиппинг регрессии к диапазону трейна — принимается только при улучшении OOF.
 
-    eval_mask ограничивает оценку строками (например, последним периодом train).
+    y_range — (min, max) таргета во всём размеченном train; по умолчанию — по y_true.
     """
-    lo, hi = float(np.min(y_true)), float(np.max(y_true))
-    if eval_mask is not None:
-        y_true, oof_pred = np.asarray(y_true)[eval_mask], np.asarray(oof_pred)[eval_mask]
+    lo, hi = y_range if y_range is not None else (float(np.min(y_true)), float(np.max(y_true)))
     base = score(metric, y_true, oof_pred)
     clipped_oof = np.clip(oof_pred, lo, hi)
     new = score(metric, y_true, clipped_oof)

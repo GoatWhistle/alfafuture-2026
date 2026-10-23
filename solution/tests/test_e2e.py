@@ -93,3 +93,31 @@ def test_multi_target(tmp_path):
     assert set(out["flag"]) <= {"yes", "no"}
     assert np.corrcoef(out["price"], test["a"])[0, 1] > 0.8
     assert ((out["flag"] == "yes") == (test["b"] > 0)).mean() > 0.9
+
+
+def test_panel_with_autoeda(tmp_path):
+    """Панель объект × период, test — следующий период: AutoEDA выбирает схему, target-спеки идут по фолдам."""
+    rng = np.random.RandomState(5)
+    n_obj, n_per = 400, 6
+    obj = np.repeat(np.arange(n_obj), n_per)
+    per = np.tile(np.arange(n_per), n_obj)
+    level = rng.randn(n_obj)[obj] * 5
+    x = rng.randn(len(obj))
+    y = level + 0.3 * per + x + 0.3 * rng.randn(len(obj))
+    df = pd.DataFrame({"id": np.arange(len(obj)), "obj": obj, "per": per, "x": x, "noise": rng.randn(len(obj)),
+                       "target": y})
+    train = df[df["per"] < 5].reset_index(drop=True)
+    test = df[df["per"] == 5].drop(columns="target").reset_index(drop=True)
+    sample = pd.DataFrame({"id": test["id"], "target": 0.0})
+    env_backup = dict(ENV)
+    ENV.update(AGENT_AUTOEDA_SEC="150", AGENT_TIME_LIMIT_SEC="3000")
+    try:
+        out = run(tmp_path, train, test, sample, "Регрессия, метрика RMSE. per — номер года, obj — объект.")
+    finally:
+        ENV.clear()
+        ENV.update(env_backup)
+    log = (tmp_path / "log.txt").read_text()
+    assert "AutoEDA: схема валидации" in log
+    truth = df[df["per"] == 5]["target"].to_numpy()
+    rmse = float(np.sqrt(np.mean((out["target"].to_numpy() - truth) ** 2)))
+    assert rmse < 2.0, rmse

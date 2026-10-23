@@ -6,7 +6,9 @@
 fit-строк; fit-строки получают cross-fitted значения (своя строка в
 статистику не попадает), apply-строки — значения по всему fit. Одна и та же
 функция строит признаки и для валидационного фолда (fit = train фолда,
-apply = val), и для финала (fit = весь train, apply = test).
+apply = val), и для финала (fit = весь train, apply = test). Внутренний
+cross-fit соблюдает схему валидации (inner_splits): temporal — только прошлые
+периоды, group — только чужие группы.
 """
 
 from __future__ import annotations
@@ -280,33 +282,62 @@ def _lookup(table: pd.DataFrame, k_dst: np.ndarray, cnt_scale: float = 1.0) -> p
     return out
 
 
-def _crossfit(n_fit: int, fn, seed: int = 11) -> pd.DataFrame:
-    """fn(src_idx, dst_idx) -> DataFrame для dst строк; собирает OOF-значения для всех fit-строк."""
-    from sklearn.model_selection import KFold
+def inner_splits(fit: pd.DataFrame, cv: dict | None, seed: int = 11) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Разбиения fit-строк для cross-fit target-признаков по схеме валидации cv.
 
-    parts, idxs = [], []
-    for tr_i, va_i in KFold(CROSSFIT_SPLITS, shuffle=True, random_state=seed).split(np.arange(n_fit)):
-        parts.append(fn(tr_i, va_i))
-        idxs.append(va_i)
-    out = pd.concat(parts, ignore_index=True)
-    order = np.empty(n_fit, dtype=np.int64)
-    order[np.concatenate(idxs)] = np.arange(n_fit)
-    return out.iloc[order].reset_index(drop=True)
+    temporal: значения строки периода t — только из строк с периодом < t
+    (первый период и строки без периода истории не получают);
+    group: строки одной группы не видят свою группу; иначе — KFold.
+    """
+    from sklearn.model_selection import GroupKFold, KFold
+
+    n = len(fit)
+    kind = (cv or {}).get("kind")
+    if kind == "temporal" and cv.get("period") in fit.columns:
+        t = pd.to_numeric(fit[cv["period"]], errors="coerce").to_numpy(float)
+        out = []
+        for p in np.unique(t[~np.isnan(t)]):
+            src = np.flatnonzero(t < p)
+            if len(src):
+                out.append((src, np.flatnonzero(t == p)))
+        return out
+    if kind == "group" and set(cv.get("keys") or []) <= set(fit.columns):
+        g = row_keys(fit, cv["keys"])
+        if pd.Series(g).nunique() >= 2:
+            k = min(CROSSFIT_SPLITS, int(pd.Series(g).nunique()))
+            return list(GroupKFold(k).split(np.arange(n), groups=g))
+    return list(KFold(CROSSFIT_SPLITS, shuffle=True, random_state=seed).split(np.arange(n)))
 
 
-def _target_group_stat(spec, fit, fit_y, app, classes):
+def _crossfit(n_fit: int, fn, splits) -> pd.DataFrame:
+    """fn(src_idx, dst_idx) -> DataFrame для dst строк; собирает OOF-значения для всех fit-строк.
+
+    Строки, не попавшие ни в один dst (нет допустимого прошлого), остаются NaN.
+    """
+    parts = []
+    for src, dst in splits:
+        if len(src) and len(dst):
+            parts.append(fn(src, dst).set_axis(dst))
+    if not parts:
+        return pd.DataFrame(index=np.arange(n_fit))
+    return pd.concat(parts).reindex(np.arange(n_fit))
+
+
+def _target_group_stat(spec, fit, fit_y, app, classes, cv=None):
     p = spec["params"]
     kf, ka = _keys(fit, app, p["keys"], p.get("bin"))
     Y = _y_matrix(fit_y, classes)
     is_cls = classes is not None
     aggs = p["aggs"]
-    scale = CROSSFIT_SPLITS / (CROSSFIT_SPLITS - 1)
+    kfold = (cv or {}).get("kind") not in ("temporal", "group")
+    scale = CROSSFIT_SPLITS / (CROSSFIT_SPLITS - 1) if kfold else 1.0
 
     def fn(src, dst):
         return _lookup(_group_table(kf[src], Y[src], aggs, is_cls), kf[dst], scale)
 
-    f = _crossfit(len(fit), fn)
     a = _lookup(_group_table(kf, Y, aggs, is_cls), ka)
+    f = _crossfit(len(fit), fn, inner_splits(fit, cv)).reindex(columns=a.columns)
+    f["count"] = f["count"].fillna(0)
     names = {c: _name(spec, c if not c.startswith("p") else f"p_{classes[int(c[1:])]}") for c in f.columns}
     if "count" not in aggs and not is_cls:
         f, a = f.drop(columns="count"), a.drop(columns="count")
@@ -401,7 +432,7 @@ def _lag(spec, fit, fit_y, app, classes):
 # Соседи.
 # ---------------------------------------------------------------------------
 
-def _knn_target(spec, fit, fit_y, app, classes):
+def _knn_target(spec, fit, fit_y, app, classes, cv=None):
     from sklearn.neighbors import NearestNeighbors
 
     cols, k = spec["cols"], spec["params"]["k"]
@@ -430,8 +461,8 @@ def _knn_target(spec, fit, fit_y, app, classes):
         out["dist1"] = dist[:, 0]
         return pd.DataFrame(out)
 
-    f = _crossfit(len(fit), lambda s, d: fn_frame(s, Xf[d]))
     a = fn_frame(np.arange(len(fit)), Xa)
+    f = _crossfit(len(fit), lambda s, d: fn_frame(s, Xf[d]), inner_splits(fit, cv)).reindex(columns=a.columns)
     names = {c: _name(spec, c) for c in f.columns}
     return f.rename(columns=names), a.rename(columns=names)
 
@@ -489,10 +520,12 @@ def _unsupervised(spec, both: pd.DataFrame) -> pd.DataFrame:
 # Исполнитель.
 # ---------------------------------------------------------------------------
 
-def apply(spec: dict, fit: pd.DataFrame, fit_y, app: pd.DataFrame, classes: list | None = None):
+def apply(spec: dict, fit: pd.DataFrame, fit_y, app: pd.DataFrame, classes: list | None = None,
+          cv: dict | None = None):
     """Признаки спеки: (fit_df, app_df) с RangeIndex по строкам fit/app или None.
 
-    classes — список классов (классификация) или None (регрессия).
+    classes — список классов (классификация) или None (регрессия); cv — схема
+    валидации для внутренних разбиений cross-fit (inner_splits).
     """
     op = spec["op"]
     if op == "drop" or op in MODEL_OPS:
@@ -504,12 +537,12 @@ def apply(spec: dict, fit: pd.DataFrame, fit_y, app: pd.DataFrame, classes: list
         return None
     if op == "group_stat":
         if spec["params"].get("src") == "target":
-            return _target_group_stat(spec, fit, fit_y, app, classes)
+            return _target_group_stat(spec, fit, fit_y, app, classes, cv)
         return _col_group_stat(spec, fit, app)
     if op == "lag":
         return _lag(spec, fit, fit_y, app, classes)
     if op == "knn_target":
-        return _knn_target(spec, fit, fit_y, app, classes)
+        return _knn_target(spec, fit, fit_y, app, classes, cv)
     if op == "flag":
         cf, ca = segment_codes(spec, fit, app)
         name = _name(spec, spec["params"]["rule"])
@@ -519,10 +552,10 @@ def apply(spec: dict, fit: pd.DataFrame, fit_y, app: pd.DataFrame, classes: list
     return out.iloc[: len(fit)].reset_index(drop=True), out.iloc[len(fit):].reset_index(drop=True)
 
 
-def safe_apply(spec, fit, fit_y, app, classes=None):
+def safe_apply(spec, fit, fit_y, app, classes=None, cv=None):
     """apply без исключений; пустой/константный результат -> None."""
     try:
-        res = apply(spec, fit, fit_y, app, classes)
+        res = apply(spec, fit, fit_y, app, classes, cv)
     except Exception as exc:  # noqa: BLE001 — кривая спека не роняет агента
         log(f"fe_dsl: спека {describe(spec)} упала: {type(exc).__name__}: {exc}")
         return None
@@ -544,7 +577,7 @@ def materialize(prof: dict, spec: dict, target: str, classes: list | None = None
     lab = train[target].notna().to_numpy()
     fit = train.loc[lab]
     app = pd.concat([train.loc[~lab], test], ignore_index=True)
-    res = safe_apply(spec, fit, fit[target].to_numpy(), app, classes)
+    res = safe_apply(spec, fit, fit[target].to_numpy(), app, classes, prof.get("cv"))
     if res is None:
         return None
     f, a = res
