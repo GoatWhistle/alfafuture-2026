@@ -553,6 +553,8 @@ def main() -> None:
             solve_target(prof, t, current, budget)
         except Exception:  # noqa: BLE001
             log(f"solve_target({t}) упал:\n" + traceback.format_exc())
+        finally:
+            models.cleanup_autogluon()
 
     log("Журнал экспериментов:")
     for e in EXPERIMENTS:
