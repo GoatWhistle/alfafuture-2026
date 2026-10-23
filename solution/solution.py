@@ -37,6 +37,7 @@ import eda_detectors
 import fe_dsl
 import fe_search
 import models
+import linear_search
 from models import (
     ag_oof,
     ag_predict,
@@ -64,6 +65,7 @@ PREDICT_RESERVE_SEC = float(os.environ.get("AGENT_PREDICT_RESERVE_SEC", 900))
 KFOLD_RESERVE_SEC = float(os.environ.get("AGENT_KFOLD_RESERVE_SEC", 600))
 AUTOEDA_SEC = float(os.environ.get("AGENT_AUTOEDA_SEC", 1200))
 MIN_AUTOEDA_SEC = 120
+LINEAR_SEC = max(0.0, min(60.0, float(os.environ.get("AGENT_LINEAR_SEC", 60))))
 # Сверх бюджета AutoEDA: после этого этап бросается (зависшее построение признаков).
 AUTOEDA_SLACK_SEC = 60
 MACRO_METRICS = ("f1_macro", "f1_weighted", "f1", "balanced_accuracy")
@@ -301,7 +303,7 @@ def _cand_score(metric: str, c: dict) -> float:
     return score(metric, c["y"], pred, proba=c["oof"], labels=c["classes"])
 
 
-def select_final(prof, target, current, quick, cands, fallback, label_copy=False):
+def select_final(prof, target, current, quick, cands, fallback, label_copy=False, extra_cands=()):
     """Выбор источника, бленд и постпроцессинг на общих OOF-строках одной схемы валидации."""
     metric = prof["metric"]
     classification = prof["problem_type"] != "regression"
@@ -331,6 +333,22 @@ def select_final(prof, target, current, quick, cands, fallback, label_copy=False
     for c in cands[1:]:
         if is_better(metric, c["score"], win["score"]):
             win = c
+    # Preserve the incumbent's validation population and its existing two-model blend.
+    # An optional family may challenge it only on every one of those same rows.
+    for candidate in _scored(list(extra_cands)):
+        if not np.isin(win["rows"], candidate["rows"]).all():
+            register("family_select", f"{candidate['name']}: неполное покрытие OOF", None, False)
+            continue
+        try:
+            incumbent, challenger = align_candidates([win, candidate])
+            old, new = _cand_score(metric, incumbent), _cand_score(metric, challenger)
+            accepted = np.isfinite(new) and _clearly_better(metric, new, old)
+            register("family_select", f"{candidate['name']} против {win['name']} ({old:.6f}); "
+                     f"{len(win['rows'])} общих строк; порог 0.2%", new, accepted)
+            if accepted:
+                win = {**challenger, "score": new}
+        except (ValueError, KeyError) as exc:
+            register("family_select", f"{candidate['name']}: {exc}", None, False)
     log(f"Финальный источник: {win['name']} ({metric}={win['score']:.5f})")
 
     if not classification:
@@ -500,6 +518,10 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     # Ступень 2: AutoGluon на фолдах схемы cv.
     ag = None
     ag_budget = remaining() - PREDICT_RESERVE_SEC - kfold_reserve
+    linear_reserve = LINEAR_SEC if linear_search.recipes(prof, target)[0] else 0.0
+    # Reserving a cheap family must not disable an otherwise eligible AutoGluon run.
+    if ag_budget >= 300:
+        ag_budget -= min(linear_reserve, max(0.0, ag_budget - 300))
     log(f"Бюджет AutoGluon {ag_budget:.0f}s (резерв k-fold {kfold_reserve:.0f}s, predict {PREDICT_RESERVE_SEC:.0f}s)")
     if ag_budget >= 300:
         try:
@@ -540,9 +562,14 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
         except Exception:  # noqa: BLE001
             log("quick_oof упал:\n" + traceback.format_exc())
 
+    # Independent family: compare raw/log within Ridge, then challenge the tree winner.
+    linear = linear_search.search(prof, target, min(linear_reserve, remaining() - PREDICT_RESERVE_SEC),
+                                  register=register)
+
     # Ступень 4: бленд, выбор финального источника и постпроцессинг.
     try:
-        return select_final(prof, target, current, quick, cands, best_pred, label_copy=eda["label_copy"])
+        return select_final(prof, target, current, quick, cands, best_pred, label_copy=eda["label_copy"],
+                            extra_cands=[linear] if linear is not None else [])
     except Exception:  # noqa: BLE001
         log("Финальный выбор упал, остаётся последний записанный сабмит:\n" + traceback.format_exc())
         return best_pred
