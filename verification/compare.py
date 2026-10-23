@@ -67,6 +67,12 @@ def dataset(name, seed, public_root=None, max_train_rows=15000, max_test_rows=60
         if name == "wine":
             y = np.array(["class_a", "class_b", "class_c"])[y]
         provenance = "sklearn bundled real dataset"
+    elif name in ("log_regression", "linear_regression"):
+        n = 2400
+        X = pd.DataFrame(np.exp(rng.uniform(-3, 6, size=(n, 4))), columns=[f"x{i}" for i in range(4)])
+        values = np.log1p(X.to_numpy()) if name == "log_regression" else X.to_numpy()
+        y = values @ np.array([3., -2., 1., 0.5]) + rng.normal(0, 0.4, n)
+        metric, provenance = "rmse", f"synthetic {name}; fixed generator, no per-task agent settings"
     elif name == "category_codes":
         n, k = 3200, 64
         codes = rng.randint(k, size=n)

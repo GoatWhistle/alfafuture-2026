@@ -1,0 +1,1140 @@
+{
+  "baseline_commit": "aab56fd3aa33fa7f8ee7fa67547a0d00a7978336",
+  "candidate_source_sha256": {
+    "agent_utils.py": "2b72073655f33563ef11bc121129cd0de9f87677b518298bce0891217dbc672f",
+    "eda_detectors.py": "7f40435e9cbedb571e55dfae041631e028212a911702e89b136dd526ae42f178",
+    "eda_probe.py": "4459dfa8b369e853ffc58b88cea70e3d0287fbb58165a5be70f09f48cd44c1c1",
+    "fe_dsl.py": "d696928886f624426a7f7f9907e755405d113046a85d8bd4653d452217f6bb7c",
+    "fe_search.py": "1dcc4f808d40d10a2a546ff097621fe2f18ee805e521ff2e191262c58e5e55e7",
+    "linear_search.py": "91aad8f449dc66fbaf9da2ac11908b7f06d718774ce8e62ee6c7bac2439b885e",
+    "models.py": "8910396c472448b007a7f78885f6902e2f4e116fdd2a587864887596e6477896",
+    "solution.py": "4a41de0dae51ea010dc47ce03e0bbb7ff13a0cc93d43e7356cc72512b5c868a8",
+    "task_profile.py": "4652e4debabef37caa5f12bf977c8ec8b7eb89fd7e656455fc6e2d0d943ece88",
+    "requirements.txt": "bb0a6f86716d244e45d70f09d38399b5e61df1c1b458434cb604497c31247738"
+  },
+  "environment": {
+    "python": "3.12.12",
+    "platform": "macOS-26.1-arm64-arm-64bit",
+    "cpus_per_worker": 2,
+    "parallel_workers": 2,
+    "llm": false,
+    "autogluon": false,
+    "packages": {
+      "numpy": "1.26.4",
+      "pandas": "2.2.3",
+      "scipy": "1.12.0",
+      "scikit-learn": "1.5.2",
+      "lightgbm": "4.6.0",
+      "psutil": "6.1.1"
+    }
+  },
+  "protocol": {
+    "seeds": [
+      17,
+      29,
+      43
+    ],
+    "local_budget_seconds": 240,
+    "public_budget_seconds": 420,
+    "local_autoeda_seconds": 60,
+    "public_autoeda_seconds": 90,
+    "holdout": "Labels outside task folders; score final submission.csv, not selection OOF.",
+    "public_regression": "15k sampled rows from years 1–4; 6k sampled holdout rows from year 5.",
+    "public_classification": "Stratified train/holdout, capped at 15k/6k.",
+    "local": "25% random holdout; synthetic generators fixed before running.",
+    "limits": "Short-budget, no LLM or AutoGluon; no hidden competition labels. Three splits are not a confidence guarantee.",
+    "memory": "Worker peak RSS sampled every 0.1s; paired processes run concurrently. Runtime differences include measurement noise.",
+    "expected_tracebacks": "Public runs try optional AutoGluon, unavailable in this environment; both versions fall back."
+  },
+  "summary": [
+    {
+      "task": "diabetes",
+      "metric": "rmse",
+      "mean": {
+        "baseline": {
+          "score": 56.635188378370835,
+          "seconds": 3.5686666666666667,
+          "peak_rss_mb": 159.74333333333334
+        },
+        "candidate": {
+          "score": 54.308315047813046,
+          "seconds": 3.604,
+          "peak_rss_mb": 160.92666666666668
+        }
+      },
+      "mean_score_improvement_pct": 4.108529338707786
+    },
+    {
+      "task": "linear_regression",
+      "metric": "rmse",
+      "mean": {
+        "baseline": {
+          "score": 14.152826667374667,
+          "seconds": 28.451333333333334,
+          "peak_rss_mb": 275.1
+        },
+        "candidate": {
+          "score": 0.4276768335723167,
+          "seconds": 28.414,
+          "peak_rss_mb": 274.83
+        }
+      },
+      "mean_score_improvement_pct": 96.97815253713095
+    },
+    {
+      "task": "log_regression",
+      "metric": "rmse",
+      "mean": {
+        "baseline": {
+          "score": 0.554887497559002,
+          "seconds": 13.975666666666665,
+          "peak_rss_mb": 212.56
+        },
+        "candidate": {
+          "score": 0.3915918177185279,
+          "seconds": 13.985,
+          "peak_rss_mb": 215.07333333333332
+        }
+      },
+      "mean_score_improvement_pct": 29.428610404600192
+    },
+    {
+      "task": "nested_segments",
+      "metric": "rmse",
+      "mean": {
+        "baseline": {
+          "score": 0.9026766680527147,
+          "seconds": 9.365,
+          "peak_rss_mb": 197.76
+        },
+        "candidate": {
+          "score": 0.9026766680527147,
+          "seconds": 9.366666666666667,
+          "peak_rss_mb": 198.43
+        }
+      },
+      "mean_score_improvement_pct": 0.0
+    },
+    {
+      "task": "public_classification",
+      "metric": "f1_macro",
+      "mean": {
+        "baseline": {
+          "score": 0.6094819656970193,
+          "seconds": 89.43566666666666,
+          "peak_rss_mb": 365.87666666666667
+        },
+        "candidate": {
+          "score": 0.6094819656970193,
+          "seconds": 88.58966666666666,
+          "peak_rss_mb": 373.07
+        }
+      },
+      "mean_score_improvement_pct": -0.0
+    },
+    {
+      "task": "public_regression",
+      "metric": "rmse",
+      "mean": {
+        "baseline": {
+          "score": 46.21885288462559,
+          "seconds": 40.495,
+          "peak_rss_mb": 388.37333333333333
+        },
+        "candidate": {
+          "score": 46.21885288462559,
+          "seconds": 40.891333333333336,
+          "peak_rss_mb": 443.9166666666667
+        }
+      },
+      "mean_score_improvement_pct": 0.0
+    }
+  ],
+  "runs": [
+    {
+      "task": "diabetes",
+      "seed": 17,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "sklearn bundled real dataset",
+      "seconds": 3.808,
+      "peak_rss_mb": 161.81,
+      "exit_code": 0,
+      "score": 53.848007429528096,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "diabetes",
+      "seed": 17,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "sklearn bundled real dataset",
+      "seconds": 3.71,
+      "peak_rss_mb": 163.47,
+      "exit_code": 0,
+      "score": 53.515299403777334,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "diabetes",
+      "seed": 29,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "sklearn bundled real dataset",
+      "seconds": 3.702,
+      "peak_rss_mb": 159.23,
+      "exit_code": 0,
+      "score": 59.436900732912086,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "diabetes",
+      "seed": 29,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "sklearn bundled real dataset",
+      "seconds": 3.814,
+      "peak_rss_mb": 160.72,
+      "exit_code": 0,
+      "score": 56.061775556475936,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "diabetes",
+      "seed": 43,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "sklearn bundled real dataset",
+      "seconds": 3.196,
+      "peak_rss_mb": 158.19,
+      "exit_code": 0,
+      "score": 56.620656972672315,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "diabetes",
+      "seed": 43,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "sklearn bundled real dataset",
+      "seconds": 3.288,
+      "peak_rss_mb": 158.59,
+      "exit_code": 0,
+      "score": 53.347870183185876,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "linear_regression",
+      "seed": 17,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "synthetic linear_regression; fixed generator, no per-task agent settings",
+      "seconds": 25.247,
+      "peak_rss_mb": 238.83,
+      "exit_code": 0,
+      "score": 16.803915667920723,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "linear_regression",
+      "seed": 17,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "synthetic linear_regression; fixed generator, no per-task agent settings",
+      "seconds": 25.017,
+      "peak_rss_mb": 235.72,
+      "exit_code": 0,
+      "score": 0.43175415365746367,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "linear_regression",
+      "seed": 29,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "synthetic linear_regression; fixed generator, no per-task agent settings",
+      "seconds": 32.26,
+      "peak_rss_mb": 300.67,
+      "exit_code": 0,
+      "score": 13.71631218522665,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "linear_regression",
+      "seed": 29,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "synthetic linear_regression; fixed generator, no per-task agent settings",
+      "seconds": 32.253,
+      "peak_rss_mb": 300.5,
+      "exit_code": 0,
+      "score": 0.4237908236856586,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "linear_regression",
+      "seed": 43,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "synthetic linear_regression; fixed generator, no per-task agent settings",
+      "seconds": 27.847,
+      "peak_rss_mb": 285.8,
+      "exit_code": 0,
+      "score": 11.938252148976627,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "linear_regression",
+      "seed": 43,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "synthetic linear_regression; fixed generator, no per-task agent settings",
+      "seconds": 27.972,
+      "peak_rss_mb": 288.27,
+      "exit_code": 0,
+      "score": 0.4274855233738277,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "log_regression",
+      "seed": 17,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "synthetic log_regression; fixed generator, no per-task agent settings",
+      "seconds": 16.7,
+      "peak_rss_mb": 217.88,
+      "exit_code": 0,
+      "score": 0.5548254297776674,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "log_regression",
+      "seed": 17,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "synthetic log_regression; fixed generator, no per-task agent settings",
+      "seconds": 16.675,
+      "peak_rss_mb": 220.88,
+      "exit_code": 0,
+      "score": 0.3976008053089683,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "log_regression",
+      "seed": 29,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "synthetic log_regression; fixed generator, no per-task agent settings",
+      "seconds": 11.229,
+      "peak_rss_mb": 213.11,
+      "exit_code": 0,
+      "score": 0.5768258926534539,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "log_regression",
+      "seed": 29,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "synthetic log_regression; fixed generator, no per-task agent settings",
+      "seconds": 11.37,
+      "peak_rss_mb": 212.45,
+      "exit_code": 0,
+      "score": 0.38676850231924376,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "log_regression",
+      "seed": 43,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "synthetic log_regression; fixed generator, no per-task agent settings",
+      "seconds": 13.998,
+      "peak_rss_mb": 206.69,
+      "exit_code": 0,
+      "score": 0.533011170245885,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "log_regression",
+      "seed": 43,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "synthetic log_regression; fixed generator, no per-task agent settings",
+      "seconds": 13.91,
+      "peak_rss_mb": 211.89,
+      "exit_code": 0,
+      "score": 0.39040614552737163,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "nested_segments",
+      "seed": 17,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "synthetic nested regimes",
+      "seconds": 9.884,
+      "peak_rss_mb": 210.23,
+      "exit_code": 0,
+      "score": 0.911455013554885,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "nested_segments",
+      "seed": 17,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "synthetic nested regimes",
+      "seconds": 9.781,
+      "peak_rss_mb": 210.97,
+      "exit_code": 0,
+      "score": 0.911455013554885,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "nested_segments",
+      "seed": 29,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "synthetic nested regimes",
+      "seconds": 9.028,
+      "peak_rss_mb": 190.44,
+      "exit_code": 0,
+      "score": 0.9054619822631922,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "nested_segments",
+      "seed": 29,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "synthetic nested regimes",
+      "seconds": 9.055,
+      "peak_rss_mb": 189.34,
+      "exit_code": 0,
+      "score": 0.9054619822631922,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "nested_segments",
+      "seed": 43,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "synthetic nested regimes",
+      "seconds": 9.183,
+      "peak_rss_mb": 192.61,
+      "exit_code": 0,
+      "score": 0.8911130083400669,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "nested_segments",
+      "seed": 43,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "synthetic nested regimes",
+      "seconds": 9.264,
+      "peak_rss_mb": 194.98,
+      "exit_code": 0,
+      "score": 0.8911130083400669,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "public_classification",
+      "seed": 17,
+      "variant": "baseline",
+      "metric": "f1_macro",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 75.717,
+      "peak_rss_mb": 348.09,
+      "exit_code": 0,
+      "score": 0.6147614492072001,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 1
+    },
+    {
+      "task": "public_classification",
+      "seed": 17,
+      "variant": "candidate",
+      "metric": "f1_macro",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 74.472,
+      "peak_rss_mb": 352.12,
+      "exit_code": 0,
+      "score": 0.6147614492072001,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 1
+    },
+    {
+      "task": "public_classification",
+      "seed": 29,
+      "variant": "baseline",
+      "metric": "f1_macro",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 91.881,
+      "peak_rss_mb": 377.02,
+      "exit_code": 0,
+      "score": 0.6319586073402481,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "public_classification",
+      "seed": 29,
+      "variant": "candidate",
+      "metric": "f1_macro",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 90.292,
+      "peak_rss_mb": 393.53,
+      "exit_code": 0,
+      "score": 0.6319586073402481,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "public_classification",
+      "seed": 43,
+      "variant": "baseline",
+      "metric": "f1_macro",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 100.709,
+      "peak_rss_mb": 372.52,
+      "exit_code": 0,
+      "score": 0.5817258405436098,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "public_classification",
+      "seed": 43,
+      "variant": "candidate",
+      "metric": "f1_macro",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 101.005,
+      "peak_rss_mb": 373.56,
+      "exit_code": 0,
+      "score": 0.5817258405436098,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 0
+    },
+    {
+      "task": "public_regression",
+      "seed": 17,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 44.988,
+      "peak_rss_mb": 370.34,
+      "exit_code": 0,
+      "score": 44.21778499078675,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 1
+    },
+    {
+      "task": "public_regression",
+      "seed": 17,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 45.495,
+      "peak_rss_mb": 478.58,
+      "exit_code": 0,
+      "score": 44.21778499078675,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 1
+    },
+    {
+      "task": "public_regression",
+      "seed": 29,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 41.101,
+      "peak_rss_mb": 393.05,
+      "exit_code": 0,
+      "score": 48.42262640494464,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 1
+    },
+    {
+      "task": "public_regression",
+      "seed": 29,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 41.563,
+      "peak_rss_mb": 409.31,
+      "exit_code": 0,
+      "score": 48.42262640494464,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 1
+    },
+    {
+      "task": "public_regression",
+      "seed": 43,
+      "variant": "baseline",
+      "metric": "rmse",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 35.396,
+      "peak_rss_mb": 401.73,
+      "exit_code": 0,
+      "score": 46.016147258145395,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 1
+    },
+    {
+      "task": "public_regression",
+      "seed": 43,
+      "variant": "candidate",
+      "metric": "rmse",
+      "provenance": "competition train; independent local holdout",
+      "seconds": 35.616,
+      "peak_rss_mb": 443.86,
+      "exit_code": 0,
+      "score": 46.016147258145395,
+      "success": true,
+      "autoeda_completed": true,
+      "kfold_completed": true,
+      "tracebacks": 1
+    }
+  ],
+  "decisions": [
+    {
+      "task": "diabetes",
+      "seed": 17,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост -0.05%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"feature_0\",\"feature_1\",\"feature_2\",\"feature_3\",\"feature_4\",\"feature_5\",\"feature_6\",\"feature_7\",\"feature_8\",\"feature_9\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 55.980814000076464,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (58.298015); 331 общих строк; порог 0.2%",
+          "val_score": 55.980814000076464,
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "task": "diabetes",
+      "seed": 29,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост +0.00%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"feature_0\",\"feature_1\",\"feature_2\",\"feature_3\",\"feature_4\",\"feature_5\",\"feature_6\",\"feature_7\",\"feature_8\",\"feature_9\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 55.56785730230035,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (58.432868); 331 общих строк; порог 0.2%",
+          "val_score": 55.56785730230035,
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "task": "diabetes",
+      "seed": 43,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост +0.02%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"feature_0\",\"feature_1\",\"feature_2\",\"feature_3\",\"feature_4\",\"feature_5\",\"feature_6\",\"feature_7\",\"feature_8\",\"feature_9\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 55.53383173685273,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (59.167401); 331 общих строк; порог 0.2%",
+          "val_score": 55.53383173685273,
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "task": "linear_regression",
+      "seed": 17,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост -19.84%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"x0\",\"x1\",\"x2\",\"x3\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 0.4501855693786359,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (20.088408); 1800 общих строк; порог 0.2%",
+          "val_score": 0.4501855693786359,
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "task": "linear_regression",
+      "seed": 29,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост -20.93%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"x0\",\"x1\",\"x2\",\"x3\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 0.4676571112234894,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (21.102101); 1800 общих строк; порог 0.2%",
+          "val_score": 0.4676571112234894,
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "task": "linear_regression",
+      "seed": 43,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост -22.77%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"x0\",\"x1\",\"x2\",\"x3\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 0.46319136452112575,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (19.932118); 1800 общих строк; порог 0.2%",
+          "val_score": 0.46319136452112575,
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "task": "log_regression",
+      "seed": 17,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост +90.65%; выбрано ridge_raw_log; recipe={\"alpha\":1.0,\"columns\":[\"x0\",\"x1\",\"x2\",\"x3\"],\"family\":\"ridge\",\"transform\":\"raw_log\"}",
+          "val_score": 0.39422919457882205,
+          "accepted": true
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw_log против quick_kfold (0.554922); 1800 общих строк; порог 0.2%",
+          "val_score": 0.39422919457882205,
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "task": "log_regression",
+      "seed": 29,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост +90.29%; выбрано ridge_raw_log; recipe={\"alpha\":1.0,\"columns\":[\"x0\",\"x1\",\"x2\",\"x3\"],\"family\":\"ridge\",\"transform\":\"raw_log\"}",
+          "val_score": 0.4100686127952878,
+          "accepted": true
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw_log против quick_kfold (0.611877); 1800 общих строк; порог 0.2%",
+          "val_score": 0.4100686127952878,
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "task": "log_regression",
+      "seed": 43,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост +90.52%; выбрано ridge_raw_log; recipe={\"alpha\":1.0,\"columns\":[\"x0\",\"x1\",\"x2\",\"x3\"],\"family\":\"ridge\",\"transform\":\"raw_log\"}",
+          "val_score": 0.39861014649283405,
+          "accepted": true
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw_log против quick_kfold (0.570901); 1800 общих строк; порог 0.2%",
+          "val_score": 0.39861014649283405,
+          "accepted": true
+        }
+      ]
+    },
+    {
+      "task": "nested_segments",
+      "seed": 17,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост +0.15%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"fine\",\"coarse\",\"x\",\"z\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 3.845025780208349,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (0.936693); 2400 общих строк; порог 0.2%",
+          "val_score": 3.845025780208349,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "task": "nested_segments",
+      "seed": 29,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост -0.12%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"fine\",\"coarse\",\"x\",\"z\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 3.900447008767399,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (0.940968); 2400 общих строк; порог 0.2%",
+          "val_score": 3.900447008767399,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "task": "nested_segments",
+      "seed": 43,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост -0.17%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"fine\",\"coarse\",\"x\",\"z\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 3.9522015216460042,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (0.931174); 2400 общих строк; порог 0.2%",
+          "val_score": 3.9522015216460042,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "task": "public_classification",
+      "seed": 17,
+      "experiments": [
+        {
+          "name": "ridge_skip",
+          "hypothesis": "поддерживается только регрессия",
+          "val_score": null,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "task": "public_classification",
+      "seed": 29,
+      "experiments": [
+        {
+          "name": "ridge_skip",
+          "hypothesis": "поддерживается только регрессия",
+          "val_score": null,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "task": "public_classification",
+      "seed": 43,
+      "experiments": [
+        {
+          "name": "ridge_skip",
+          "hypothesis": "поддерживается только регрессия",
+          "val_score": null,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "task": "public_regression",
+      "seed": 17,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост +34.52%; выбрано ridge_raw_log; recipe={\"alpha\":1.0,\"columns\":[\"Year_Factor\",\"floor_area\",\"year_built\",\"energy_star_rating\",\"ELEVATION\",\"january_min_temp_c\",\"january_avg_temp_c\",\"january_max_temp_c\",\"february_min_temp_c\",\"february_avg_temp_c\",\"february_max_temp_c\",\"march_min_temp_c\",\"march_avg_temp_c\",\"march_max_temp_c\",\"april_min_temp_c\",\"april_avg_temp_c\",\"april_max_temp_c\",\"may_min_temp_c\",\"may_avg_temp_c\",\"may_max_temp_c\",\"june_min_temp_c\",\"june_avg_temp_c\",\"june_max_temp_c\",\"july_min_temp_c\",\"july_avg_temp_c\",\"july_max_temp_c\",\"august_min_temp_c\",\"august_avg_temp_c\",\"august_max_temp_c\",\"september_min_temp_c\",\"september_avg_temp_c\",\"september_max_temp_c\",\"october_min_temp_c\",\"october_avg_temp_c\",\"october_max_temp_c\",\"november_min_temp_c\",\"november_avg_temp_c\",\"november_max_temp_c\",\"december_min_temp_c\",\"december_avg_temp_c\",\"december_max_temp_c\",\"cooling_degree_days_c\",\"heating_degree_days_c\",\"precipitation_inches\",\"snowfall_inches\",\"snowdepth_inches\",\"avg_temp_c\",\"days_below_minus1C\",\"days_below_minus7C\",\"days_below_minus12C\",\"days_below_minus18C\",\"days_above_27C\",\"days_above_32C\",\"days_above_38C\",\"days_above_43C\",\"direction_max_wind_speed\",\"direction_peak_wind_speed\",\"max_wind_speed\",\"days_with_fog\"],\"family\":\"ridge\",\"transform\":\"raw_log\"}",
+          "val_score": 84.62380220870955,
+          "accepted": true
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw_log против quick_kfold (50.915215); 10214 общих строк; порог 0.2%",
+          "val_score": 84.62380220870955,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "task": "public_regression",
+      "seed": 29,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост -6.07%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"Year_Factor\",\"floor_area\",\"year_built\",\"energy_star_rating\",\"ELEVATION\",\"january_min_temp_c\",\"january_avg_temp_c\",\"january_max_temp_c\",\"february_min_temp_c\",\"february_avg_temp_c\",\"february_max_temp_c\",\"march_min_temp_c\",\"march_avg_temp_c\",\"march_max_temp_c\",\"april_min_temp_c\",\"april_avg_temp_c\",\"april_max_temp_c\",\"may_min_temp_c\",\"may_avg_temp_c\",\"may_max_temp_c\",\"june_min_temp_c\",\"june_avg_temp_c\",\"june_max_temp_c\",\"july_min_temp_c\",\"july_avg_temp_c\",\"july_max_temp_c\",\"august_min_temp_c\",\"august_avg_temp_c\",\"august_max_temp_c\",\"september_min_temp_c\",\"september_avg_temp_c\",\"september_max_temp_c\",\"october_min_temp_c\",\"october_avg_temp_c\",\"october_max_temp_c\",\"november_min_temp_c\",\"november_avg_temp_c\",\"november_max_temp_c\",\"december_min_temp_c\",\"december_avg_temp_c\",\"december_max_temp_c\",\"cooling_degree_days_c\",\"heating_degree_days_c\",\"precipitation_inches\",\"snowfall_inches\",\"snowdepth_inches\",\"avg_temp_c\",\"days_below_minus1C\",\"days_below_minus7C\",\"days_below_minus12C\",\"days_below_minus18C\",\"days_above_27C\",\"days_above_32C\",\"days_above_38C\",\"days_above_43C\",\"direction_max_wind_speed\",\"direction_peak_wind_speed\",\"max_wind_speed\",\"days_with_fog\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 102.13349490061208,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (52.072683); 10208 общих строк; порог 0.2%",
+          "val_score": 102.13349490061208,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "task": "public_regression",
+      "seed": 43,
+      "experiments": [
+        {
+          "name": "ridge_transform",
+          "hypothesis": "raw → raw+signed_log1p, прирост -97.20%; выбрано ridge_raw; recipe={\"alpha\":1.0,\"columns\":[\"Year_Factor\",\"floor_area\",\"year_built\",\"energy_star_rating\",\"ELEVATION\",\"january_min_temp_c\",\"january_avg_temp_c\",\"january_max_temp_c\",\"february_min_temp_c\",\"february_avg_temp_c\",\"february_max_temp_c\",\"march_min_temp_c\",\"march_avg_temp_c\",\"march_max_temp_c\",\"april_min_temp_c\",\"april_avg_temp_c\",\"april_max_temp_c\",\"may_min_temp_c\",\"may_avg_temp_c\",\"may_max_temp_c\",\"june_min_temp_c\",\"june_avg_temp_c\",\"june_max_temp_c\",\"july_min_temp_c\",\"july_avg_temp_c\",\"july_max_temp_c\",\"august_min_temp_c\",\"august_avg_temp_c\",\"august_max_temp_c\",\"september_min_temp_c\",\"september_avg_temp_c\",\"september_max_temp_c\",\"october_min_temp_c\",\"october_avg_temp_c\",\"october_max_temp_c\",\"november_min_temp_c\",\"november_avg_temp_c\",\"november_max_temp_c\",\"december_min_temp_c\",\"december_avg_temp_c\",\"december_max_temp_c\",\"cooling_degree_days_c\",\"heating_degree_days_c\",\"precipitation_inches\",\"snowfall_inches\",\"snowdepth_inches\",\"avg_temp_c\",\"days_below_minus1C\",\"days_below_minus7C\",\"days_below_minus12C\",\"days_below_minus18C\",\"days_above_27C\",\"days_above_32C\",\"days_above_38C\",\"days_above_43C\",\"direction_max_wind_speed\",\"direction_peak_wind_speed\",\"max_wind_speed\",\"days_with_fog\"],\"family\":\"ridge\",\"transform\":\"raw\"}",
+          "val_score": 100.97073263180746,
+          "accepted": false
+        },
+        {
+          "name": "family_select",
+          "hypothesis": "ridge_raw против quick_kfold (52.019818); 10203 общих строк; порог 0.2%",
+          "val_score": 100.97073263180746,
+          "accepted": false
+        }
+      ]
+    }
+  ],
+  "paired_submissions": [
+    {
+      "task": "diabetes",
+      "seed": 17,
+      "baseline_sha256": "97eb8137ac66f9ff84c901c742daa6f088d734640c0ec7eb46a97c7c3ca3fd97",
+      "candidate_sha256": "691fd2c8b65fed5aea91bee25f8fda5cad1bef63f1c5817fcae536bb52a2b4f7",
+      "identical": false
+    },
+    {
+      "task": "diabetes",
+      "seed": 29,
+      "baseline_sha256": "75128363e8d2ee9a725ca80768bf8deb3134772af137b55d07550d7d6fff53f5",
+      "candidate_sha256": "5c93c885ac36f972feeb5510af1577f94973f604ddcf4ecc5257b2f0fa7a4bdf",
+      "identical": false
+    },
+    {
+      "task": "diabetes",
+      "seed": 43,
+      "baseline_sha256": "f4b4942b9f9b9045039bd13632f0a1dffa4f9c57e68961108c1c07d21f9c2cf8",
+      "candidate_sha256": "9fe1bb16c9dcfd4023655f61a884c2e737a199c18d1a8f54dd92664df7ff0324",
+      "identical": false
+    },
+    {
+      "task": "linear_regression",
+      "seed": 17,
+      "baseline_sha256": "544ba0f9401016d9d530c72697cefb770f5739edfaf887e56f7f843d89adbd1d",
+      "candidate_sha256": "b9abdfbc66f91ccf5f618ef3e61a64e6bdddca5ecfd72578570e7dc676962adc",
+      "identical": false
+    },
+    {
+      "task": "linear_regression",
+      "seed": 29,
+      "baseline_sha256": "bc150f2bae5bc297051897b9b168516512e3f53324b71bcbf10ad5e3a6aef9b3",
+      "candidate_sha256": "9ab5fc48e2b155a7045c2bb7f31332148af0ef29c34de909c7802f795cbee494",
+      "identical": false
+    },
+    {
+      "task": "linear_regression",
+      "seed": 43,
+      "baseline_sha256": "f9eac04d5b209bcedd9f9303731c6cb9edea1136e95777da7c57f51bed72d675",
+      "candidate_sha256": "35d7780a5305ad6262eb5f98f5fa7526c26f33c0d446eb7128ce42169bb7d9a5",
+      "identical": false
+    },
+    {
+      "task": "log_regression",
+      "seed": 17,
+      "baseline_sha256": "f0ef6e0955f9b845c2fc6d43a655812331265dee05ea17da2ac5c8fa0463a186",
+      "candidate_sha256": "a05832f0a330e7293efce13afbbe21efa8648f3a1e082e6d9531921242bc95e3",
+      "identical": false
+    },
+    {
+      "task": "log_regression",
+      "seed": 29,
+      "baseline_sha256": "2c1917234b5fad9a076d45847f6ea7cd2955b207797180a11fdf761a4fee5dcc",
+      "candidate_sha256": "6cd5a72aa5f5812d39c7400ef36b4ed9af16fadd140538cb3960df715823f2e2",
+      "identical": false
+    },
+    {
+      "task": "log_regression",
+      "seed": 43,
+      "baseline_sha256": "d56244f0dd194d839c2d37e6bb919721f05faf3b8b022723bd7ce23e7a21b64e",
+      "candidate_sha256": "0b65c2920dd58ba44a931927a023c2f35f0516771f3c084e09e6a97876ee597d",
+      "identical": false
+    },
+    {
+      "task": "nested_segments",
+      "seed": 17,
+      "baseline_sha256": "8b2ebb3c96f0a7e5d6201b03e0c444ca507b8f03899111d5bde77fbb181db442",
+      "candidate_sha256": "8b2ebb3c96f0a7e5d6201b03e0c444ca507b8f03899111d5bde77fbb181db442",
+      "identical": true
+    },
+    {
+      "task": "nested_segments",
+      "seed": 29,
+      "baseline_sha256": "befeb127305404b494e70308c8168d93f951cb5a068ac24cc855acac58089c88",
+      "candidate_sha256": "befeb127305404b494e70308c8168d93f951cb5a068ac24cc855acac58089c88",
+      "identical": true
+    },
+    {
+      "task": "nested_segments",
+      "seed": 43,
+      "baseline_sha256": "c16fc7343d8cdfb812ebfc31c7b7f24966341d013ed64154fd0a34d1c34e5fd3",
+      "candidate_sha256": "c16fc7343d8cdfb812ebfc31c7b7f24966341d013ed64154fd0a34d1c34e5fd3",
+      "identical": true
+    },
+    {
+      "task": "public_classification",
+      "seed": 17,
+      "baseline_sha256": "71c262535ae3b648e6cf3410ca6b36233a1570dd8c585a9a8cb6a651dc1a14d1",
+      "candidate_sha256": "71c262535ae3b648e6cf3410ca6b36233a1570dd8c585a9a8cb6a651dc1a14d1",
+      "identical": true
+    },
+    {
+      "task": "public_classification",
+      "seed": 29,
+      "baseline_sha256": "34441d9ee1b1907e7ae9262b184898af3f07058cfa39eb3ad5cdd8d2d446fc95",
+      "candidate_sha256": "34441d9ee1b1907e7ae9262b184898af3f07058cfa39eb3ad5cdd8d2d446fc95",
+      "identical": true
+    },
+    {
+      "task": "public_classification",
+      "seed": 43,
+      "baseline_sha256": "0e6ed723f516fcfc598d9d27564628e2cdb5572a82a1a541bc9abc208d99ebae",
+      "candidate_sha256": "0e6ed723f516fcfc598d9d27564628e2cdb5572a82a1a541bc9abc208d99ebae",
+      "identical": true
+    },
+    {
+      "task": "public_regression",
+      "seed": 17,
+      "baseline_sha256": "5d4c9e91109a19c61d27034845af4867410b98189eaff60d48e2aa71f55e497d",
+      "candidate_sha256": "5d4c9e91109a19c61d27034845af4867410b98189eaff60d48e2aa71f55e497d",
+      "identical": true
+    },
+    {
+      "task": "public_regression",
+      "seed": 29,
+      "baseline_sha256": "bd490915aaa98bd0acbea4ca47bb9b192aae88f2a27e3469c47e18e842188c45",
+      "candidate_sha256": "bd490915aaa98bd0acbea4ca47bb9b192aae88f2a27e3469c47e18e842188c45",
+      "identical": true
+    },
+    {
+      "task": "public_regression",
+      "seed": 43,
+      "baseline_sha256": "a85b20a3e41ded3908364d1169de2deb0f533721937e712eaa970ea0fd786afa",
+      "candidate_sha256": "a85b20a3e41ded3908364d1169de2deb0f533721937e712eaa970ea0fd786afa",
+      "identical": true
+    }
+  ],
+  "tests": [
+    {
+      "tests": "88",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "1",
+      "time": "133.894"
+    }
+  ]
+}
