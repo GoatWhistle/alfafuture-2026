@@ -374,8 +374,11 @@ def run_autogluon(prof: dict, target: str, budget: float) -> dict | None:
     """AutoGluon как кандидат на фолдах схемы prof["cv"].
 
     Фолды покрывают все строки (kfold/group) — бэггинг AutoGluon идёт по ним,
-    OOF сопоставим с k-fold LightGBM. Temporal — holdout-fit на прошлом с
-    оценкой на последнем периоде, затем fit на всём train для test.
+    OOF сопоставим с k-fold LightGBM; target-признаков AutoGluon здесь не
+    получает (бэггинг по фолдам протёк бы через них). Temporal — holdout-fit
+    на прошлом с оценкой на последнем периоде, затем fit на всём train для
+    test; target-признаки строятся только по прошлому (fit-строки — по
+    более ранним периодам, holdout и test — по всему fit), утечки нет.
     """
     lab = labeled(prof, target)
     y = lab[target].to_numpy()
@@ -395,15 +398,20 @@ def run_autogluon(prof: dict, target: str, budget: float) -> dict | None:
     else:
         t0 = time.time()
         tr, va = folds[-1]
-        holdout = fit_autogluon(prof, target, 0.35 * budget, rows=lab.index[tr])
-        h_pred, h_proba, h_classes = ag_predict(prof, holdout, target, frame=lab.iloc[va])
+        F_tr, F_va = models.target_features(prof, target, lab.iloc[tr], lab.iloc[va])
+        holdout = fit_autogluon(prof, target, 0.35 * budget, rows=lab.index[tr], extra=F_tr)
+        h_pred, h_proba, h_classes = ag_predict(prof, holdout, target, frame=lab.iloc[va], extra=F_va)
         rest = budget - (time.time() - t0)
         if rest >= 300:
-            predictor = fit_autogluon(prof, target, rest)
+            F_all, F_te = models.target_features(prof, target, lab, prof["test"])
+            predictor = fit_autogluon(prof, target, rest, extra=F_all)
         else:
             log("AutoGluon: на fit по всему train не осталось времени — test предсказывает holdout-модель")
             predictor = holdout
-        test_pred, test_proba, classes = ag_predict(prof, predictor, target)
+            _, F_te = models.target_features(prof, target, lab.iloc[tr], prof["test"])
+            if F_te is not None and F_tr is not None:
+                F_te = F_te.reindex(columns=F_tr.columns)
+        test_pred, test_proba, classes = ag_predict(prof, predictor, target, extra=F_te)
         oof = h_pred if regression else align_classes(h_proba, h_classes, classes)
         cand.update(test_pred=test_pred, test=test_pred if regression else test_proba, classes=classes,
                     rows=lab.index.to_numpy()[va], y=y[va], oof=oof)
@@ -429,8 +437,12 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
         return t_end - time.time()
 
     # Ступень 1: быстрый LightGBM — ранний валидный сабмит.
+    kfold_reserve = KFOLD_RESERVE_SEC
     try:
+        tq = time.time()
         quick = quick_model(prof, target, deadline_ts=t_end)
+        # k-fold ≈ N_FOLDS + 1 таких обучений (+ target-признаки): резерв по факту, не больше заданного.
+        kfold_reserve = float(np.clip(10 * (time.time() - tq), 120, KFOLD_RESERVE_SEC))
         current[target] = quick["test_pred"]
         write_submission(prof, current)
         best_pred = current[target]
@@ -441,7 +453,7 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     # Ступень 1.5: AutoEDA — детекторы, гипотезы Qwen, валидатор на фолдах под тест.
     prof.setdefault("base_features", list(prof["features"]))
     eda = {"period": None, "label_copy": False, "accepted": []}
-    spare = remaining() - PREDICT_RESERVE_SEC - KFOLD_RESERVE_SEC
+    spare = remaining() - PREDICT_RESERVE_SEC - kfold_reserve
     eda_budget = min(AUTOEDA_SEC, 0.3 * spare)
     if eda_budget >= MIN_AUTOEDA_SEC:
         # AutoEDA работает на копии профиля под лимитом времени: зависшее построение признаков
@@ -480,7 +492,8 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
 
     # Ступень 2: AutoGluon на фолдах схемы cv.
     ag = None
-    ag_budget = remaining() - PREDICT_RESERVE_SEC - KFOLD_RESERVE_SEC
+    ag_budget = remaining() - PREDICT_RESERVE_SEC - kfold_reserve
+    log(f"Бюджет AutoGluon {ag_budget:.0f}s (резерв k-fold {kfold_reserve:.0f}s, predict {PREDICT_RESERVE_SEC:.0f}s)")
     if ag_budget >= 300:
         try:
             ag = run_autogluon(prof, target, ag_budget)

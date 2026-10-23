@@ -59,3 +59,28 @@ def test_autogluon_classification_strings(monkeypatch):
 def _cleanup_ag():
     yield
     models.cleanup_autogluon()
+
+
+def test_autogluon_temporal_gets_past_only_target_features(monkeypatch):
+    from test_independence import SPECS
+
+    df = panel(n_obj=100)
+    test = panel(n_obj=10, seed=1).drop(columns="y")
+    test["per"] = 5.0
+    prof = {"train": df, "test": test, "problem_type": "regression", "metric": "rmse",
+            "ag_metric": "root_mean_squared_error", "features": ["x", "x2", "per"], "log_target": False,
+            "output_proba": False, "cv": {"kind": "temporal", "period": "per"}, "target_specs": [SPECS[0]],
+            "model_ops": {}}
+    monkeypatch.setattr(models, "N_CPUS", 2)
+    fitted = []
+    real_fit = solution.fit_autogluon
+
+    def spy(*a, **k):
+        fitted.append(k.get("extra"))
+        return real_fit(*a, **k)
+
+    monkeypatch.setattr(solution, "fit_autogluon", spy)
+    cand = solution.run_autogluon(prof, "y", 700)
+    assert all(e is not None and e.shape[1] > 0 for e in fitted)
+    # Объектный уровень таргета из прошлого делает AutoGluon заметно точнее разброса таргета.
+    assert cand["score"] < 0.5 * df["y"].std()

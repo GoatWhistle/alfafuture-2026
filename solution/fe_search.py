@@ -105,7 +105,13 @@ def fit_predict(ctx: dict, Xtr, ytr, Xva, yva, fast: bool = False, objective: di
         proba[:, pos[present[0]]] = 1.0
         return proba, None
     m = lgb.LGBMClassifier(**params)
-    m.fit(Xtr, ytr, eval_set=[(Xva, yva)], callbacks=cb)
+    # Ранняя остановка — по строкам val с классами, известными модели (сегмент может не видеть редкий класс).
+    seen = np.isin(np.asarray(yva), present)
+    if seen.sum() == 0:
+        m.set_params(n_estimators=100)
+        m.fit(Xtr, ytr, callbacks=cb[2:])
+    else:
+        m.fit(Xtr, ytr, eval_set=[(Xva[seen], np.asarray(yva)[seen])], callbacks=cb)
     proba[:, [pos[c] for c in m.classes_]] = m.predict_proba(Xva)
     return proba, m
 
@@ -455,7 +461,11 @@ class Search:
             if not self.ev.fits(deadline):
                 log(f"AutoEDA: этап A остановлен по времени, оценено {len(done)}/{len(specs)}")
                 break
-            scores = self.ev.run([spec])
+            try:
+                scores = self.ev.run([spec])
+            except Exception as exc:  # noqa: BLE001 — одна кривая спека не роняет поиск
+                log(f"AutoEDA: спека {fe_dsl.describe(spec)} упала при оценке: {type(exc).__name__}: {exc}")
+                continue
             if scores is None:
                 continue
             mean, lcb = _gain(metric, scores, self.base)
@@ -482,7 +492,11 @@ class Search:
                 break
             if spec["op"] in fe_dsl.MODEL_OPS and any(a["op"] == spec["op"] for a in accepted):
                 continue
-            scores = self.ev.run(accepted + [spec])
+            try:
+                scores = self.ev.run(accepted + [spec])
+            except Exception as exc:  # noqa: BLE001
+                log(f"AutoEDA: спека {fe_dsl.describe(spec)} упала на этапе B: {type(exc).__name__}: {exc}")
+                continue
             if scores is None:
                 continue
             mean, lcb = _gain(metric, scores, cur)

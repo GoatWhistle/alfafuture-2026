@@ -170,3 +170,22 @@ def test_quick_oof_follows_scheme(cv):
     assert np.isfinite(kq["oof"]).all() and len(kq["test"]) == len(test)
     if cv["kind"] == "temporal":
         assert set(df.loc[kq["rows"], "per"]) == {3.0, 4.0}
+
+
+def test_segment_without_rare_class_does_not_crash():
+    """Сегмент, в train которого нет редкого класса, а в val он есть: обе ветки (валидатор и k-fold)."""
+    import fe_search
+
+    rng = np.random.RandomState(0)
+    n = 1200
+    seg = (np.arange(n) % 2).astype(float)
+    y = np.where(rng.rand(n) < 0.5, "a", "b").astype(object)
+    rare = np.flatnonzero(seg == 1)[:3]
+    y[rare] = "rare"
+    X = pd.DataFrame({"x": rng.randn(n), "seg": seg})
+    ctx = {"ptype": "multiclass", "metric": "f1_macro", "classes": ["a", "b", "rare"], "deadline": 1e12}
+    tr = np.setdiff1d(np.arange(n), rare)
+    va = np.concatenate([rare, np.arange(0, 400, 2)])
+    out = fe_search.fit_predict_segmented(ctx, X.iloc[tr].reset_index(drop=True), y[tr], X.iloc[va].reset_index(drop=True),
+                                          y[va], seg[tr], seg[va])
+    assert out.shape == (len(va), 3)
