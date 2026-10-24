@@ -75,7 +75,9 @@ def test_fallback_score_is_reported_but_not_counted_as_completed_autogluon(tmp_p
         record = dict(task='case', seed=17, mode=mode, metric='f1_macro', target='target',
                       success=complete, autogluon_evaluated=complete, submission_valid=True,
                       score=value, seconds=10, peak_tree_rss_mib=100, llm_cost_rub=0,
-                      telemetry={}, input_sha256={name:hashlib.sha256((folder/name).read_bytes()).hexdigest()
+                      telemetry={'autogluon': [dict(status='complete', seconds=8)] if complete
+                                 else [dict(status='running', budget=600)]},
+                      input_sha256={name:hashlib.sha256((folder/name).read_bytes()).hexdigest()
                           for name in ['train.csv', 'test.csv']})
         if complete:
             record['autogluon_standalone_score'] = value
@@ -95,6 +97,9 @@ def test_fallback_score_is_reported_but_not_counted_as_completed_autogluon(tmp_p
     stats = result['summary'][0]
     assert stats['paired_seeds'] == []
     assert stats['delivered_paired_seeds'] == [17]
+    assert stats['mean']['legacy']['autogluon_seconds'] == 8
+    assert stats['mean']['iterative']['autogluon_seconds'] is None
+    assert stats['mean']['iterative']['autogluon_timing_observations'] == 0
     for mode, value in [('legacy', .8), ('iterative', .7)]:
         assert stats['mean'][mode]['score'] is None
         assert stats['mean'][mode]['delivered_score'] == value
