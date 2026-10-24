@@ -286,3 +286,31 @@ python verification/research_curve.py --source solution --output .scratch/resear
 копируется в протокол или каталоги задач. Автоматическое объединение веток
 рецептов, ансамбль из всего портфеля, изменение целевой переменной и модели
 нулевой/ненулевой части ответа остаются следующими этапами.
+
+## Сравнение полного каскада с AutoGluon
+
+[verification/full_cascade.py](../verification/full_cascade.py) запускает рабочий
+`solution.main` в обоих режимах: исследование, AutoGluon, LightGBM по фолдам,
+выбор/смесь и постобработка. Оба получают 3000 секунд общего времени;
+исследование ограничено 600 секундами и долей 0.3. Остаток используется каскадом
+по обычным правилам. Это отдельный протокол от исследования без AutoGluon.
+
+```bash
+python verification/full_cascade.py --source solution \
+  --output .scratch/benchmarks/alfa-full-cascade \
+  --credentials-file /path/to/local-credentials.json \
+  --tasks public_regression public_classification --seeds 17 29 \
+  --total-seconds 3000 --jobs 2
+python verification/summarize_full_cascade.py .scratch/benchmarks/alfa-full-cascade \
+  --output verification/alfa-full-cascade-results.json
+```
+
+Выходной каталог должен быть новым. Сводка создаётся после всех запусков,
+проверяет хэши кода и входов, одинаковые данные в паре, отсутствие контрольных
+меток во входном test и пересечений ID train/holdout. Валидный CSV, завершённый
+каскад и фактически оценённый AutoGluon учитываются раздельно. Дополнительный
+CSV AutoGluon сохраняется до смешивания и постобработки; это компонент того же
+запуска, а не самостоятельный контроль с равным бюджетом.
+
+Протокол, ограничения среды и разбор выбора моделей — в
+[отчёте полного каскада](../verification/alfa-full-cascade-results.md).
