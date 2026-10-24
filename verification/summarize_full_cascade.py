@@ -15,6 +15,18 @@ def mean(values):
     return statistics.mean(values) if values else None
 
 
+def stage_seconds(record, stage):
+    events = record['telemetry'].get(stage, [])
+    if any('seconds' not in event for event in events):
+        return None
+    return sum(event['seconds'] for event in events)
+
+
+def complete_mean(values):
+    values = list(values)
+    return None if any(value is None for value in values) else mean(values)
+
+
 def recover_lightgbm(root, folder, record, train):
     """Post-hoc diagnosis only: invert a regression blend when clipping lost no information."""
     if record['metric'] != 'rmse' or not (record.get('final_source') or '').startswith('blend '):
@@ -72,6 +84,8 @@ def summarize(root):
         log = (folder/'log.txt').read_text(errors='replace')
         r['ray_worker_error_messages'] = log.count('The worker died unexpectedly')
         r['watchdog_triggered'] = 'Жёсткий дедлайн: останавливаю работу' in log
+        for stage in ['research', 'autogluon']:
+            r[f'{stage}_seconds_recorded'] = stage_seconds(r, stage)
         r['selection_validation'] = [dict(candidate=name, metric=r['metric'],
                                           score=float(value), rows=int(count))
             for name,value,count in re.findall(
@@ -113,8 +127,10 @@ def summarize(root):
                 delivered_score=mean(r['score'] for r in subset if r['seed'] in delivered_seeds),
                 seconds=mean(r['seconds'] for r in subset),
                 peak_tree_rss_mib=mean(r['peak_tree_rss_mib'] for r in subset),
-                research_seconds=mean(sum(e.get('seconds',0) for e in r['telemetry'].get('research',[])) for r in subset),
-                autogluon_seconds=mean(sum(e.get('seconds',0) for e in r['telemetry'].get('autogluon',[])) for r in subset),
+                research_seconds=complete_mean(r['research_seconds_recorded'] for r in subset),
+                autogluon_seconds=complete_mean(r['autogluon_seconds_recorded'] for r in subset),
+                research_timing_observations=sum(r['research_seconds_recorded'] is not None for r in subset),
+                autogluon_timing_observations=sum(r['autogluon_seconds_recorded'] is not None for r in subset),
                 llm_cost_rub=mean(r['llm_cost_rub'] for r in subset))
         summary.append(dict(task=task,metric=rows[0]['metric'],paired_seeds=sorted(paired_seeds),
                             delivered_paired_seeds=sorted(delivered_seeds),mean=stats))
@@ -138,6 +154,7 @@ def summarize(root):
                     'Both modes use tabular[all], a wider optional backend set than the repository requirements.',
                     'Selection validation scores are parsed from logs and rounded to five decimals.',
                     'Delivered score includes valid fallback CSVs from incomplete pipelines; full-cascade score excludes them.',
+                    'Stage timing is null if interrupted before telemetry persisted elapsed seconds; it is never imputed as zero.',
                     'Reported API cost comes from returned usage and may omit charged timed-out requests.'])
 
 
