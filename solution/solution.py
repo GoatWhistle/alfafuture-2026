@@ -319,6 +319,21 @@ def _cand_score(metric: str, c: dict) -> float:
     return score(metric, c["y"], pred, proba=c["oof"], labels=c["classes"])
 
 
+def _dump_candidates(cands: list[dict], target: str) -> None:
+    """Отладка (AGENT_DUMP_CANDS=каталог): test-прогнозы и OOF-скор каждого кандидата для офлайн-анализа."""
+    out = os.environ.get("AGENT_DUMP_CANDS")
+    if not out:
+        return
+    try:
+        d = Path(out) / str(target)
+        d.mkdir(parents=True, exist_ok=True)
+        for c in cands:
+            np.save(d / f"{c['name']}.npy", np.asarray(c["test"]))
+        (d / "scores.json").write_text(json.dumps({c["name"]: c["score"] for c in cands}, default=float))
+    except Exception as exc:  # noqa: BLE001
+        log(f"дамп кандидатов не записан: {exc}")
+
+
 CONTROL_SHARE = 0.3
 CONTROL_MIN_ROWS = 300
 
@@ -400,6 +415,7 @@ def select_final(prof, target, current, quick, cands, fallback, label_copy=False
     for c in cands[1:]:
         if is_better(metric, c["score"], win["score"]):
             win = c
+    _dump_candidates(cands, target)
     log(f"Финальный источник: {win['name']} ({metric}={win['score']:.5f})")
 
     if not classification:
@@ -519,6 +535,20 @@ def run_autogluon(prof: dict, target: str, budget: float) -> dict | None:
     return cand
 
 
+def _best_target_scale(cands: list[dict], metric: str) -> str | None:
+    """Преобразование таргета (log1p/sqrt), с которым LightGBM пула обошёл k-fold LightGBM на исходной шкале."""
+    base = next((c for c in cands if c["name"] == "quick_kfold"), None)
+    if base is None or base.get("classes") is not None:
+        return None
+    best = None
+    for c in cands:
+        if c["name"] in ("lgbm_log1p", "lgbm_sqrt") and c.get("score") is not None:
+            ref = best["score"] if best else base["score"]
+            if _clearly_better(metric, c["score"], ref):
+                best = c
+    return best["recipe"]["tf"] if best else None
+
+
 def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget: float) -> np.ndarray:
     """Решает одну целевую колонку, по ходу обновляя submission.csv.
 
@@ -600,8 +630,8 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
         try:
             tk = time.time()
             kq = quick_oof(prof, target, deadline_ts=t_end - PREDICT_RESERVE_SEC)
-            lgbm_sec = time.time() - tk
             if kq is not None:
+                lgbm_sec = time.time() - tk
                 register("quick_oof", "k-fold LightGBM: OOF-база для бленда", kq["score"], True, duration=lgbm_sec)
                 cands.append({"name": "quick_kfold", **kq})
         except Exception as exc:  # noqa: BLE001
@@ -623,6 +653,10 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
             best_pred = select_final(prof, target, current, quick, cands, best_pred, label_copy=eda["label_copy"])
         except Exception:  # noqa: BLE001
             log("Промежуточный выбор упал:\n" + traceback.format_exc())
+
+    prof["ag_tf"] = _best_target_scale(cands, metric)
+    if prof["ag_tf"]:
+        log(f"AutoGluon обучается в шкале {prof['ag_tf']} (выиграла у исходной в пуле)")
 
     # Ступень 4: AutoGluon на фолдах схемы cv.
     ag_budget = remaining() - PREDICT_RESERVE_SEC
@@ -674,7 +708,7 @@ def main() -> None:
     base_state = {"train": prof["train"], "test": prof["test"], "features": list(prof["features"])}
     for i, t in enumerate(targets):
         prof.update(base_state, features=list(base_state["features"]), target=t, **prof["per_target"][t])
-        for k in ("base_features", "model_ops", "target_specs", "cv"):
+        for k in ("base_features", "model_ops", "target_specs", "cv", "ag_tf"):
             prof.pop(k, None)
         # Бюджет — от фактически оставшегося времени на оставшиеся таргеты.
         budget = time_left() / (len(targets) - i)

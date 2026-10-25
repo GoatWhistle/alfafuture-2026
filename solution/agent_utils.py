@@ -13,7 +13,7 @@ START = time.time()
 # Полный лимит платформы — 3 часа. Резерв на предикт/запись — отдельно.
 TOTAL_BUDGET_SEC = float(os.environ.get("AGENT_TIME_LIMIT_SEC", 3 * 3600))
 # Жёсткий запас: к этому моменту submission.csv уже должен лежать финальный.
-SAFETY_SEC = float(os.environ.get("AGENT_SAFETY_SEC", 600))
+SAFETY_SEC = float(os.environ.get("AGENT_SAFETY_SEC", 420))
 # Сторожевой поток завершает процесс за столько секунд до лимита, что бы ни висело.
 HARD_MARGIN_SEC = float(os.environ.get("AGENT_HARD_MARGIN_SEC", 120))
 

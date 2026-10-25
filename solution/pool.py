@@ -636,6 +636,29 @@ def plan(prof: dict, target: str) -> list[dict]:
 
 TF_FAMILIES = ("lgbm", "catboost", "xgboost", "extratrees")
 EXTRA_SEEDS = 2
+# Каталог допустимых значений LightGBM для поиска (#12): строки сэмплируются вместе с ненулевой частотой.
+LGBM_CATALOG = {
+    "learning_rate": [0.02, 0.03, 0.05, 0.08],
+    "num_leaves": [15, 31, 63, 127, 255],
+    "min_child_samples": [5, 20, 50, 100],
+    "colsample_bytree": [0.3, 0.5, 0.7, 0.9],
+    "subsample": [0.6, 0.8, 1.0],
+    "reg_alpha": [0.0, 0.1, 1.0],
+    "reg_lambda": [0.0, 1.0, 5.0, 20.0],
+}
+SEARCH_TRIALS = 4
+
+
+def lgbm_search_recipes(n: int, seed: int = 0) -> list[dict]:
+    """n конфигураций из LGBM_CATALOG (детерминированно); subsample<1 включается с subsample_freq=1."""
+    rng = np.random.RandomState(seed)
+    out = []
+    for i in range(n):
+        p = {k: v[rng.randint(len(v))] for k, v in LGBM_CATALOG.items()}
+        p["subsample_freq"] = 1 if p["subsample"] < 1 else 0
+        out.append({"name": f"lgbm_rs{i + 1}", "family": "lgbm", "params": p,
+                    "why": "поиск регуляризации/сэмплирования LightGBM по каталогу"})
+    return out
 
 
 def run_pool(prof: dict, target: str, deadline_ts: float, lgbm_sec: float, register=None,
@@ -708,6 +731,11 @@ def run_pool(prof: dict, target: str, deadline_ts: float, lgbm_sec: float, regis
                      why=f"другой seed лучшего рецепта {best['name']}")
             if attempt(r) is None:
                 break
+    for r in lgbm_search_recipes(SEARCH_TRIALS):
+        if fd.regression and best_tf() is not None:
+            r = {**r, "tf": best_tf(), "name": f"{r['name']}_{best_tf()}"}
+        if attempt(r) is None and deadline_ts - time.time() < COST["lgbm"] * lgbm_sec:
+            break
     return out
 
 

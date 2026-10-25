@@ -209,3 +209,13 @@ def test_run_pool_propagates_transform_and_adds_seeds(monkeypatch):
     assert "extratrees_log1p" in names                       # лучшая шкала перенесена на другое семейство
     assert any(n.endswith("_s1") for n in names)              # доп. seed лучшего рецепта
     assert len(log_journal) == len(out)
+
+
+def test_lgbm_search_catalog_consistent():
+    recs = pool.lgbm_search_recipes(6)
+    assert len({str(r["params"]) for r in recs}) == len(recs)        # разные конфигурации — разные идентичности
+    for r in recs:
+        p = r["params"]
+        assert all(p[k] in v for k, v in pool.LGBM_CATALOG.items())
+        assert (p["subsample_freq"] > 0) == (p["subsample"] < 1)     # сэмплирование строк реально включено
+    assert recs == pool.lgbm_search_recipes(6)                       # детерминированно

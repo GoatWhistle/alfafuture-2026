@@ -81,6 +81,11 @@ def score(metric: str, y_true, y_pred, proba=None, labels=None) -> float:
         return float(sm.mean_absolute_percentage_error(y_true, y_pred))
     if metric == "r2":
         return float(sm.r2_score(y_true, y_pred))
+    if metric in ("f1_macro", "f1_weighted", "balanced_accuracy", "accuracy"):
+        # object-массив числовых меток sklearn считает неизвестным типом таргета: общие коды для y_true и y_pred.
+        yt, yp = np.asarray(y_true), np.asarray(y_pred)
+        codes, _ = pd.factorize(pd.Series([*yt, *yp], dtype=object), sort=False)
+        y_true, y_pred = codes[:len(yt)], codes[len(yt):]
     if metric == "f1_macro":
         return float(sm.f1_score(y_true, y_pred, average="macro"))
     if metric == "f1_weighted":
@@ -336,7 +341,8 @@ def outer_folds(prof: dict, lab: pd.DataFrame, y, n_splits: int = N_FOLDS) -> li
         log("outer_folds: групп меньше двух, беру KFold")
     ys = pd.Series(np.asarray(y, dtype=object))
     if prof["problem_type"] != "regression" and ys.value_counts().min() >= n_splits:
-        return list(StratifiedKFold(n_splits, shuffle=True, random_state=7).split(np.arange(n), ys))
+        codes, _ = pd.factorize(ys, sort=False)
+        return list(StratifiedKFold(n_splits, shuffle=True, random_state=7).split(np.arange(n), codes))
     return list(KFold(n_splits, shuffle=True, random_state=7).split(np.arange(n)))
 
 
@@ -790,6 +796,11 @@ def fit_autogluon(prof: dict, target: str, time_budget: float, rows=None, folds=
         features = features + list(extra.columns)
     if prof["log_target"]:
         df[target] = np.log1p(df[target].clip(lower=0))
+    elif prof.get("ag_tf"):
+        import pool
+
+        # Шкала таргета, которую пул признал лучшей (log1p/sqrt); обратное — в ag_predict/ag_oof.
+        df[target] = pool._forward(df[target].to_numpy(float), prof["ag_tf"])
     extra: dict = {}
     if folds is not None and rows is None and len(np.unique(folds)) >= 2 and (np.asarray(folds) >= 0).all():
         df[FOLD_COL] = np.asarray(folds)
@@ -851,6 +862,10 @@ def ag_predict(prof: dict, predictor, target: str, frame: pd.DataFrame | None = 
         pred = predictor.predict(X).to_numpy()
         if prof["log_target"]:
             pred = np.clip(np.expm1(pred), 0, None)
+        elif prof.get("ag_tf"):
+            import pool
+
+            pred = np.clip(pool._inverse(pred, prof["ag_tf"]), 0, None)
         return pred, None, None
     proba = predictor.predict_proba(X)
     classes = list(proba.columns)
@@ -867,6 +882,10 @@ def ag_oof(predictor, prof: dict, target: str):
             vals = oof.to_numpy()
             if prof["log_target"]:
                 vals = np.clip(np.expm1(vals), 0, None)
+            elif prof.get("ag_tf"):
+                import pool
+
+                vals = np.clip(pool._inverse(vals, prof["ag_tf"]), 0, None)
             return rows, train.loc[rows, target].to_numpy(), vals, None, None
         proba = predictor.predict_proba_oof()
         rows = proba.index.to_numpy()

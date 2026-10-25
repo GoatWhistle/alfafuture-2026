@@ -154,8 +154,8 @@ cd solution && uvx --python 3.12 --with numpy==1.26.4 --with pandas==2.2.3 \
 
 ## Тайм-менеджмент
 
-Бюджет 3 ч (`AGENT_TIME_LIMIT_SEC` для локальных тестов), запас 10 мин
-(`AGENT_SAFETY_SEC`) + резерв 15 мин на predict (`AGENT_PREDICT_RESERVE_SEC`).
+Бюджет 3 ч (`AGENT_TIME_LIMIT_SEC` для локальных тестов), запас 7 мин
+(`AGENT_SAFETY_SEC`) + резерв 8 мин на predict (`AGENT_PREDICT_RESERVE_SEC`).
 Каждый таргет работает до абсолютного времени окончания (`solve_target`:
 `t_end`), этапы получают остаток от него. Ограничители:
 

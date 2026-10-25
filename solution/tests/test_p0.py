@@ -229,3 +229,10 @@ def test_losing_quick_with_new_features_keeps_original(tmp_path, monkeypatch):
     assert (current["target"] == 1).all()
     out = pd.read_csv(tmp_path / "submission.csv")
     assert (out["target"] == 1).all()
+
+
+def test_numeric_labels_in_object_arrays():
+    y = np.array([1, 2, 3, 1, 2, 3], dtype=object)
+    p = np.array([1, 2, 2, 1, 2, 3], dtype=object)
+    assert models.score("f1_macro", y, p) == pytest.approx(models.score("f1_macro", y.astype(int), p.astype(int)))
+    assert models.score("accuracy", y, p) == pytest.approx(5 / 6)
