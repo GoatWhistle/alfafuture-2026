@@ -13,6 +13,7 @@ AutoEDA (детекторы зависимостей + гипотезы Qwen -> 
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -37,6 +38,7 @@ import eda_detectors
 import fe_dsl
 import fe_search
 import models
+import pool
 from models import (
     ag_oof,
     ag_predict,
@@ -60,8 +62,11 @@ from models import (
 )
 from task_profile import build_profile, llm_propose_specs, llm_refine_specs
 
-PREDICT_RESERVE_SEC = float(os.environ.get("AGENT_PREDICT_RESERVE_SEC", 900))
+START_TS = time.time()
+PREDICT_RESERVE_SEC = float(os.environ.get("AGENT_PREDICT_RESERVE_SEC", 480))
 KFOLD_RESERVE_SEC = float(os.environ.get("AGENT_KFOLD_RESERVE_SEC", 600))
+# Доля остатка (после k-fold LightGBM) на пул рецептов; остальное — AutoGluon.
+POOL_SHARE = float(os.environ.get("AGENT_POOL_SHARE", 0.3))
 AUTOEDA_SEC = float(os.environ.get("AGENT_AUTOEDA_SEC", 1200))
 MIN_AUTOEDA_SEC = 120
 # Сверх бюджета AutoEDA: после этого этап бросается (зависшее построение признаков).
@@ -70,13 +75,33 @@ MACRO_METRICS = ("f1_macro", "f1_weighted", "f1", "balanced_accuracy")
 # Что AutoEDA меняет в профиле (переносится из рабочей копии только при успехе).
 EDA_KEYS = ("train", "test", "features", "model_ops", "target_specs", "cv")
 EXPERIMENTS: list[dict] = []
+# Машиночитаемый журнал (JSONL рядом с task.md): дописывается после каждого эксперимента, переживает сбой.
+EXP_LOG: dict = {"path": None, "target": None, "metric": None, "scheme": None, "t_last": time.time()}
 
 
-def register(name: str, hypothesis: str, val_score, accepted: bool) -> None:
-    EXPERIMENTS.append(
-        {"name": name, "hypothesis": hypothesis, "val_score": val_score, "accepted": accepted}
-    )
-    log(f"эксперимент {name}: score={val_score}, accepted={accepted} — {hypothesis}")
+def register(name: str, hypothesis: str, val_score, accepted: bool, **info) -> None:
+    """Эксперимент в журнал: гипотеза, схема проверки, метрика, длительность, решение, причина.
+
+    info — duration (иначе время с прошлой записи), reason/error и прочие поля.
+    """
+    now = time.time()
+    rec = {
+        "name": name, "hypothesis": hypothesis,
+        "val_score": None if val_score is None else float(val_score), "accepted": bool(accepted),
+        "target": EXP_LOG["target"], "metric": EXP_LOG["metric"], "scheme": EXP_LOG["scheme"],
+        "duration_sec": round(float(info.pop("duration", now - EXP_LOG["t_last"])), 2),
+        "t": round(now - START_TS, 1), **info,
+    }
+    EXP_LOG["t_last"] = now
+    EXPERIMENTS.append(rec)
+    log(f"эксперимент {name}: score={val_score}, accepted={accepted} — {hypothesis}"
+        + (f" [{info}]" if info else ""))
+    if EXP_LOG["path"] is not None:
+        try:
+            with open(EXP_LOG["path"], "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        except OSError as exc:
+            log(f"журнал экспериментов не записан: {exc}")
 
 
 def _tuned_or(tuned: np.ndarray | None, fallback: np.ndarray) -> np.ndarray:
@@ -294,6 +319,39 @@ def _cand_score(metric: str, c: dict) -> float:
     return score(metric, c["y"], pred, proba=c["oof"], labels=c["classes"])
 
 
+CONTROL_SHARE = 0.3
+CONTROL_MIN_ROWS = 300
+
+
+def _dev_control(prof: dict, cand: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Разбиение общих OOF-строк на development (подбор смеси/постпроцессинга) и control (аудит).
+
+    group-схема — по группам ключа объекта; иначе по строкам (стратифицированно
+    для классификации). Мало строк — control пуст, всё идёт в development.
+    """
+    from sklearn.model_selection import GroupShuffleSplit, ShuffleSplit, StratifiedShuffleSplit
+
+    n = len(cand["rows"])
+    dev = np.ones(n, dtype=bool)
+    if n < CONTROL_MIN_ROWS / CONTROL_SHARE:
+        return dev, ~dev
+    cv = prof.get("cv") or {}
+    y = np.asarray(cand["y"], dtype=object).astype(str)
+    idx = np.arange(n)
+    try:
+        if cv.get("kind") == "group" and set(cv.get("keys") or []) <= set(prof["train"].columns):
+            g = models.row_keys(prof["train"].loc[cand["rows"]], cv["keys"])
+            _, c = next(GroupShuffleSplit(1, test_size=CONTROL_SHARE, random_state=19).split(idx, groups=g))
+        elif cand.get("classes") is not None and pd.Series(y).value_counts().min() >= 2:
+            _, c = next(StratifiedShuffleSplit(1, test_size=CONTROL_SHARE, random_state=19).split(idx, y))
+        else:
+            _, c = next(ShuffleSplit(1, test_size=CONTROL_SHARE, random_state=19).split(idx))
+    except ValueError:
+        return dev, ~dev
+    dev[c] = False
+    return dev, ~dev
+
+
 def select_final(prof, target, current, quick, cands, fallback, label_copy=False):
     """Выбор источника, бленд и постпроцессинг на общих OOF-строках одной схемы валидации."""
     metric = prof["metric"]
@@ -310,16 +368,34 @@ def select_final(prof, target, current, quick, cands, fallback, label_copy=False
     for c in cands:
         c["score"] = _cand_score(metric, c)
         log(f"{c['name']}: {metric}={c['score']:.5f} на {len(c['rows'])} общих строках")
-    if len(cands) == 2:
-        a, b = cands
-        alpha, s = tune_blend(metric, a["y"], a["oof"], b["oof"], classes=a.get("classes"))
-        accepted = all(is_better(metric, s, c["score"]) or s == c["score"] for c in cands)
-        register("blend", f"смесь {a['name']} и {b['name']}, alpha={alpha:.2f}", s, accepted)
-        cands.append({
-            "name": "blend", "score": s, "y": a["y"], "rows": a["rows"], "classes": a.get("classes"),
-            "oof": alpha * a["oof"] + (1 - alpha) * b["oof"],
-            "test": alpha * a["test"] + (1 - alpha) * b["test"],
-        })
+    dev, ctl = _dev_control(prof, cands[0])
+    if len(cands) >= 2:
+        # Состав и веса — на development-строках OOF; control — аудит: смесь не хуже лучшего одиночного.
+        dc = [{**c, "oof": c["oof"][dev], "y": c["y"][dev]} for c in cands]
+        for c in dc:
+            c["score"] = _cand_score(metric, c)
+        weights, s_dev = pool.greedy_ensemble(dc, metric)
+        used = {c["name"]: round(float(w), 3) for c, w in zip(cands, weights) if w > 0}
+        mix = {**cands[0], "oof": sum(w * c["oof"] for c, w in zip(cands, weights) if w > 0)}
+        best_dev = max(range(len(dc)), key=lambda i: dc[i]["score"] if models.HIGHER_BETTER[metric] else -dc[i]["score"])
+        accepted = len(used) > 1 and is_better(metric, s_dev, dc[best_dev]["score"])
+        info = {}
+        if ctl.any() and accepted:
+            s_mix_ctl = _cand_score(metric, {**mix, "oof": mix["oof"][ctl], "y": mix["y"][ctl]})
+            s_one_ctl = _cand_score(metric, {**cands[best_dev], "oof": cands[best_dev]["oof"][ctl],
+                                             "y": cands[best_dev]["y"][ctl]})
+            info = {"control": round(s_mix_ctl, 6), "control_best_single": round(s_one_ctl, 6),
+                    "control_rows": int(ctl.sum())}
+            accepted = not is_better(metric, s_one_ctl, s_mix_ctl)
+        s_all = _cand_score(metric, mix)
+        register("ensemble", f"жадный ансамбль из {len(cands)} кандидатов: {used}", s_all, accepted,
+                 dev_score=s_dev, **info)
+        if accepted:
+            cands.append({
+                "name": "ensemble", "score": s_all, "y": cands[0]["y"], "rows": cands[0]["rows"],
+                "classes": cands[0].get("classes"), "weights": used, "oof": mix["oof"],
+                "test": sum(w * c["test"] for c, w in zip(cands, weights) if w > 0),
+            })
     win = cands[0]
     for c in cands[1:]:
         if is_better(metric, c["score"], win["score"]):
@@ -337,6 +413,17 @@ def select_final(prof, target, current, quick, cands, fallback, label_copy=False
 
     classes = win["classes"]
     classes_arr = np.array(classes, dtype=object)
+    if metric == "log_loss":
+        try:
+            cal = models.calibrate_proba(win["y"], win["oof"], win["test"], classes,
+                                         from_autogluon=win["name"] == "autogluon")
+            register("calibration", f"калибровка вероятностей {win['name']} под log loss: {cal['info']}",
+                     cal["new"], cal["test"] is not None, base=cal["base"])
+            if cal["test"] is not None:
+                win = {**win, "oof": cal["oof"], "test": cal["test"]}
+        except Exception as exc:  # noqa: BLE001
+            log("Калибровка упала:\n" + traceback.format_exc())
+            register("calibration", "калибровка вероятностей", None, False, error=f"{type(exc).__name__}: {exc}")
     if prof["output_proba"]:
         current[target] = output_from_proba(prof, target, win["test"], classes)
         write_submission(prof, current)
@@ -344,8 +431,18 @@ def select_final(prof, target, current, quick, cands, fallback, label_copy=False
 
     proba_test, proba_oof = win["test"], win["oof"]
     if metric in MACRO_METRICS:
-        weights, _, new = tune_class_weights_stable(win["y"], win["oof"], classes, metric)
-        register("class_weights_stable", "классовые множители (бутстреп-усреднение по OOF)", new, weights is not None)
+        # Множители — по development-строкам, control проверяет перенос.
+        weights, _, new = tune_class_weights_stable(win["y"][dev], win["oof"][dev], classes, metric)
+        info = {}
+        if weights is not None and ctl.any():
+            yc, pc = win["y"][ctl], win["oof"][ctl]
+            base_c = score(metric, yc, classes_arr[np.argmax(pc, axis=1)])
+            new_c = score(metric, yc, classes_arr[np.argmax(pc * weights, axis=1)])
+            info = {"control_base": round(base_c, 6), "control": round(new_c, 6)}
+            if new_c < base_c:
+                weights = None
+        register("class_weights_stable", "классовые множители (бутстреп-усреднение по OOF dev)", new,
+                 weights is not None, **info)
         if weights is not None:
             proba_test, proba_oof = proba_test * weights, proba_oof * weights
     pred = classes_arr[np.argmax(proba_test, axis=1)]
@@ -447,8 +544,10 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
         write_submission(prof, current)
         best_pred = current[target]
         register("quick_lgbm", "градиентный бустинг с дефолтами как опорная точка", quick["val_score"], True)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log("quick_lgbm упал:\n" + traceback.format_exc())
+        register("quick_lgbm", "градиентный бустинг с дефолтами как опорная точка", None, False,
+                 error=f"{type(exc).__name__}: {exc}")
 
     # Ступень 1.5: AutoEDA — детекторы, гипотезы Qwen, валидатор на фолдах под тест.
     prof.setdefault("base_features", list(prof["features"]))
@@ -469,10 +568,14 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
                     prof[k] = work[k]
         except StageTimeout:
             log(f"AutoEDA не уложился в {eda_limit:.0f}s — продолжаю на исходных признаках")
-        except Exception:  # noqa: BLE001
+            register("autoeda", "детекторы + LLM -> спеки -> валидатор", None, False, error="timeout")
+        except Exception as exc:  # noqa: BLE001
             log("AutoEDA упал, работаю на исходных признаках:\n" + traceback.format_exc())
+            register("autoeda", "детекторы + LLM -> спеки -> валидатор", None, False,
+                     error=f"{type(exc).__name__}: {exc}")
     else:
         log(f"Пропускаю AutoEDA: мало времени ({eda_budget:.0f}s)")
+    EXP_LOG["scheme"] = (prof.get("cv") or {"kind": "kfold"})["kind"]
     if eda["accepted"] and quick is not None:
         # Сравнение на одном фолде схемы cv: база — исходные признаки без target-спек и модельных операций.
         try:
@@ -490,50 +593,62 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
         except Exception:  # noqa: BLE001
             log("quick_lgbm на признаках AutoEDA упал:\n" + traceback.format_exc())
 
-    # Ступень 2: AutoGluon на фолдах схемы cv.
+    # Ступень 2: k-fold LightGBM на фолдах схемы cv — OOF-база и мерило стоимости для пула.
+    cands: list[dict] = []
+    lgbm_sec = None
+    if remaining() > PREDICT_RESERVE_SEC:
+        try:
+            tk = time.time()
+            kq = quick_oof(prof, target, deadline_ts=t_end - PREDICT_RESERVE_SEC)
+            lgbm_sec = time.time() - tk
+            if kq is not None:
+                register("quick_oof", "k-fold LightGBM: OOF-база для бленда", kq["score"], True, duration=lgbm_sec)
+                cands.append({"name": "quick_kfold", **kq})
+        except Exception as exc:  # noqa: BLE001
+            log("quick_oof упал:\n" + traceback.format_exc())
+            register("quick_oof", "k-fold LightGBM", None, False, error=f"{type(exc).__name__}: {exc}")
+
+    # Ступень 3: пул рецептов (другие семейства, функции потерь, преобразования таргета) на тех же фолдах.
+    pool_budget = POOL_SHARE * (remaining() - PREDICT_RESERVE_SEC)
+    if lgbm_sec is not None and pool_budget >= 60:
+        try:
+            cands += pool.run_pool(prof, target, time.time() + pool_budget, lgbm_sec, register,
+                                   base_score=cands[0]["score"] if cands else None)
+        except Exception as exc:  # noqa: BLE001
+            log("Пул кандидатов упал:\n" + traceback.format_exc())
+            register("pool", "пул рецептов", None, False, error=f"{type(exc).__name__}: {exc}")
+    if cands:
+        # Промежуточный выбор: сабмит лучшего ансамбля пула до долгого AutoGluon.
+        try:
+            best_pred = select_final(prof, target, current, quick, cands, best_pred, label_copy=eda["label_copy"])
+        except Exception:  # noqa: BLE001
+            log("Промежуточный выбор упал:\n" + traceback.format_exc())
+
+    # Ступень 4: AutoGluon на фолдах схемы cv.
+    ag_budget = remaining() - PREDICT_RESERVE_SEC
+    log(f"Бюджет AutoGluon {ag_budget:.0f}s (резерв predict {PREDICT_RESERVE_SEC:.0f}s)")
     ag = None
-    ag_budget = remaining() - PREDICT_RESERVE_SEC - kfold_reserve
-    log(f"Бюджет AutoGluon {ag_budget:.0f}s (резерв k-fold {kfold_reserve:.0f}s, predict {PREDICT_RESERVE_SEC:.0f}s)")
-    if ag_budget >= 300:
+    if os.environ.get("AGENT_NO_AUTOGLUON"):
+        log("AutoGluon отключён (AGENT_NO_AUTOGLUON)")
+    elif ag_budget >= 300:
         try:
             ag = run_autogluon(prof, target, ag_budget)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log("AutoGluon упал:\n" + traceback.format_exc())
+            register("autogluon", "ансамбль AutoGluon", None, False, error=f"{type(exc).__name__}: {exc}")
     else:
         log(f"Пропускаю AutoGluon: осталось мало времени ({ag_budget:.0f}s)")
     if ag is not None and ag.get("test_pred") is not None:
-        # Немедленная перезапись сабмита: OOF AutoGluon надёжнее одного
-        # сплита quick, поэтому AG отбрасываем только при явном (>2%)
-        # преимуществе quick. Финальный выбор ниже — на общих OOF-строках.
-        ag_score = ag["score"]
-        if quick is None:
-            take_ag = True
-        elif ag_score is None:
-            log("AutoGluon: OOF-оценка недоступна, сабмит quick остаётся")
-            take_ag = False
-        else:
-            qs = quick["val_score"]
-            margin = 0.02 * abs(qs) if qs else 1e-9
-            shifted = qs - margin if models.HIGHER_BETTER[metric] else qs + margin
-            take_ag = not is_better(metric, shifted, ag_score)
-        register("autogluon", "ансамбль AutoGluon против опорного бустинга", ag_score, take_ag)
-        if take_ag:
+        register("autogluon", "ансамбль AutoGluon на фолдах схемы cv", ag["score"], ag.get("rows") is not None)
+        if ag.get("rows") is not None:
+            cands.append(ag)
+        elif not cands:
+            # Без OOF сравнить не с чем: AutoGluon заменяет только quick-модель.
             current[target] = ag["test_pred"]
             write_submission(prof, current)
             best_pred = current[target]
 
-    # Ступень 3: k-fold LightGBM на тех же фолдах — база сравнения и материал для бленда.
-    cands = [ag] if ag is not None and ag.get("rows") is not None else []
-    if remaining() > PREDICT_RESERVE_SEC * 0.5:
-        try:
-            kq = quick_oof(prof, target, deadline_ts=t_end)
-            if kq is not None:
-                register("quick_oof", "k-fold LightGBM: OOF-база для бленда", kq["score"], True)
-                cands.append({"name": "quick_kfold", **kq})
-        except Exception:  # noqa: BLE001
-            log("quick_oof упал:\n" + traceback.format_exc())
-
-    # Ступень 4: бленд, выбор финального источника и постпроцессинг.
+    # Ступень 5: ансамбль, выбор финального источника и постпроцессинг.
     try:
         return select_final(prof, target, current, quick, cands, best_pred, label_copy=eda["label_copy"])
     except Exception:  # noqa: BLE001
@@ -546,6 +661,7 @@ def main() -> None:
     log(f"Старт. task={task_path}, бюджет={TOTAL_BUDGET_SEC:.0f}s, CPU={models.N_CPUS}")
     start_watchdog(task_path.parent)
 
+    EXP_LOG["path"] = task_path.parent / "experiments.jsonl"
     prof = build_profile(task_path)
     targets = prof["target_cols"]
 
@@ -562,6 +678,7 @@ def main() -> None:
             prof.pop(k, None)
         # Бюджет — от фактически оставшегося времени на оставшиеся таргеты.
         budget = time_left() / (len(targets) - i)
+        EXP_LOG.update(target=t, metric=prof["metric"], scheme="random_holdout")
         try:
             solve_target(prof, t, current, budget)
         except Exception:  # noqa: BLE001

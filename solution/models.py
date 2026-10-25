@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from agent_utils import available_cpus, deadline, log
-from eda_probe import row_keys
+from eda_probe import row_key_strings, row_keys
 
 N_CPUS = available_cpus()
 
@@ -700,8 +700,9 @@ def copy_duplicate_labels(prof: dict, target: str, y_oof, oof_pred, test_pred, m
     feats = list(prof.get("base_features") or prof["features"])
     lab = train.loc[train[target].notna()] if rows is None else train.loc[rows]
     y = np.asarray(y_oof, dtype=object)
-    ktr = row_keys(lab, feats)
-    kte = row_keys(test, feats)
+    # Точное равенство признаков (не хэш): метка переносится только на подтверждённый дубль.
+    ktr = row_key_strings(lab, feats)
+    kte = row_key_strings(test, feats)
     labels = lab[target].astype(str).to_numpy()
 
     df = pd.DataFrame({"k": ktr, "y": labels})
@@ -1004,3 +1005,77 @@ def clip_to_train_range(y_true, oof_pred, test_pred, metric: str, y_range=None):
     if is_better(metric, new, base) and new != base:
         return np.clip(test_pred, lo, hi), base, new
     return test_pred, base, base
+
+
+def _apply_calibration(proba: np.ndarray, params: dict) -> np.ndarray:
+    eps = 1e-7
+    p = np.clip(np.asarray(proba, dtype=float), eps, 1.0)
+    if params["kind"] == "platt":
+        j = params["pos"]
+        z = np.log(np.clip(p[:, j], eps, 1 - eps)) - np.log(np.clip(1 - p[:, j], eps, 1 - eps))
+        q = 1.0 / (1.0 + np.exp(-(params["a"] * z + params["b"])))
+        out = np.zeros_like(p)
+        out[:, j] = q
+        out[:, 1 - j] = 1 - q
+        return out
+    logits = np.log(p) / params["t"]
+    logits -= logits.max(axis=1, keepdims=True)
+    e = np.exp(logits)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def _fit_calibration(y_idx: np.ndarray, proba: np.ndarray, k: int, pos: int) -> dict:
+    """Platt (бинарная: a·logit + b) или temperature scaling (T > 0) по log loss."""
+    from scipy.optimize import minimize, minimize_scalar
+
+    eps = 1e-7
+    p = np.clip(proba, eps, 1.0)
+
+    def nll(params):
+        q = _apply_calibration(p, params)
+        return -float(np.mean(np.log(np.clip(q[np.arange(len(y_idx)), y_idx], eps, 1.0))))
+
+    if k == 2:
+        res = minimize(lambda v: nll({"kind": "platt", "pos": pos, "a": v[0], "b": v[1]}), x0=[1.0, 0.0],
+                       method="Nelder-Mead", options={"maxiter": 400, "xatol": 1e-4, "fatol": 1e-7})
+        return {"kind": "platt", "pos": pos, "a": float(res.x[0]), "b": float(res.x[1])}
+    res = minimize_scalar(lambda t: nll({"kind": "temp", "t": t}), bounds=(0.05, 20.0), method="bounded")
+    return {"kind": "temp", "t": float(res.x)}
+
+
+def calibrate_proba(y_true, oof, test, classes, from_autogluon: bool = False, min_rel_gain: float = 0.002,
+                    min_rows: int = 200) -> dict:
+    """Калибровка вероятностей под log loss с проверкой прироста cross-fit по OOF.
+
+    Калибратор обучается на OOF-вероятностях (модель этих меток не видела):
+    сначала 2-fold cross-fit — оценка прироста на строках, не участвовавших
+    в подборе; при приросте > min_rel_gain калибратор подбирается на всём OOF
+    и применяется к test. AutoGluon уже калибрует температуру — повторно не
+    калибруется. Возвращает {"test", "oof" (None — исходные вероятности), "base", "new", "info"}.
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    classes = list(classes)
+    k = len(classes)
+    pos_map = {str(c): i for i, c in enumerate(classes)}
+    y_idx = np.array([pos_map[str(v)] for v in y_true])
+    base = score("log_loss", y_true, None, proba=oof, labels=classes)
+    keep = {"test": None, "oof": None, "base": base, "new": base}
+    if from_autogluon:
+        return {**keep, "info": "AutoGluon уже калибрует вероятности — пропуск"}
+    counts = np.bincount(y_idx, minlength=k)
+    if len(y_idx) < min_rows or (counts > 0).sum() < 2 or counts[counts > 0].min() < 2:
+        return {**keep, "info": "мало строк/классов для подбора"}
+    pos = classes.index(positive_label(classes)) if k == 2 else 0
+    cross = np.zeros_like(oof, dtype=float)
+    for a, b in StratifiedKFold(2, shuffle=True, random_state=0).split(np.zeros(len(y_idx)), y_idx):
+        cross[b] = _apply_calibration(oof[b], _fit_calibration(y_idx[a], oof[a], k, pos))
+    new = score("log_loss", y_true, None, proba=cross, labels=classes)
+    if not (np.isfinite(new) and new < base * (1 - min_rel_gain)):
+        return {**keep, "new": new, "info": f"нет прироста cross-fit ({base:.5f} -> {new:.5f})"}
+    params = _fit_calibration(y_idx, oof, k, pos)
+    test_cal = _apply_calibration(test, params)
+    if not (np.isfinite(test_cal).all() and np.allclose(test_cal.sum(axis=1), 1.0, atol=1e-6)):
+        return {**keep, "new": new, "info": "калибровка дала некорректные вероятности"}
+    return {"test": test_cal, "oof": _apply_calibration(oof, params), "base": base, "new": new,
+            "info": f"{params}, cross-fit {base:.5f} -> {new:.5f}"}

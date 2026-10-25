@@ -19,25 +19,59 @@ QID_EXTEND_TOP = 60
 QID_MIN_COVERAGE = 0.3    # колонка, чьи значения в test новые, ключом быть не может
 
 
+NAN_KEY = "\x00nan"
+
+
+def _num_key(s: pd.Series) -> pd.Series:
+    """Число -> строка без потери точности: целые — десятичной записью целого, иначе repr float.
+
+    int 1942 и float 1942.0 дают "1942"; 9007199254740992 и ...993 в int64
+    остаются разными (через float они бы совпали). Пропуск — NAN_KEY.
+    """
+    if pd.api.types.is_integer_dtype(s) and not isinstance(s.dtype, pd.api.types.CategoricalDtype):
+        if s.isna().any():  # nullable Int64
+            return s.astype(object).map(lambda v: NAN_KEY if pd.isna(v) else str(int(v)))
+        return pd.Series(s.to_numpy().astype(str), index=s.index, dtype=object)
+    v = pd.to_numeric(s, errors="coerce").to_numpy(float)
+    out = v.astype(str).astype(object)  # кратчайший repr float
+    whole = np.isfinite(v) & (np.abs(v) < 2 ** 63)
+    whole[whole] = v[whole] == np.trunc(v[whole])
+    out[whole] = v[whole].astype(np.int64).astype(str)
+    out[np.isnan(v)] = NAN_KEY
+    return pd.Series(out, index=s.index, dtype=object)
+
+
 def normalize_keys(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     """Строковое представление колонок, одинаковое для train и test.
 
-    Числа приводятся к float: иначе int-колонка train ("1942") и float-колонка
-    test с пропусками ("1942.0") дают разные ключи.
+    Числа — точная десятичная запись (_num_key): int-колонка train (1942) и
+    float-колонка test с пропусками (1942.0) дают один ключ, а большие целые
+    не склеиваются через float. Строки — как есть, пропуск — NAN_KEY.
     """
     out = {}
     for c in cols:
         s = df[c]
         if pd.api.types.is_numeric_dtype(s) and s.dtype != bool:
-            out[c] = s.astype(float).astype(str)
+            out[c] = _num_key(s)
         else:
-            out[c] = s.astype(str)
+            out[c] = s.astype(str).where(s.notna(), NAN_KEY).astype(object)
     return pd.DataFrame(out, index=df.index)
 
 
 def row_keys(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
-    """Хэш строки по нормализованным значениям колонок (точные дубли, группы)."""
+    """Хэш строки по нормализованным значениям колонок (точные дубли, группы).
+
+    Компоненты хэшируются по отдельности (hash_pandas_object по колонкам
+    DataFrame), поэтому склейка значений разных колонок не даёт коллизий.
+    """
     return pd.util.hash_pandas_object(normalize_keys(df, cols), index=False).to_numpy()
+
+
+def row_key_strings(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
+    """Точный ключ строки (без хэша): подтверждение равенства признаков, а не совпадения хэша."""
+    norm = normalize_keys(df, cols)
+    # repr каждой компоненты экранирует разделитель: ("a|b", "c") != ("a", "b|c").
+    return np.array(["\x1f".join(map(repr, t)) for t in norm.itertuples(index=False, name=None)], dtype=object)
 
 
 def _sample(df: pd.DataFrame, n: int, seed: int = 0) -> pd.DataFrame:

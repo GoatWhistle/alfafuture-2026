@@ -119,6 +119,13 @@ def detect_entities(ctx: dict) -> list[dict]:
     for r in alts:
         out.append(_spec("group_stat", [], {"keys": r["key"], "src": "target", "aggs": list(fe_dsl.TARGET_AGGS)},
                          "entities", r["score"], f"ключ покрывает {r['coverage']:.0%} test"))
+    if len(best["key"]) >= 2:
+        # Редкие и неизвестные составные ключи: сглаживание к самому важному компоненту ключа.
+        general = _top_important(ctx, list(best["key"]), 1)
+        out.append(_spec("group_stat", [], {"keys": best["key"], "src": "target", "aggs": ["mean", "count"],
+                                            "smooth": 5.0, "fallback": [general]},
+                         "entities", best["score"] * 0.6,
+                         f"сглаженная статистика объекта с переходом к {general} для неизвестных ключей"))
     num = [c for c in _top_important(ctx, _numeric(ctx), 6) if c not in best["key"]][:3]
     for c in num:
         out.append(_spec("group_dev", [c], {"keys": best["key"]}, "entities", best["score"] * 0.2,
@@ -354,12 +361,117 @@ def detect_missingness(ctx: dict) -> list[dict]:
             w = omega2(r, miss.to_numpy(np.int64))
             if w > 0:
                 out.append(_spec("missing_ind", [c], {}, "missingness", w, f"пропуск в {c} связан с ошибкой модели"))
-    return sorted(out, key=lambda s: -s["prior"])[:5]
+    out = sorted(out, key=lambda s: -s["prior"])[:5]
+    holes = [c for c in ctx["features"] if 0.01 < df[c].isna().mean() < 0.99]
+    if len(holes) >= 3:
+        cnt = df[holes].isna().sum(axis=1).to_numpy(np.int64)
+        out.append(_spec("missing_count", holes[:64], {}, "missingness", max(omega2(r, cnt), 1e-4),
+                         f"число пропусков по {len(holes)} колонкам"))
+    return out
+
+
+CYCLE_HINTS = (("direction", 360.0), ("angle", 360.0), ("bearing", 360.0), ("heading", 360.0),
+               ("degree", 360.0), ("направлен", 360.0), ("month", 12.0), ("месяц", 12.0),
+               ("hour", 24.0), ("час", 24.0), ("weekday", 7.0), ("dow", 7.0), ("день недели", 7.0))
+DATE_MIN_PARSED = 0.9
+
+
+def date_columns(ctx: dict, n: int = 2000) -> list[str]:
+    """Строковые колонки, где ≥90% непустых значений разбираются как дата и есть цифры (не категории-слова)."""
+    out = []
+    for c in ctx["features"]:
+        s = ctx["df"][c]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            out.append(c)
+            continue
+        if s.dtype != object:
+            continue
+        v = s.dropna().astype(str).head(n)
+        if len(v) < 20 or not v.str.contains(r"\d", regex=True).mean() > 0.9 or not v.str.len().between(6, 40).all():
+            continue
+        if fe_dsl.parse_dates(v).notna().mean() >= DATE_MIN_PARSED:
+            out.append(c)
+    return out
+
+
+def detect_calendar(ctx: dict) -> list[dict]:
+    """Даты -> календарные части (+ удаление сырой строки-даты); периодические величины -> sin/cos."""
+    out = []
+    for c in date_columns(ctx):
+        out.append(_spec("date_parts", [c], {}, "calendar", 0.5, f"{c} — дата: год, месяц, день недели, час"))
+        out.append(_spec("drop", [c], {}, "calendar", 0.05, f"сырая дата {c} как категория не обобщается"))
+    text = _dict_text(ctx)
+    for c in _numeric(ctx):
+        desc = c.lower() + " " + text.get(c, "")
+        v = pd.to_numeric(ctx["df"][c], errors="coerce").dropna()
+        if v.empty:
+            continue
+        for hint, per in CYCLE_HINTS:
+            if hint in desc and v.min() >= 0 and v.max() <= per + 1:
+                out.append(_spec("cyclic", [c], {"period": per}, "calendar", 0.01,
+                                 f"{c} периодичен (период {per:g}): близкие концы шкалы — близкие значения"))
+                break
+    return out
+
+
+CODE_HINTS = ("code", "type", "class", "categ", "kind", "group", "region", "zone", "zip", "state", "factor",
+              "level", "grade", "status", "segment", "brand", "model", "channel", "код", "тип", "класс",
+              "категор", "регион", "вид", "групп", "статус", "уровень", "сегмент", "штат")
+QUANTITY_HINTS = ("count", "num", "days", "year", "age", "amount", "sum", "qty", "size", "area", "price",
+                  "temp", "speed", "rate", "bytes", "pkts", "ct_", "количеств", "число", "сумм", "площад",
+                  "возраст", "дней", "лет", "скорост", "цена")
+MAX_CODE_LEVELS = 200
+MAX_CODE_CANDIDATES = 8
+
+
+def _dict_text(ctx: dict) -> dict:
+    """Текст строки словаря данных по имени признака (нижний регистр)."""
+    dd = ctx["prof"].get("data_dictionary")
+    if dd is None or len(dd.columns) == 0:
+        return {}
+    low = {c.lower(): c for c in dd.columns}
+    key = next((low[k] for k in ("feature", "column", "name", "field", "поле", "признак") if k in low), dd.columns[0])
+    return {str(r[key]): " ".join(str(v) for v in r.values).lower() for _, r in dd.iterrows()}
+
+
+def integer_code_candidates(ctx: dict) -> list[tuple[str, float, str]]:
+    """Целочисленные колонки, которые могут быть кодами категорий: (col, вес, основание).
+
+    Целочисленность сама по себе не доказательство: нужны умеренное число
+    уровней и не-ID; имя/словарь с намёком на код повышают вес, намёк на
+    количество/измерение — понижает (решение всё равно за валидатором).
+    """
+    df, n = ctx["df"], len(ctx["df"])
+    text = _dict_text(ctx)
+    out = []
+    for c in _numeric(ctx):
+        if c == ctx.get("period"):
+            continue
+        v = pd.to_numeric(df[c], errors="coerce").dropna()
+        nu = v.nunique()
+        if not 3 <= nu <= MAX_CODE_LEVELS or nu > 0.5 * n or len(v) == 0:
+            continue
+        if not np.all(v.to_numpy() == np.round(v.to_numpy())):
+            continue
+        desc = (c.lower() + " " + text.get(c, ""))
+        code_hint = any(h in desc for h in CODE_HINTS) or "category" in text.get(c, "") or "категор" in desc
+        qty_hint = any(h in desc for h in QUANTITY_HINTS)
+        if qty_hint and not code_hint:
+            continue
+        w = 1.0 if code_hint else 0.3
+        why = ("имя/словарь указывают на код" if code_hint else "целые значения") + f", {nu} уровней"
+        out.append((c, w, why))
+    out.sort(key=lambda t: -t[1])
+    return out[:MAX_CODE_CANDIDATES]
 
 
 def detect_categoricals(ctx: dict) -> list[dict]:
     df, r = ctx["df"], ctx["resid"]
     out = []
+    for c, w, why in integer_code_candidates(ctx):
+        om = omega2(r, _codes(df[c].astype(str), top=MAX_CODE_LEVELS))
+        out.append(_spec("as_category", [c], {}, "categoricals", w * max(om, 1e-3),
+                         f"числовой код {c} как категория: {why}"))
     for c in ctx["features"]:
         nu = df[c].nunique()
         if not _is_cat(df[c]) or nu <= 30:
@@ -368,6 +480,8 @@ def detect_categoricals(ctx: dict) -> list[dict]:
         out.append(_spec("count_enc", [c], {}, "categoricals", w * 0.5, f"частота уровня {c} ({nu} уровней)"))
         out.append(_spec("group_stat", [], {"keys": [c], "src": "target", "aggs": ["mean", "std", "count"]},
                          "categoricals", w, f"target encoding {c} ({nu} уровней)"))
+        out.append(_spec("group_stat", [], {"keys": [c], "src": "target", "aggs": ["mean", "count"], "smooth": 20.0},
+                         "categoricals", w * 0.8, f"сглаженный target encoding {c}: редкие уровни к общему"))
     return out
 
 
@@ -395,36 +509,56 @@ def detect_neighbors(ctx: dict) -> list[dict]:
 # 9. Сдвиг train/test (adversarial validation).
 # ---------------------------------------------------------------------------
 
+SHIFT_ROWS = 10_000
+SHIFT_MIN_ROWS = 1_000
+
+
 def detect_shift(ctx: dict) -> list[dict]:
+    """Adversarial validation: насколько отличим test от train по разрешённым признакам.
+
+    Без таргета и ID (ctx["features"]) и без колонки периода. Точные дубли
+    признаков — одна группа (GroupKFold): классификатор источника не
+    выигрывает запоминанием строк. Факты идут в профиль и промпт Qwen;
+    drop-спеки — только гипотезы для валидатора, сам AUC ничего не меняет.
+    """
     import lightgbm as lgb
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import GroupKFold
 
     import fe_search
 
+    t0 = time.time()
     feats = [c for c in ctx["features"] if c != ctx["period"]]
-    tr = _sample(ctx["df"][feats], 10_000, 2)
-    te = _sample(ctx["test"][feats], 10_000, 2)
+    tr = _sample(ctx["df"][feats], SHIFT_ROWS, 2)
+    te = _sample(ctx["test"][feats], SHIFT_ROWS, 2)
     X = pd.concat([tr, te], ignore_index=True)
     y = np.r_[np.zeros(len(tr)), np.ones(len(te))]
+    groups = pd.factorize(row_keys(X, feats))[0]
     X, _ = fe_search._to_lgb(X, X.iloc[:0])
     pred = np.zeros(len(X))
     imp = np.zeros(len(feats))
-    for a, b in StratifiedKFold(3, shuffle=True, random_state=4).split(X, y):
+    for a, b in GroupKFold(3).split(X, y, groups):
         m = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, num_leaves=31, n_jobs=fe_search.models.N_CPUS,
                                verbosity=-1)
         m.fit(X.iloc[a], y[a])
         pred[b] = m.predict_proba(X.iloc[b])[:, 1]
         imp += m.booster_.feature_importance("gain")
-    from sklearn.metrics import roc_auc_score
-
     auc = float(roc_auc_score(y, pred))
     share = imp / max(imp.sum(), 1e-9)
     top = sorted(zip(share, feats), reverse=True)[:5]
-    ctx["facts"]["adversarial"] = {"auc": round(auc, 4), "top": [(c, round(float(s), 3)) for s, c in top]}
-    log(f"AutoEDA shift: adversarial AUC={auc:.3f}, топ дрейфа {[c for _, c in top]}")
-    if auc < 0.6:
+    small = min(len(tr), len(te)) < SHIFT_MIN_ROWS
+    ctx["facts"]["adversarial"] = {
+        "auc": round(auc, 4), "top": [(c, round(float(s), 3)) for s, c in top],
+        "rows": {"train": len(tr), "test": len(te)}, "small_sample": small,
+        "protocol": "LightGBM train-vs-test, GroupKFold(3) по точным дублям, без таргета/ID/периода",
+        "sec": round(time.time() - t0, 1),
+    }
+    log(f"AutoEDA shift: adversarial AUC={auc:.3f} ({len(tr)}+{len(te)} строк{', мало' if small else ''}), "
+        f"топ дрейфа {[c for _, c in top]}")
+    if auc < 0.6 or small:
         return []
-    return [_spec("drop", [c], {}, "shift", (auc - 0.5) * float(s) * 0.5, f"дрейф train/test, доля важности {s:.2f}")
+    return [_spec("drop", [c], {}, "shift", (auc - 0.5) * float(s) * 0.5,
+                  f"adversarial AUC={auc:.3f}: дрейф train/test, доля важности {s:.2f}")
             for s, c in top if s > 0.05]
 
 
@@ -592,6 +726,7 @@ DETECTORS = [
     ("missingness", detect_missingness),
     ("transforms", detect_transforms),
     ("shift", detect_shift),
+    ("calendar", detect_calendar),
 ]
 
 

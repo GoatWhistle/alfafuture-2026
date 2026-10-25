@@ -206,13 +206,18 @@ def _llm_parse(task_text: str, columns: list[str], target: str, facts: dict) -> 
 
 DSL_HELP = """Операции DSL (cols — колонки train; target — таргет):
 - group_stat: статистика по группе; cols=[] -> таргет (cross-fitted), cols=[col] -> признак;
-  params {"keys": [1-5 колонок], "aggs": ["mean","median","std","count"], "bin": <число квантильных бинов числовых ключей>}
+  params {"keys": [1-5 колонок], "aggs": ["mean","median","std","count"], "bin": <число квантильных бинов числовых ключей>,
+  "smooth": <сила сглаживания среднего к общему уровню>, "fallback": [[более общие ключи], ...]}
 - group_dev: cols=[col] минус среднее col по группе; params {"keys": [...]}
 - lag: история объекта в прошлых периодах; cols=[] -> таргет, cols=[col] -> признак;
   params {"keys": [ключ объекта], "period": "<колонка периода>", "aggs": ["last","mean","count","gap"]}
 - ratio | diff | prod: cols=[a, b] — a/b, a-b, a*b
 - agg_cols: cols=[однородные колонки], params {"aggs": ["mean","std","min","max","sum","range"]}
 - log | rank | count_enc | missing_ind: cols=[col]
+- missing_count: cols=[колонки с пропусками] — число пропусков в строке
+- date_parts: cols=[строка-дата] — год, месяц, день, день недели, день года, час
+- cyclic: cols=[col], params {"period": 360|12|24|7} — sin/cos периодической величины
+- as_category: cols=[числовая колонка] — целочисленный код (регион, тип, класс) как категория без порядка
 - bin: cols=[col], params {"bins": q}; interaction: cols=[a, b], params {"bins": q} — код пары
 - knn_target: cols=[числовые], params {"k": 10} — таргет ближайших соседей
 - flag: cols=[col], params {"rule": "zero|nan|level|threshold", "value": <порог для threshold>} — индикатор сегмента

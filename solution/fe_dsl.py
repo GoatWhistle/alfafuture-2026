@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from agent_utils import log
-from eda_probe import row_keys
+from eda_probe import normalize_keys, row_keys
 
 TARGET = "__target__"
 MAX_CLASSES = 20
@@ -43,6 +43,10 @@ OPS = {
     "interaction": (2, 2, False),
     "knn_target": (1, 20, True),
     "flag": (1, 1, False),         # индикатор сегмента: params.rule
+    "as_category": (1, 1, False),  # числовой код как категория (без порядка и расстояния)
+    "missing_count": (2, 64, False),  # число пропусков в строке по cols (до импутации)
+    "date_parts": (1, 1, False),   # дата/время строкой -> год, месяц, день, день недели, день года, час
+    "cyclic": (1, 1, False),       # периодический признак -> sin/cos; params.period
     "drop": (1, 1, False),
     # Модельные операции: меняют обучение, а не признаки.
     "segment_model": (1, 1, False),  # отдельные модели по сегментам col (params.rule)
@@ -85,7 +89,8 @@ def validate(spec, columns, numeric: set[str] | None = None) -> dict | None:
     lo, hi, _ = OPS[op]
     if not lo <= len(cols) <= hi or not set(cols) <= columns:
         return None
-    if numeric is not None and op in ("log", "rank", "ratio", "diff", "prod", "agg_cols", "bin", "group_dev", "knn_target"):
+    if numeric is not None and op in ("log", "rank", "ratio", "diff", "prod", "agg_cols", "bin", "group_dev", "knn_target",
+                                      "as_category"):
         if not set(cols) <= numeric:
             return None
     params: dict = {}
@@ -102,6 +107,19 @@ def validate(spec, columns, numeric: set[str] | None = None) -> dict | None:
     if op == "group_stat":
         aggs = [a for a in (_str_list(raw.get("aggs")) or []) if a in TARGET_AGGS] or ["mean", "count"]
         params["aggs"] = aggs
+        # Сглаживание среднего к более общей группе (#7): сила m и цепочка общих ключей.
+        m = raw.get("smooth")
+        if isinstance(m, (int, float)) and np.isfinite(m) and 0 < m <= 10_000:
+            params["smooth"] = float(m)
+        fb = raw.get("fallback")
+        if isinstance(fb, (list, tuple)) and fb:
+            chain = []
+            for level in fb[:3]:
+                lk = _str_list(level)
+                if not lk or not set(lk) <= columns or set(lk) == set(keys):
+                    return None
+                chain.append(lk)
+            params["fallback"] = chain
     if op == "lag":
         period = raw.get("period")
         if not isinstance(period, str) or period not in columns or period in params["keys"]:
@@ -116,6 +134,13 @@ def validate(spec, columns, numeric: set[str] | None = None) -> dict | None:
         return None
     if op == "agg_cols":
         params["aggs"] = [a for a in (_str_list(raw.get("aggs")) or []) if a in COL_AGGS] or ["mean", "std", "range"]
+    if op == "cyclic":
+        per = raw.get("period")
+        if not isinstance(per, (int, float)) or not np.isfinite(per) or per <= 0:
+            return None
+        if numeric is not None and not set(cols) <= numeric:
+            return None
+        params["period"] = float(per)
     if op in ("bin", "interaction"):
         q = raw.get("bins", raw.get("bin", 10))
         params["bins"] = int(q) if isinstance(q, (int, float)) and 2 <= int(q) <= 100 else 10
@@ -198,6 +223,10 @@ def _name(spec: dict, suffix: str) -> str:
         parts += ["by", *spec["params"]["keys"]]
     if spec["params"].get("src") == "target":
         parts.insert(1, "y")
+    if "smooth" in spec["params"]:
+        parts.append(f"s{spec['params']['smooth']:g}")
+    for level in spec["params"].get("fallback", []):
+        parts += ["fb", *level]
     base = "__".join(re.sub(r"[^0-9A-Za-z_]", "_", str(x)) for x in parts)
     if len(base) > 90:
         base = base[:70] + "_" + hashlib.md5(base.encode()).hexdigest()[:8]
@@ -306,7 +335,9 @@ def inner_splits(fit: pd.DataFrame, cv: dict | None, seed: int = 11) -> list[tup
         if pd.Series(g).nunique() >= 2:
             k = min(CROSSFIT_SPLITS, int(pd.Series(g).nunique()))
             return list(GroupKFold(k).split(np.arange(n), groups=g))
-    return list(KFold(CROSSFIT_SPLITS, shuffle=True, random_state=seed).split(np.arange(n)))
+    if n < 2:
+        return []
+    return list(KFold(min(CROSSFIT_SPLITS, n), shuffle=True, random_state=seed).split(np.arange(n)))
 
 
 def _crossfit(n_fit: int, fn, splits) -> pd.DataFrame:
@@ -323,6 +354,28 @@ def _crossfit(n_fit: int, fn, splits) -> pd.DataFrame:
     return pd.concat(parts).reindex(np.arange(n_fit))
 
 
+def _smoothed_means(levels: list[tuple[np.ndarray, np.ndarray]], Y: np.ndarray, src: np.ndarray,
+                    m: float) -> np.ndarray:
+    """Среднее (доли классов) по первому уровню ключа, сглаженное к следующим уровням и к общему среднему.
+
+    levels — [(ключи fit, ключи dst), ...] от частного к общему. Для группы с
+    n допустимыми строками и суммой S: (S + m·P) / (n + m), где P — такая же
+    оценка следующего уровня (последний — среднее src). Неизвестная группа
+    (n = 0) получает P: первый известный более общий уровень, затем общий.
+    m = 0 для известной группы — несглаженное среднее.
+    """
+    prior = np.tile(Y[src].mean(axis=0), (len(levels[0][1]), 1))
+    for kfit, kdst in reversed(levels):
+        df = pd.DataFrame(Y[src], columns=[f"c{i}" for i in range(Y.shape[1])])
+        df["k"] = kfit[src]
+        g = df.groupby("k")
+        sums = g.sum().reindex(kdst).to_numpy(float)
+        n = g.size().reindex(kdst).to_numpy(float)
+        sums, n = np.nan_to_num(sums), np.nan_to_num(n)
+        prior = np.where(n[:, None] + m > 0, (sums + m * prior) / np.maximum(n[:, None] + m, 1e-12), prior)
+    return prior
+
+
 def _target_group_stat(spec, fit, fit_y, app, classes, cv=None):
     p = spec["params"]
     kf, ka = _keys(fit, app, p["keys"], p.get("bin"))
@@ -331,11 +384,30 @@ def _target_group_stat(spec, fit, fit_y, app, classes, cv=None):
     aggs = p["aggs"]
     kfold = (cv or {}).get("kind") not in ("temporal", "group")
     scale = CROSSFIT_SPLITS / (CROSSFIT_SPLITS - 1) if kfold else 1.0
+    smooth = "smooth" in p or "fallback" in p
+    chain = [_keys(fit, app, lk, p.get("bin")) for lk in p.get("fallback", [])]
+
+    def smoothed(src, dst_keys: list[np.ndarray]) -> np.ndarray:
+        levels = [(kf, dst_keys[0])] + [(c[0], d) for c, d in zip(chain, dst_keys[1:])]
+        return _smoothed_means(levels, Y, src, p.get("smooth", 0.0))
+
+    def with_smooth(tab: pd.DataFrame, src, dst_keys) -> pd.DataFrame:
+        if not smooth:
+            return tab
+        sm = smoothed(src, dst_keys)
+        if is_cls:
+            for i in range(Y.shape[1]):
+                tab[f"p{i}"] = sm[:, i]
+        elif "mean" in tab.columns:
+            tab["mean"] = sm[:, 0]
+        return tab
 
     def fn(src, dst):
-        return _lookup(_group_table(kf[src], Y[src], aggs, is_cls), kf[dst], scale)
+        tab = _lookup(_group_table(kf[src], Y[src], aggs, is_cls), kf[dst], scale)
+        return with_smooth(tab, src, [kf[dst]] + [c[0][dst] for c in chain])
 
     a = _lookup(_group_table(kf, Y, aggs, is_cls), ka)
+    a = with_smooth(a, np.arange(len(fit)), [ka] + [c[1] for c in chain])
     f = _crossfit(len(fit), fn, inner_splits(fit, cv)).reindex(columns=a.columns)
     f["count"] = f["count"].fillna(0)
     names = {c: _name(spec, c if not c.startswith("p") else f"p_{classes[int(c[1:])]}") for c in f.columns}
@@ -498,6 +570,17 @@ def _unsupervised(spec, both: pd.DataFrame) -> pd.DataFrame:
     if op == "count_enc":
         s = both[cols[0]].astype(str)
         return pd.DataFrame({_name(spec, ""): s.map(s.value_counts()).astype(float)})
+    if op == "as_category":
+        # Точная запись кода (большие целые не склеиваются), пропуск — отдельный уровень;
+        # уровень, которого нет в train, модель видит как неизвестную категорию.
+        return pd.DataFrame({_name(spec, ""): normalize_keys(both, cols)[cols[0]].astype(object)})
+    if op == "missing_count":
+        return pd.DataFrame({_name(spec, ""): both[cols].isna().sum(axis=1).astype(float)})
+    if op == "date_parts":
+        return _date_parts(spec, both[cols[0]])
+    if op == "cyclic":
+        ang = 2 * np.pi * _num(both, cols[0]) / p["period"]
+        return pd.DataFrame({_name(spec, "sin"): np.sin(ang), _name(spec, "cos"): np.cos(ang)})
     if op == "missing_ind":
         return pd.DataFrame({_name(spec, ""): both[cols[0]].isna().astype(float)})
     if op == "bin":
@@ -514,6 +597,30 @@ def _unsupervised(spec, both: pd.DataFrame) -> pd.DataFrame:
         x = _num(both, cols[0])
         return pd.DataFrame({_name(spec, ""): x - x.groupby(kf).transform("mean").to_numpy()})
     raise ValueError(op)
+
+
+def parse_dates(s: pd.Series) -> pd.Series:
+    """Явное правило разбора дат: строки ISO/смешанных форматов, ошибка разбора -> NaT, без часового пояса."""
+    if pd.api.types.is_datetime64_any_dtype(s):
+        out = s
+    else:
+        out = pd.to_datetime(s.astype(object).where(s.notna(), None), errors="coerce", format="mixed", utc=True)
+    if getattr(out.dt, "tz", None) is not None:
+        out = out.dt.tz_convert(None)
+    return out
+
+
+def _date_parts(spec: dict, s: pd.Series) -> pd.DataFrame:
+    """Год, месяц, день, день недели, день года, (час), порядковое время в днях; пропуск -> NaN."""
+    d = parse_dates(s)
+    out = {
+        _name(spec, "year"): d.dt.year, _name(spec, "month"): d.dt.month, _name(spec, "day"): d.dt.day,
+        _name(spec, "dow"): d.dt.dayofweek, _name(spec, "doy"): d.dt.dayofyear,
+        _name(spec, "t_days"): (d - pd.Timestamp("1970-01-01")).dt.total_seconds() / 86400.0,
+    }
+    if (d.dt.hour.fillna(0) != 0).any():
+        out[_name(spec, "hour")] = d.dt.hour + d.dt.minute / 60.0
+    return pd.DataFrame(out).astype(float)
 
 
 # ---------------------------------------------------------------------------

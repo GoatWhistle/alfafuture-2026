@@ -15,6 +15,7 @@ SOLUTION = Path(__file__).resolve().parents[1] / "solution.py"
 ENV = {
     "AGENT_TIME_LIMIT_SEC": "2000", "AGENT_SAFETY_SEC": "0", "AGENT_AUTOEDA_SEC": "60",
     "AGENT_PREDICT_RESERVE_SEC": "600", "AGENT_KFOLD_RESERVE_SEC": "600",
+    "AGENT_NO_AUTOGLUON": "1", "AGENT_POOL_SHARE": "0.05",
 }
 
 
