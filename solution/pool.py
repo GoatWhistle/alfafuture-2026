@@ -648,14 +648,15 @@ def plan(prof: dict, target: str) -> list[dict]:
     if text and not (regression is False and len(pd.unique(labeled(prof, target)[target])) > 50):
         out.insert(0, {"name": "tfidf_linear", "family": "tfidf", "text_cols": text,
                        "why": f"свободный текст в {text}: разреженный TF-IDF + линейная модель"})
+    # Порядок — по ценности на единицу стоимости: дешёвые и непохожие на LightGBM раньше, CatBoost (≈4×) последним.
     out += [
-        {"name": "catboost", "family": "catboost", "why": "другое семейство бустинга (симметричные деревья)"},
+        {"name": "extratrees", "family": "extratrees", "why": "бэггинг случайных деревьев: иные ошибки"},
         {"name": "xgboost", "family": "xgboost", "why": "другое семейство бустинга (по уровням)"},
         {"name": "lgbm_reg", "family": "lgbm",
          "params": {"learning_rate": 0.03, "num_leaves": 63, "min_child_samples": 50, "reg_lambda": 5.0,
                     "reg_alpha": 0.5, "colsample_bytree": 0.5},
          "why": "сильнее регуляризация и сэмплирование признаков"},
-        {"name": "extratrees", "family": "extratrees", "why": "бэггинг случайных деревьев: иные ошибки"},
+        {"name": "catboost", "family": "catboost", "why": "другое семейство бустинга (симметричные деревья)"},
     ]
     return out
 
