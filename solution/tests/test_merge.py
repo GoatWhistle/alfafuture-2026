@@ -102,3 +102,11 @@ def test_provenance_strong_legit_vs_leak():
     assert srch.provenance(legit)[0] is False
     assert srch.provenance(leak)[0] is True             # uid test — новые: запоминание строк
     assert srch.provenance(plain)[0] is False
+
+
+def test_merge_same_output_names_keeps_first():
+    a = [S("group_stat", [], {"keys": ["g"], "src": "target", "aggs": ["mean", "count"]})]
+    b = [S("group_stat", [], {"keys": ["g"], "src": "target", "aggs": ["mean", "std", "count"]}), S("log", ["a"])]
+    m, why = fe_search.Search.merge_specs(a, b)
+    assert [s["op"] for s in m] == ["group_stat", "log"] and m[0]["params"]["aggs"] == ["mean", "count"]
+    assert "отброшено" in why

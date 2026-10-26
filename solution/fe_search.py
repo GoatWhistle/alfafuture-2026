@@ -589,10 +589,17 @@ class Search:
         mops = [s["op"] for s in merged if s["op"] in fe_dsl.MODEL_OPS]
         if len(mops) != len(set(mops)):
             return None, "конфликт: две модельные операции одного типа"
-        names = [fe_dsl._name(s, "") for s in merged if s["op"] != "drop" and s["op"] not in fe_dsl.MODEL_OPS]
-        if len(names) != len(set(names)):
-            return None, "конфликт имён выходов"
-        return merged, ""
+        # Одинаковые имена выходов (та же операция по тем же колонкам/ключам с другими агрегатами):
+        # остаётся первая спека (выше по delta своей ветки), повтор отбрасывается.
+        out, names, dropped = [], set(), []
+        for spec in merged:
+            nm = None if spec["op"] == "drop" or spec["op"] in fe_dsl.MODEL_OPS else fe_dsl._name(spec, "")
+            if nm is not None and nm in names:
+                dropped.append(fe_dsl.describe(spec))
+                continue
+            names.add(nm)
+            out.append(spec)
+        return out, ("совпадение имён выходов, отброшено: " + "; ".join(dropped)) if dropped else ""
 
     def _scores(self, specs: list[dict]) -> list[float] | None:
         key = frozenset(fe_dsl.spec_key(s) for s in specs)
@@ -611,6 +618,8 @@ class Search:
         for a, b in list(combinations(order, 2))[:MERGE_MAX_PAIRS]:
             name = f"merge:{a}+{b}"
             merged, why = self.merge_specs(br[a], br[b])
+            if why and merged is not None:
+                log(f"AutoEDA: {name}: {why}")
             if merged is None:
                 if self.register:
                     self.register(name, why, None, False, reason=why)
