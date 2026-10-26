@@ -396,6 +396,9 @@ def select_final(prof, target, current, quick, cands, fallback, label_copy=False
         mix = {**cands[0], "oof": sum(w * c["oof"] for c, w in zip(cands, weights) if w > 0)}
         best_dev = max(range(len(dc)), key=lambda i: dc[i]["score"] if models.HIGHER_BETTER[metric] else -dc[i]["score"])
         accepted = len(used) > 1 and is_better(metric, s_dev, dc[best_dev]["score"])
+        if not ctl.any():
+            # Мало строк для control: веса подобраны и оценены на одних строках — нужен явный запас.
+            accepted = len(used) > 1 and _clearly_better(metric, s_dev, dc[best_dev]["score"], rel=0.005)
         info = {}
         if ctl.any() and accepted:
             s_mix_ctl = _cand_score(metric, {**mix, "oof": mix["oof"][ctl], "y": mix["y"][ctl]})
@@ -539,7 +542,9 @@ def run_autogluon(prof: dict, target: str, budget: float) -> dict | None:
 
 def _best_target_scale(cands: list[dict], metric: str) -> str | None:
     """Преобразование таргета (log1p/sqrt), с которым LightGBM пула обошёл k-fold LightGBM на исходной шкале."""
-    base = next((c for c in cands if c["name"] == "quick_kfold"), None)
+    # База — LightGBM пула в исходной шкале (без модельных операций AutoEDA), иначе k-fold LightGBM.
+    base = next((c for c in cands if c["name"] == "lgbm"), None) or next(
+        (c for c in cands if c["name"] == "quick_kfold"), None)
     if base is None or base.get("classes") is not None:
         return None
     best = None

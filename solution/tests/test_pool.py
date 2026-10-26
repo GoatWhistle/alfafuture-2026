@@ -83,7 +83,7 @@ def test_plan_applicability():
 def test_twopart_and_transforms_in_original_scale():
     tr, te = reg_frames(zeros=0.3)
     fd = pool.FoldData(_prof(tr, te, "y", "regression", "rmse"), "y")
-    for r in pool.plan(fd.prof, "y")[:4]:
+    for r in [r for r in pool.plan(fd.prof, "y") if r["name"] in ("lgbm_log1p", "lgbm_sqrt", "lgbm_tweedie", "twopart")]:
         c = pool.run_candidate(fd, r, deadline_ts=1e18)
         assert c is not None, r["name"]
         assert (c["test"] >= 0).all() and np.isfinite(c["test"]).all()
@@ -219,3 +219,22 @@ def test_lgbm_search_catalog_consistent():
         assert all(p[k] in v for k, v in pool.LGBM_CATALOG.items())
         assert (p["subsample_freq"] > 0) == (p["subsample"] < 1)     # сэмплирование строк реально включено
     assert recs == pool.lgbm_search_recipes(6)                       # детерминированно
+
+
+def test_f1_stop_binary_tracks_positive_label():
+    """Остановка по F1 следит за positive_label (attack), а не за вторым классом по str-сортировке."""
+    rng = np.random.RandomState(0)
+    n = 900
+    x = rng.randn(n + 100, 2)
+    lab = np.where(x[:, 0] + 0.5 * rng.randn(n + 100) > 1.0, "attack", "normal")
+    df = pd.DataFrame({"id": np.arange(n + 100), "a": x[:, 0], "b": x[:, 1], "t": lab})
+    tr, te = df.iloc[:n].reset_index(drop=True), df.iloc[n:].drop(columns="t").reset_index(drop=True)
+    fd = pool.FoldData(_prof(tr, te, "t", "binary", "f1"), "t")
+    fam = pool.LGBMFamily(fd, {"f1_stop": True})
+    feval = fam._feval()
+    y_enc = np.array([0, 0, 1, 1])               # 0 = attack, 1 = normal (str-сортировка)
+    p_enc1 = np.array([0.1, 0.2, 0.9, 0.8])      # модель уверенно выделяет normal, attack — нет
+    _, val, _ = feval(y_enc, p_enc1)
+    assert val == 1.0                           # F1 класса attack (pos_label=0) при точном разделении
+    _, val2, _ = feval(y_enc, np.array([0.9, 0.9, 0.9, 0.9]))
+    assert val2 == 0.0                          # всё предсказано normal -> F1(attack) = 0

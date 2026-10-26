@@ -128,17 +128,20 @@ class LGBMFamily(_Family):
     def _feval(self):
         """Метрика задачи как eval LightGBM (остановка по ней, а не по добавленному log loss)."""
         metric, k = self.metric, self.k
+        # Положительный класс бинарной F1 — positive_label задачи, а не второй по str-сортировке.
+        pos = self.fd.classes.index(models.positive_label(self.fd.classes)) if k == 2 else 1
 
         def f1_eval(y_true, y_pred):
             yp = y_pred.reshape(len(y_true), -1) if y_pred.ndim == 1 and k and k > 2 else y_pred
             if yp.ndim == 1:
-                lab = (yp > 0.5).astype(int)
+                lab = (yp > 0.5).astype(int)  # LightGBM: вероятность закодированного класса 1
             else:
                 lab = np.argmax(yp, axis=1)
             from sklearn.metrics import f1_score
 
-            avg = "macro" if metric == "f1_macro" else "binary"
-            return "task_f1", float(f1_score(y_true.astype(int), lab, average=avg)), True
+            if metric == "f1_macro":
+                return "task_f1", float(f1_score(y_true.astype(int), lab, average="macro")), True
+            return "task_f1", float(f1_score(y_true.astype(int), lab, average="binary", pos_label=pos)), True
 
         return f1_eval
 
@@ -279,7 +282,8 @@ class CatBoostFamily(_Family):
         cats = _cat_cols_obj(Xf)
         m = self._make(5000, True)
         m.fit(Xf, yf, cat_features=cats, eval_set=(Xes, yes), callbacks=[self._guard(dl)])
-        return m, int(m.get_best_iteration() or m.tree_count_) + 1
+        best = m.get_best_iteration()
+        return m, int(m.tree_count_ if best is None else best) + 1
 
     def refit(self, X, y, w, n_iter, dl):
         X = self._prep(X)
@@ -379,8 +383,11 @@ class ExtraTreesFamily(_Family):
     def _make(self):
         from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
 
-        p = dict(n_estimators=250, min_samples_leaf=2, max_features=0.5, n_jobs=N_CPUS,
-                 random_state=self.seed)
+        # Память дерева ~ число узлов × (64 + 8K) байт: bootstrap-подвыборка ограничивает размер дерева.
+        n = self._n_fit
+        p = dict(n_estimators=ET_TREES, min_samples_leaf=3, max_features=0.5, n_jobs=N_CPUS,
+                 random_state=self.seed, bootstrap=n > ET_MAX_SAMPLES,
+                 max_samples=min(ET_MAX_SAMPLES, n) if n > ET_MAX_SAMPLES else None)
         p.update(self.params)
         if self.fd.regression:
             return ExtraTreesRegressor(**p)
@@ -390,7 +397,10 @@ class ExtraTreesFamily(_Family):
         return self.refit(Xf, yf, None, 0, dl), 0
 
     def refit(self, X, y, w, n_iter, dl):
+        if time.time() > dl:
+            raise TimeoutError("дедлайн до обучения ExtraTrees")
         Xe, med = self._encode(X)
+        self._n_fit = len(Xe)
         m = self._make().fit(Xe, y)
         m._med = med
         return m
@@ -411,7 +421,8 @@ class TfidfFamily(_Family):
 
     def _docs(self, X: pd.DataFrame) -> pd.Series:
         cols = self.recipe["text_cols"]
-        parts = [X[c].astype(object).where(X[c].notna(), "").astype(str) for c in cols]
+        # _prep_matrices превращает пропуск в категорию "nan": пустой документ, а не токен.
+        parts = [X[c].astype(object).where(X[c].notna(), "").astype(str).replace("nan", "") for c in cols]
         doc = parts[0]
         for p in parts[1:]:
             doc = doc + " \x1f " + p
@@ -422,6 +433,11 @@ class TfidfFamily(_Family):
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.linear_model import LogisticRegression, Ridge
 
+        if time.time() > dl:
+            raise TimeoutError("дедлайн до обучения TF-IDF")
+        if len(X) > TEXT_MAX_ROWS:
+            keep = np.sort(np.random.RandomState(self.seed).choice(len(X), TEXT_MAX_ROWS, replace=False))
+            X, y = X.iloc[keep], np.asarray(y)[keep]
         docs = self._docs(X)
         vw = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=TEXT_MAX_FEATURES, sublinear_tf=True)
         vc = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=3, max_features=TEXT_MAX_FEATURES,
@@ -449,6 +465,10 @@ class TfidfFamily(_Family):
 
 
 TEXT_MAX_FEATURES = 100_000
+TEXT_MAX_ROWS = 200_000
+ET_TREES = 150
+ET_MAX_SAMPLES = 60_000
+ET_MAX_BYTES = 6e9
 TEXT_MAX_CHARS = 5_000
 TEXT_MIN_TOKENS = 4      # медиана слов в значении — признак свободного текста, а не категории/ID
 TEXT_MIN_UNIQUE = 0.2
@@ -538,6 +558,10 @@ def run_candidate(fd: FoldData, recipe: dict, deadline_ts: float) -> dict | None
         m, it = fam.fit(Xf, yt[fit_i], Xes, yt[es_i], wf, wes, deadline_ts)
         oof[va] = fam.predict(m, Xva)
         iters.append(it)
+    if time.time() > deadline_ts:
+        # Последний фолд мог оборваться по дедлайну на недообученной модели — OOF несопоставим.
+        log(f"pool[{recipe['name']}]: фолды закончились после дедлайна — кандидат пропущен")
+        return None
     if isinstance(iters[0], tuple):
         n_iter = tuple(int(np.median([t[j] for t in iters]) * 1.1) for j in range(len(iters[0])))
     else:
@@ -598,6 +622,8 @@ def plan(prof: dict, target: str) -> list[dict]:
         nonneg = bool((y >= 0).all())
         sk = _skew(y)
         if nonneg and not prof["log_target"] and sk > SKEW_MIN:
+            # База сравнения шкал — тот же LightGBM пула без модельных операций AutoEDA.
+            out.append({"name": "lgbm", "family": "lgbm", "why": "LightGBM пула в исходной шкале (база для шкал)"})
             out.append({"name": "lgbm_log1p", "family": "lgbm", "tf": "log1p",
                         "why": f"неотрицательный таргет с асимметрией {sk:.2f}"})
             out.append({"name": "lgbm_sqrt", "family": "lgbm", "tf": "sqrt",
@@ -676,6 +702,7 @@ def run_pool(prof: dict, target: str, deadline_ts: float, lgbm_sec: float, regis
     metric = prof["metric"]
     out: list[dict] = []
     tf_scores = {None: base_score}
+    fam_k = None if fd.classes is None else len(fd.classes)
 
     def best_tf():
         best, bs = None, tf_scores[None]
@@ -685,6 +712,12 @@ def run_pool(prof: dict, target: str, deadline_ts: float, lgbm_sec: float, regis
         return best
 
     def attempt(r: dict) -> dict | None:
+        if r["family"] == "extratrees":
+            n = min(len(fd.y_orig), ET_MAX_SAMPLES)
+            mem = ET_TREES * (2 * n / 3) * (64 + 8 * (fam_k or 1))
+            if mem > ET_MAX_BYTES:
+                log(f"pool[{r['name']}]: пропуск — оценка памяти {mem / 1e9:.1f} ГБ")
+                return None
         est = COST[r["family"]] * max(lgbm_sec, 1.0)
         left = deadline_ts - time.time()
         if est > left:
@@ -717,6 +750,8 @@ def run_pool(prof: dict, target: str, deadline_ts: float, lgbm_sec: float, regis
             if tf is not None:
                 r = {**r, "tf": tf, "name": f"{r['name']}_{tf}", "why": r["why"] + f"; шкала {tf} лучше исходной"}
         cand = attempt(r)
+        if cand is not None and r["name"] == "lgbm":
+            tf_scores[None] = cand["score"]
         if cand is not None and r["family"] == "lgbm" and r.get("tf") and r["name"] in ("lgbm_log1p", "lgbm_sqrt"):
             tf_scores[r["tf"]] = cand["score"]
     if out:
