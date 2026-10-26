@@ -219,6 +219,10 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
                 qwen2 = []
             srch.stage_a(qwen2, t0 + 0.8 * budget)
     accepted = srch.stage_b(deadline)
+    try:
+        accepted = srch.merge_branches(accepted, deadline + 0.1 * budget)
+    except Exception:  # noqa: BLE001
+        log("Объединение веток упало:\n" + traceback.format_exc())
 
     added = []
     model_ops = {}

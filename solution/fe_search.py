@@ -9,6 +9,7 @@ apply = val фолда (fe_dsl.apply), поэтому target-признаки н
 from __future__ import annotations
 
 import time
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -24,7 +25,11 @@ SEARCH_MIN_ROWS = 15_000
 REL_MIN = 0.002            # минимальный относительный прирост метрики
 LCB_K = 1.0                # нижняя граница: mean − k·std/√n по фолдам > 0
 N_NULL = 3                 # null-спеки (перемешанные копии признаков) для калибровки порога
-ENTITY_GROUP_MAX_COVERAGE = 0.3  # сущности test в основном новые -> GroupKFold
+ENTITY_GROUP_MAX_COVERAGE = 0.3
+PROVENANCE_MIN_COVERAGE = 0.5  # доля test-строк с ключом из train, при которой target-статистика допустима
+MERGE_BRANCH_SIZE = 3      # спек в ветке (лучшие по delta этапа A)
+MERGE_TOP_BRANCHES = 3     # ветки-кандидаты для объединения
+MERGE_MAX_PAIRS = 3  # сущности test в основном новые -> GroupKFold
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +443,7 @@ class Search:
         self.ev = Evaluator(ctx)
         self.passed: list[dict] = []
         self.results: list[dict] = []
+        self._score_cache: dict = {}  # скоры рецептов по множеству ключей спек (повтор не переобучается)
         self.t0 = time.time()
 
     def calibrate(self) -> None:
@@ -469,7 +475,12 @@ class Search:
             if scores is None:
                 continue
             mean, lcb = _gain(metric, scores, self.base)
-            leaky = _looks_leaky(metric, scores, self.base)
+            leaky = False
+            if _looks_leaky(metric, scores, self.base):
+                # Подозрительно высокий скор — повод проверить происхождение, а не отклонить сразу.
+                leaky, why = self.provenance(spec)
+                spec["provenance"] = why
+                log(f"AutoEDA: {fe_dsl.describe(spec)} — подозрительно высокий скор; происхождение: {why}")
             ok = mean > rel_min and lcb > 0 and not leaky
             spec["delta"], spec["lcb"], spec["accepted_a"] = round(mean, 5), round(lcb, 5), ok
             done.append(spec)
@@ -507,12 +518,134 @@ class Search:
             if ok:
                 accepted.append(spec)
                 cur = scores
+        self.final_scores = cur
         total, _ = _gain(metric, cur, self.base)
         log(f"AutoEDA: принято {len(accepted)} спек, прирост {total:+.2%} "
             f"({metric} {np.mean(self.base):.5f} -> {np.mean(cur):.5f}), оценок {self.ev.n_evals}, "
             f"{time.time() - self.t0:.0f}s")
         self.ctx["search_base"], self.ctx["search_final"] = float(np.mean(self.base)), float(np.mean(cur))
         return accepted
+
+    def provenance(self, spec: dict) -> tuple[bool, str]:
+        """(утечка?, основание) для спеки с подозрительно высоким скором.
+
+        Признак только из признаков (без таргета) таргетом протечь не может —
+        сильная допустимая закономерность. Признак из таргета строится на
+        фолдах по train фолда (метки val не видит), но по ключу объекта он
+        переносится на test только для объектов, известных в train: если ключи
+        test в основном новые, высокий скор — запоминание объектов (утечка
+        через идентичность строк), на test не воспроизведётся.
+        """
+        if not fe_dsl.uses_target(spec):
+            return False, "признак без таргета — допустимая сильная закономерность"
+        keys = spec["params"].get("keys")
+        if not keys:
+            return True, "соседи по таргету с идеальным скором — вероятны дубли строк"
+        df, test = self.ctx["df"], self.ctx["test"]
+        if not set(keys) <= set(test.columns):
+            return True, "ключ отсутствует в test"
+        cov = float(np.isin(row_keys(test, keys), row_keys(df, keys)).mean())
+        if cov >= PROVENANCE_MIN_COVERAGE:
+            return False, f"ключи test известны в train на {cov:.0%} — статистика переносится на test"
+        return True, f"ключи test известны в train лишь на {cov:.0%} — скор не воспроизведётся на test"
+
+    # --- Объединение веток (#21) -------------------------------------------------
+
+    @staticmethod
+    def _branch_name(spec: dict) -> str:
+        return spec["source"] if spec["source"].startswith("qwen") else spec["source"].split(":")[0]
+
+    def branches(self) -> dict[str, list[dict]]:
+        """Ветка поиска = до MERGE_BRANCH_SIZE лучших (по delta этапа A) спек одного источника."""
+        out: dict[str, list[dict]] = {}
+        for spec in sorted(self.passed, key=lambda s: -s["delta"]):
+            b = out.setdefault(self._branch_name(spec), [])
+            if len(b) < MERGE_BRANCH_SIZE:
+                b.append(spec)
+        return out
+
+    @staticmethod
+    def merge_specs(a: list[dict], b: list[dict]) -> tuple[list[dict] | None, str]:
+        """Рецепт из двух веток: порядок a, затем b; общие операции не повторяются.
+
+        Конфликт (None, причина): drop колонки, которую использует другая операция;
+        две модельные операции одного типа; совпадение имён выходов у разных спек.
+        Произвольных Python-трансформеров в DSL нет — склеиваются только операции DSL.
+        """
+        merged, keys = [], set()
+        for spec in a + b:
+            k = fe_dsl.spec_key(spec)
+            if k not in keys:
+                keys.add(k)
+                merged.append(spec)
+        drops = {s["cols"][0] for s in merged if s["op"] == "drop"}
+        for spec in merged:
+            if spec["op"] == "drop":
+                continue
+            p = spec["params"]
+            used = set(spec["cols"]) | set(p.get("keys", [])) | ({p["period"]} if "period" in p else set())
+            if used & drops:
+                return None, f"конфликт: {fe_dsl.describe(spec)} использует удаляемую {sorted(used & drops)}"
+        mops = [s["op"] for s in merged if s["op"] in fe_dsl.MODEL_OPS]
+        if len(mops) != len(set(mops)):
+            return None, "конфликт: две модельные операции одного типа"
+        names = [fe_dsl._name(s, "") for s in merged if s["op"] != "drop" and s["op"] not in fe_dsl.MODEL_OPS]
+        if len(names) != len(set(names)):
+            return None, "конфликт имён выходов"
+        return merged, ""
+
+    def _scores(self, specs: list[dict]) -> list[float] | None:
+        key = frozenset(fe_dsl.spec_key(s) for s in specs)
+        if key not in self._score_cache:
+            self._score_cache[key] = self.ev.run(specs)
+        return self._score_cache[key]
+
+    def merge_branches(self, leader: list[dict], deadline: float) -> list[dict]:
+        """Объединения пар лучших веток против обоих родителей и лидера этапа B; победитель — новый лидер."""
+        leader_scores = getattr(self, "final_scores", self.base)
+        self._score_cache.setdefault(frozenset(fe_dsl.spec_key(s) for s in leader), leader_scores)
+        br = self.branches()
+        order = sorted(br, key=lambda k: -br[k][0]["delta"])[:MERGE_TOP_BRANCHES]
+        best, best_sc = leader, leader_scores
+        tried = {frozenset(fe_dsl.spec_key(s) for s in leader)}
+        for a, b in list(combinations(order, 2))[:MERGE_MAX_PAIRS]:
+            name = f"merge:{a}+{b}"
+            merged, why = self.merge_specs(br[a], br[b])
+            if merged is None:
+                if self.register:
+                    self.register(name, why, None, False, reason=why)
+                continue
+            key = frozenset(fe_dsl.spec_key(s) for s in merged)
+            if key in tried:
+                if self.register:
+                    self.register(name, "эквивалентно уже оценённому рецепту", None, False, reason="дубль")
+                continue
+            tried.add(key)
+            if not self.ev.fits(deadline):
+                log("AutoEDA: объединение веток остановлено по времени")
+                break
+            try:
+                sc_a, sc_b, sc_m = self._scores(br[a]), self._scores(br[b]), self._scores(merged)
+            except Exception as exc:  # noqa: BLE001
+                log(f"AutoEDA: объединение {a}+{b} упало: {type(exc).__name__}: {exc}")
+                continue
+            if sc_m is None or sc_a is None or sc_b is None:
+                continue
+            g_lead, lcb = _gain(self.metric, sc_m, best_sc)
+            beats_parents = all(_gain(self.metric, sc_m, p)[0] > 0 for p in (sc_a, sc_b))
+            ok = bool(beats_parents and g_lead > self.rel_min / 2 and lcb > -self.rel_min)
+            if self.register:
+                self.register(name, f"{len(merged)} спек: " + "; ".join(fe_dsl.describe(s) for s in merged),
+                              round(float(np.mean(sc_m)), 5), ok,
+                              parents={a: round(float(np.mean(sc_a)), 5), b: round(float(np.mean(sc_b)), 5)},
+                              leader=round(float(np.mean(best_sc)), 5))
+            if ok:
+                best, best_sc = merged, sc_m
+        if best is not leader:
+            self.final_scores = best_sc
+            self.ctx["search_final"] = float(np.mean(best_sc))
+            log(f"AutoEDA: лидер заменён объединением веток ({len(best)} спек)")
+        return best
 
     def feedback(self, top: int = 30) -> dict:
         """Итоги этапа A для второго раунда LLM: что прошло, что нет, с дельтами."""
