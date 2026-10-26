@@ -329,6 +329,8 @@ def _dump_candidates(cands: list[dict], target: str) -> None:
         d.mkdir(parents=True, exist_ok=True)
         for c in cands:
             np.save(d / f"{c['name']}.npy", np.asarray(c["test"]))
+            np.save(d / f"{c['name']}.oof.npy", np.asarray(c["oof"]))
+        np.save(d / "rows.npy", np.asarray(cands[0]["rows"]))
         (d / "scores.json").write_text(json.dumps({c["name"]: c["score"] for c in cands}, default=float))
     except Exception as exc:  # noqa: BLE001
         log(f"дамп кандидатов не записан: {exc}")

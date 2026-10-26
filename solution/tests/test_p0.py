@@ -236,3 +236,22 @@ def test_numeric_labels_in_object_arrays():
     p = np.array([1, 2, 2, 1, 2, 3], dtype=object)
     assert models.score("f1_macro", y, p) == pytest.approx(models.score("f1_macro", y.astype(int), p.astype(int)))
     assert models.score("accuracy", y, p) == pytest.approx(5 / 6)
+
+
+def test_llm_retries_transient_503(monkeypatch):
+    import httpx
+    import openai
+
+    monkeypatch.setattr(task_profile.time, "sleep", lambda s: None)
+    req = httpx.Request("POST", "http://x/v1/chat/completions")
+    calls = {"n": 0}
+
+    class Completions:
+        def create(self, **kw):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise openai.InternalServerError("503", response=httpx.Response(503, request=req), body=None)
+            return "ok"
+
+    client = type("C", (), {"chat": type("Ch", (), {"completions": Completions()})()})()
+    assert task_profile._create_with_retry(client, "m", "p", "t") == "ok" and calls["n"] == 3

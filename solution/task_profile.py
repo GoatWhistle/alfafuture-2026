@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import re
 from pathlib import Path
 
@@ -156,6 +157,30 @@ def _llm_json(prompt: str, tag: str, timeout: float = 60, retries: int = 1) -> d
     return data
 
 
+TRANSIENT_RETRIES = 3
+
+
+def _create_with_retry(client, model: str, prompt: str, tag: str):
+    """chat.completions с повтором на временных ошибках (429, 5xx, обрыв соединения/таймаут)."""
+    import openai
+
+    for k in range(TRANSIENT_RETRIES + 1):
+        try:
+            return client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}],
+                                                  temperature=0)
+        except (openai.APIConnectionError, openai.RateLimitError, openai.InternalServerError) as exc:
+            if k == TRANSIENT_RETRIES:
+                raise
+            log(f"LLM[{tag}]: временная ошибка ({type(exc).__name__}), повтор {k + 1}/{TRANSIENT_RETRIES}")
+            time.sleep(3 * (k + 1))
+        except openai.APIStatusError as exc:
+            if exc.status_code not in (408, 409, 429) and exc.status_code < 500 or k == TRANSIENT_RETRIES:
+                raise
+            log(f"LLM[{tag}]: HTTP {exc.status_code}, повтор {k + 1}/{TRANSIENT_RETRIES}")
+            time.sleep(3 * (k + 1))
+    return None
+
+
 def _llm_json_call(prompt: str, tag: str, timeout: float, retries: int) -> dict | None:
     if not os.environ.get("OPENAI_API_KEY"):
         log(f"LLM[{tag}]: OPENAI_API_KEY не задан, работаю на дефолтах")
@@ -167,11 +192,7 @@ def _llm_json_call(prompt: str, tag: str, timeout: float, retries: int) -> dict 
         # Прокси платформы подставляет модель задачи по любому имени.
         model = os.environ.get("OPENAI_MODEL", "qwen/qwen3.8-27b")
         for attempt in (1, 2):
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-            )
+            resp = _create_with_retry(client, model, prompt, tag)
             data = _extract_json(resp.choices[0].message.content or "")
             if data:
                 log(f"LLM[{tag}] (попытка {attempt}): {data}")
@@ -268,7 +289,17 @@ def _dictionary_text(dd: pd.DataFrame | None, columns: list[str], limit: int = 6
 
 
 def _specs_prompt(question: str, facts: dict, dd_text: str, columns: list[str], task_text: str, n: int,
-                  planned: list[str] | None = None) -> str:
+                  planned: list[str] | None = None, compact: bool = False) -> str:
+    """Промпт спек DSL; compact — короткая версия для повтора, когда полный запрос не дождался ответа."""
+    if compact:
+        return (
+            "Отвечай быстро: рассуждай не больше нескольких предложений и сразу верни JSON. "
+            f"Вопрос: {question}\nПредложи до {n} гипотез-спек DSL по фактам, только колонки из списка.\n\n"
+            f"{DSL_HELP}\n\n"
+            'JSON: {"specs": [{"op": "...", "cols": [...], "params": {...}, "why": "..."}], "entity": [], '
+            '"period": null}\n\n'
+            f"Колонки: {columns[:120]}\n\nФакты: {json.dumps(facts, ensure_ascii=False, default=str)[:2000]}"
+        )
     planned_text = ""
     if planned:
         planned_text = ("Эти гипотезы УЖЕ в очереди проверки — НЕ повторяй их; предлагай другие ключи, "
@@ -314,8 +345,13 @@ def llm_propose_specs(task_text: str, summary: dict, dd: pd.DataFrame | None, co
         facts = {**base, **{k: summary.get(k) for k in keys if summary.get(k) is not None}}
         prompt = _specs_prompt(question, facts, dd_text if theme in ("semantics", "time_objects") else "см. колонки",
                                columns, task_text, 8, planned)
-        # Reasoning-модель на 4 параллельных запросах отвечает минутами: один долгий запрос без повтора.
-        return theme, _parse_specs(_llm_json(prompt, f"fe_{theme}", timeout=300, retries=0), 12)
+        # Reasoning-модель на 4 параллельных запросах отвечает минутами: один долгий запрос без повтора;
+        # шлюз может оборвать долгий ответ (503) — тогда короткая версия промпта.
+        ans = _parse_specs(_llm_json(prompt, f"fe_{theme}", timeout=300, retries=0), 12)
+        if ans is None:
+            short = _specs_prompt(question, facts, "", columns, task_text, 4, compact=True)
+            ans = _parse_specs(_llm_json(short, f"fe_{theme}_short", timeout=180, retries=0), 6)
+        return theme, ans
 
     with ThreadPoolExecutor(len(LLM_THEMES)) as pool:
         answers = list(pool.map(ask, LLM_THEMES))
