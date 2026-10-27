@@ -39,6 +39,7 @@ import fe_dsl
 import fe_search
 import models
 import pool
+import linear_search
 from models import (
     ag_oof,
     ag_predict,
@@ -69,6 +70,7 @@ KFOLD_RESERVE_SEC = float(os.environ.get("AGENT_KFOLD_RESERVE_SEC", 600))
 POOL_SHARE = float(os.environ.get("AGENT_POOL_SHARE", 0.3))
 AUTOEDA_SEC = float(os.environ.get("AGENT_AUTOEDA_SEC", 1200))
 MIN_AUTOEDA_SEC = 120
+LINEAR_SEC = max(0.0, min(60.0, float(os.environ.get("AGENT_LINEAR_SEC", 60))))
 # Сверх бюджета AutoEDA: после этого этап бросается (зависшее построение признаков).
 AUTOEDA_SLACK_SEC = 60
 MACRO_METRICS = ("f1_macro", "f1_weighted", "f1", "balanced_accuracy")
@@ -171,7 +173,7 @@ def _llm_round1(prof: dict, ctx: dict, summary: dict, known: set[str], planned: 
     return _validate_llm(raw, ctx, known, "qwen")
 
 
-def run_autoeda(prof: dict, target: str, budget: float) -> dict:
+def run_autoeda(prof: dict, target: str, budget: float, use_llm: bool | None = None) -> dict:
     """Детекторы -> валидатор; Qwen: раунд 1 (темы параллельно, в фоне) -> раунд 2 по итогам.
 
     Возвращает {"period", "label_copy", "accepted"}: схему валидации для
@@ -183,6 +185,27 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
     ctx = fe_search.build_context(prof, target, deadline)
     specs = eda_detectors.run_all(ctx, t0 + 0.25 * budget)
     fe_search.build_folds(ctx)
+    if os.environ.get("AGENT_RESEARCH_MODE", "legacy") == "iterative":
+        from research_search import Research
+        from task_profile import llm_research_specs
+
+        def ask(diag, feedback, planned, seconds):
+            summary = eda_detectors.summary(diag, [])
+            summary["current_recipe"] = diag["facts"]["current_recipe"]
+            proposal = llm_research_specs(prof["task_text"], summary, feedback,
+                                          list(ctx["features"]), planned, seconds)
+            raw = proposal["specs"] if proposal else []
+            diag["llm_prior"] = float(np.median([s["prior"] for s in specs])) if specs else 0
+            # A feature tried against another parent is a different recipe experiment.
+            return _validate_llm(raw, diag, set(), "qwen_research")
+
+        research = Research(ctx, register, llm=ask if use_llm is not False and os.environ.get("OPENAI_API_KEY") else None)
+        accepted = research.run(specs, deadline)
+        added = apply_recipe(prof, target, accepted, ctx)
+        register("autoeda", f"research: {research.stop_reason}; {len(accepted)} спек -> {added}",
+                 ctx.get("search_final"), bool(accepted))
+        log(f"AutoEDA: {time.time() - t0:.0f}s, признаков {len(prof['features'])}")
+        return {"period": ctx["period"], "label_copy": ctx["label_copy"], "accepted": accepted}
     srch = fe_search.Search(ctx, register)
     srch.calibrate()
     try:
@@ -195,8 +218,9 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
     register("autoeda_specs", f"{len(specs)} гипотез детекторов: " + "; ".join(
         f"{s['source']}:{fe_dsl.describe(s)}" for s in sorted(specs, key=lambda s: -s["prior"])[:12]), None, True)
 
-    use_llm = time_left() > 1800
     planned = [fe_dsl.describe(s) for s in sorted(specs, key=lambda s: -s["prior"])]
+    if use_llm is None:
+        use_llm = time_left() > 1800
     fut = Background(_llm_round1, prof, ctx, summary, known, planned) if use_llm else None
     srch.stage_a(specs, t0 + 0.5 * budget)
     if fut is not None:
@@ -224,10 +248,20 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
     except Exception:  # noqa: BLE001
         log("Объединение веток упало:\n" + traceback.format_exc())
 
+    added = apply_recipe(prof, target, accepted, ctx)
+    register("autoeda", f"схема {ctx['fold_scheme']}; принято {len(accepted)} спек -> {added}",
+             ctx.get("search_final"), bool(accepted))
+    log(f"AutoEDA: {time.time() - t0:.0f}s, признаков {len(prof['features'])}")
+    return {"period": ctx["period"], "label_copy": ctx["label_copy"], "accepted": accepted}
+
+
+def apply_recipe(prof: dict, target: str, accepted: list[dict], ctx: dict) -> list[str]:
+    """Materialize a selected, replayable recipe on a fresh base profile."""
     added = []
     model_ops = {}
     target_specs = []
-    for spec in accepted:
+    materialized = set()
+    for spec in fe_dsl.unique_specs(accepted):
         if spec["op"] == "drop":
             col = spec["cols"][0]
             prof["features"] = [c for c in prof["features"] if c != col]
@@ -248,22 +282,25 @@ def run_autoeda(prof: dict, target: str, budget: float) -> dict:
             target_specs.append(spec)
             added.append(fe_dsl.describe(spec) + " [по фолдам]")
             continue
+        key = fe_dsl.spec_key(spec)
+        if key in materialized:
+            # segment_model тоже добавляет flag; отдельная такая же flag-спека
+            # не должна повторно добавлять этот индикатор.
+            continue
         res = fe_dsl.materialize(prof, spec, target, ctx["classes"])
         if res is None:
             continue
         tr_new, te_new = res
-        new_cols = [c for c in tr_new.columns if c not in prof["train"].columns]
-        prof["train"] = pd.concat([prof["train"], tr_new[new_cols]], axis=1)
-        prof["test"] = pd.concat([prof["test"], te_new[new_cols]], axis=1)
+        new_cols = list(tr_new.columns)
+        prof["train"] = pd.concat([prof["train"], tr_new], axis=1, verify_integrity=True)
+        prof["test"] = pd.concat([prof["test"], te_new], axis=1, verify_integrity=True)
         prof["features"] = list(prof["features"]) + new_cols
+        materialized.add(key)
         added += new_cols
     prof["model_ops"] = model_ops
     prof["target_specs"] = target_specs
     prof["cv"] = ctx["cv"]
-    register("autoeda", f"схема {ctx['fold_scheme']}; принято {len(accepted)} спек -> {added}",
-             ctx.get("search_final"), bool(accepted))
-    log(f"AutoEDA: {time.time() - t0:.0f}s, признаков {len(prof['features'])}")
-    return {"period": ctx["period"], "label_copy": ctx["label_copy"], "accepted": accepted}
+    return added
 
 
 def _scored(cands: list[dict]) -> list[dict]:
@@ -373,7 +410,7 @@ def _dev_control(prof: dict, cand: dict) -> tuple[np.ndarray, np.ndarray]:
     return dev, ~dev
 
 
-def select_final(prof, target, current, quick, cands, fallback, label_copy=False):
+def select_final(prof, target, current, quick, cands, fallback, label_copy=False, extra_cands=()):
     """Выбор источника, бленд и постпроцессинг на общих OOF-строках одной схемы валидации."""
     metric = prof["metric"]
     classification = prof["problem_type"] != "regression"
@@ -425,6 +462,22 @@ def select_final(prof, target, current, quick, cands, fallback, label_copy=False
         if is_better(metric, c["score"], win["score"]):
             win = c
     _dump_candidates(cands, target)
+    # Preserve the incumbent's validation population and its existing two-model blend.
+    # An optional family may challenge it only on every one of those same rows.
+    for candidate in _scored(list(extra_cands)):
+        if not np.isin(win["rows"], candidate["rows"]).all():
+            register("family_select", f"{candidate['name']}: неполное покрытие OOF", None, False)
+            continue
+        try:
+            incumbent, challenger = align_candidates([win, candidate])
+            old, new = _cand_score(metric, incumbent), _cand_score(metric, challenger)
+            accepted = np.isfinite(new) and _clearly_better(metric, new, old)
+            register("family_select", f"{candidate['name']} против {win['name']} ({old:.6f}); "
+                     f"{len(win['rows'])} общих строк; порог 0.2%", new, accepted)
+            if accepted:
+                win = {**challenger, "score": new}
+        except (ValueError, KeyError) as exc:
+            register("family_select", f"{candidate['name']}: {exc}", None, False)
     log(f"Финальный источник: {win['name']} ({metric}={win['score']:.5f})")
 
     if not classification:
@@ -594,7 +647,10 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     prof.setdefault("base_features", list(prof["features"]))
     eda = {"period": None, "label_copy": False, "accepted": []}
     spare = remaining() - PREDICT_RESERVE_SEC - kfold_reserve
-    eda_budget = min(AUTOEDA_SEC, 0.3 * spare)
+    research_share = 0.3
+    if os.environ.get("AGENT_RESEARCH_MODE") == "iterative":
+        research_share = float(np.clip(float(os.environ.get("AGENT_RESEARCH_SHARE", .75)), .1, .9))
+    eda_budget = min(AUTOEDA_SEC, research_share * spare)
     if eda_budget >= MIN_AUTOEDA_SEC:
         # AutoEDA работает на копии профиля под лимитом времени: зависшее построение признаков
         # прерывается, а прерванный этап не оставляет профиль наполовину изменённым.
@@ -673,6 +729,10 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
     ag_budget = remaining() - PREDICT_RESERVE_SEC
     log(f"Бюджет AutoGluon {ag_budget:.0f}s (резерв predict {PREDICT_RESERVE_SEC:.0f}s)")
     ag = None
+    linear_reserve = LINEAR_SEC if linear_search.recipes(prof, target)[0] else 0.0
+    # Reserving a cheap family must not disable an otherwise eligible AutoGluon run.
+    if ag_budget >= 300:
+        ag_budget -= min(linear_reserve, max(0.0, ag_budget - 300))
     if os.environ.get("AGENT_NO_AUTOGLUON"):
         log("AutoGluon отключён (AGENT_NO_AUTOGLUON)")
     elif ag_budget >= 300:
@@ -693,9 +753,14 @@ def solve_target(prof: dict, target: str, current: dict[str, np.ndarray], budget
             write_submission(prof, current)
             best_pred = current[target]
 
+    # Independent family: compare raw/log within Ridge, then challenge the tree winner.
+    linear = linear_search.search(prof, target, min(linear_reserve, remaining() - PREDICT_RESERVE_SEC),
+                                  register=register)
+
     # Ступень 5: ансамбль, выбор финального источника и постпроцессинг.
     try:
-        return select_final(prof, target, current, quick, cands, best_pred, label_copy=eda["label_copy"])
+        return select_final(prof, target, current, quick, cands, best_pred, label_copy=eda["label_copy"],
+                            extra_cands=[linear] if linear is not None else [])
     except Exception:  # noqa: BLE001
         log("Финальный выбор упал, остаётся последний записанный сабмит:\n" + traceback.format_exc())
         return best_pred

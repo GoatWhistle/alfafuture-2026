@@ -594,9 +594,13 @@ def _segment_candidates(ctx: dict) -> list[tuple[str, dict, np.ndarray]]:
 
 
 def _agreement(a: np.ndarray, b: np.ndarray) -> float:
-    """Доля строк, где два разбиения совпадают (с точностью до перенумерации сегментов)."""
+    """Минимум долей совпадений в обоих направлениях.
+
+    Единица означает одинаковые разбиения с точностью до перенумерации.
+    Одностороннее включение мелких сегментов в крупные не даёт единицу.
+    """
     ct = pd.crosstab(a, b).to_numpy()
-    return float(ct.max(axis=1).sum() / len(a))
+    return float(min(ct.max(axis=1).sum(), ct.max(axis=0).sum()) / len(a))
 
 
 def detect_segments(ctx: dict) -> list[dict]:
@@ -639,13 +643,15 @@ def detect_segments(ctx: dict) -> list[dict]:
                       "score": (shift + w) * balance, "_codes": codes,
                       "flip": max(flips, key=lambda f: abs(f["corr_all"] - f["corr_seg"]), default=None)})
     found.sort(key=lambda r: -r["score"])
-    # Одинаковое разбиение разными колонками (dbytes==0 ⇔ dpkts==0) — один сегмент.
+    # Объединяем только одинаковые разбиения. Даже маленький дополнительный
+    # сегмент остаётся отдельной гипотезой; пользу определяет валидатор.
     uniq = []
     for r in found:
-        if all(_agreement(r["_codes"], u["_codes"]) < 0.98 for u in uniq):
+        same = next((u for u in uniq if _agreement(r["_codes"], u["_codes"]) == 1.0), None)
+        if same is None:
             uniq.append(r)
         else:
-            next(u for u in uniq if _agreement(r["_codes"], u["_codes"]) >= 0.98).setdefault("same_as", []).append(r["col"])
+            same.setdefault("same_as", []).append(r["col"])
     found = uniq
     ctx["facts"]["segments"] = [{k: v for k, v in r.items() if k not in ("score", "_codes")} for r in found[:8]]
     out = []

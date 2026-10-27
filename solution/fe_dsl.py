@@ -14,6 +14,7 @@ cross-fit соблюдает схему валидации (inner_splits): tempo
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 
 import numpy as np
@@ -170,22 +171,45 @@ def validate(spec, columns, numeric: set[str] | None = None) -> dict | None:
     if src_target and op in ("group_stat", "lag"):
         params["src"] = "target"
     prior = spec.get("prior")
-    return {
+    return canonical_spec({
         "op": op, "cols": cols, "params": params,
         "source": str(spec.get("source") or "unknown")[:80],
         "prior": float(prior) if isinstance(prior, (int, float)) and np.isfinite(prior) else 0.0,
         "why": str(spec.get("why") or "")[:300],
-    }
+    })
 
 
 def uses_target(spec: dict) -> bool:
     return spec["params"].get("src") == "target" or spec["op"] == "knn_target"
 
 
+def canonical_spec(spec: dict) -> dict:
+    """Единый порядок аргументов для идентичности и исполнения валидной спеки."""
+    cols, params = list(spec["cols"]), dict(spec["params"])
+    if spec["op"] in ("prod", "interaction", "agg_cols", "knn_target"):
+        cols.sort()
+    for key in ("keys", "aggs"):
+        if key in params:
+            params[key] = sorted(params[key])
+    return {**spec, "cols": cols, "params": params}
+
+
 def spec_key(spec: dict) -> str:
-    """Каноническая строка спеки (дедупликация, кэш)."""
-    p = spec["params"]
-    return f"{spec['op']}|{','.join(spec['cols'])}|" + "|".join(f"{k}={p[k]}" for k in sorted(p))
+    """Идентичность без метаданных; JSON сохраняет границы имён и параметров."""
+    s = canonical_spec(spec)
+    return json.dumps({k: s[k] for k in ("op", "cols", "params")},
+                      sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def unique_specs(specs: list[dict]) -> list[dict]:
+    """Эквивалентные спеки исполняются один раз, порядок первых сохраняется."""
+    seen, out = set(), []
+    for spec in specs:
+        key = spec_key(spec)
+        if key not in seen:
+            seen.add(key)
+            out.append(spec)
+    return out
 
 
 def describe(spec: dict) -> str:
@@ -218,6 +242,7 @@ def segment_codes(spec: dict, fit: pd.DataFrame, app: pd.DataFrame) -> tuple[np.
 
 
 def _name(spec: dict, suffix: str) -> str:
+    spec = canonical_spec(spec)
     parts = [spec["op"], *spec["cols"]]
     if "keys" in spec["params"]:
         parts += ["by", *spec["params"]["keys"]]
@@ -228,9 +253,12 @@ def _name(spec: dict, suffix: str) -> str:
     for level in spec["params"].get("fallback", []):
         parts += ["fb", *level]
     base = "__".join(re.sub(r"[^0-9A-Za-z_]", "_", str(x)) for x in parts)
-    if len(base) > 90:
-        base = base[:70] + "_" + hashlib.md5(base.encode()).hexdigest()[:8]
-    return f"fe_{base}__{suffix}" if suffix else f"fe_{base}"
+    # Хэш включает исходные (до нормализации) имена, все параметры и класс/агрегат.
+    identity = json.dumps([spec_key(spec), suffix], ensure_ascii=False)
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:20]
+    tail = re.sub(r"[^0-9A-Za-z_]", "_", suffix)[:40]
+    name = f"fe_{base[:70]}_{digest}"
+    return f"{name}__{tail}" if tail else name
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +662,7 @@ def apply(spec: dict, fit: pd.DataFrame, fit_y, app: pd.DataFrame, classes: list
     classes — список классов (классификация) или None (регрессия); cv — схема
     валидации для внутренних разбиений cross-fit (inner_splits).
     """
+    spec = canonical_spec(spec)
     op = spec["op"]
     if op == "drop" or op in MODEL_OPS:
         return None
@@ -669,6 +698,8 @@ def safe_apply(spec, fit, fit_y, app, classes=None, cv=None):
     if res is None:
         return None
     f, a = res
+    if not f.columns.is_unique or not a.columns.is_unique:
+        raise ValueError(f"overlapping feature names in {describe(spec)}")
     keep = [c for c in f.columns if f[c].nunique(dropna=True) > 1]
     if not keep:
         return None

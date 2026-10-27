@@ -44,6 +44,22 @@ def frames(n, y_fn, seed=0):
     return train, test, y[:n]
 
 
+def test_iterative_research_reaches_final_csv(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("AGENT_RESEARCH_MODE", "iterative")
+    monkeypatch.setitem(ENV, "AGENT_AUTOEDA_SEC", "120")
+    train, test, y = frames(400, lambda x, r: 3 * x[:, 0] * x[:, 1] + r.randn(len(x)) * .3)
+    train["target"] = y
+    sample = pd.DataFrame({"id": test["id"], "target": 0.})
+    out = run(tmp_path, train, test, sample, "Регрессия. Метрика RMSE.")
+    assert np.isfinite(out.target).all()
+    report = json.loads(next((tmp_path / "research").glob('*.json')).read_text())
+    assert report["champion"] and report["portfolio"]
+    assert any(e["event"] == "round" for e in report["events"])
+    assert "Финальный источник:" in (tmp_path / "log.txt").read_text()
+
+
 def test_binary_logloss_strings(tmp_path):
     train, test, y = frames(1500, lambda x, r: np.where(x[:, 0] + r.randn(len(x)) > 0, "yes", "no"))
     train["target"] = y
@@ -53,6 +69,29 @@ def test_binary_logloss_strings(tmp_path):
     assert np.isfinite(p).all() and (p >= 0).all() and (p <= 1).all()
     # Вероятность класса "yes" растёт с признаком a.
     assert np.corrcoef(p, test["a"])[0, 1] > 0.5
+
+
+def test_binary_logloss_numeric_uses_final_folds(tmp_path):
+    train, test, y = frames(1500, lambda x, r: (x[:, 0] + r.randn(len(x)) > 0).astype(int))
+    train["target"] = y
+    sample = pd.DataFrame({"id": test["id"], "target": 0})
+    out = run(tmp_path, train, test, sample, "Классификация. Метрика log loss.")
+    log = (tmp_path / "log.txt").read_text()
+    assert "quick_oof[target]: log_loss=" in log
+    assert "Финальный источник: quick_kfold" in log
+    assert "quick_oof упал" not in log
+    assert np.corrcoef(out["target"], test["a"])[0, 1] > 0.5
+
+
+def test_numeric_multiclass_f1_uses_final_folds(tmp_path):
+    train, test, y = frames(1500, lambda x, r: np.array([2, 5, 9])[np.digitize(x[:, 1], [-0.5, 0.5])])
+    train["target"] = y
+    sample = pd.DataFrame({"id": test["id"], "target": 2})
+    out = run(tmp_path, train, test, sample, "Классификация. Метрика Macro F1.")
+    log = (tmp_path / "log.txt").read_text()
+    assert "quick_oof[target]: f1_macro=" in log
+    assert "quick_oof упал" not in log and "Финальный выбор упал" not in log
+    assert set(out["target"]) <= {2, 5, 9}
 
 
 def test_binary_f1_string_labels(tmp_path):
