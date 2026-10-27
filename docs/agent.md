@@ -1,6 +1,6 @@
-# AutoML-агент (хакатон Альфа-Банка)
+# Устройство агента
 
-Агент решает табличную ML-задачу end-to-end: `python3 solution.py task.md` → `submission.csv`.
+Агент решает табличную ML-задачу end-to-end: `python3 solution/solution.py task.md` → `submission.csv`. Обзор и запуск — в [README проекта](../README.md).
 
 ## Стратегия на максимальный балл
 
